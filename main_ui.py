@@ -1597,12 +1597,9 @@ class App(ctk.CTk):
                 f"교체 단계에서 오류가 발생했습니다.\n\n{e}")
             self._set_status("Ready", self.COLORS["text_sub"])
             return
-        # 교체 스크립트가 떴으니 현재 프로세스는 종료한다.
-        try:
-            self.destroy()
-        except Exception:
-            pass
-        sys.exit(0)
+        # 새 exe(교체 담당)가 떴다. 이 프로세스가 살아 있으면 구 exe 파일이 잠겨
+        # 교체가 안 되므로, 정리 없이 즉시 강제 종료해 잠금을 푼다.
+        os._exit(0)
 
     def _clear_log(self):
         if not messagebox.askyesno("로그 삭제", "시스템 로그를 삭제하시겠습니까?"):
@@ -1678,5 +1675,17 @@ class App(ctk.CTk):
 # ── 진입점 ────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import updater
+    # 새 exe 가 --apply-update 모드로 실행되면 GUI 대신 교체만 수행하고 종료한다.
+    if updater.APPLY_FLAG in sys.argv:
+        idx = sys.argv.index(updater.APPLY_FLAG)
+        target = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else ""
+        if target:
+            updater.perform_swap(target)
+        sys.exit(0)
+
+    # 교체 후 첫 실행이면 남은 다운로드 임시파일 정리
+    updater.cleanup_after_update()
+
     app = App()
     app.mainloop()
