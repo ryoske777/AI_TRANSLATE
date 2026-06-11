@@ -3,6 +3,7 @@
   "files": {
     "main.py": "7ec228bfaef5770aeb36240e1c02e23b63047c4d222933970fa3fd3d954d5fcf",
     "run_ui.bat": "d766378466c7cb6e3b396ce05a73de51decc1103f0b90e77dd7712b804964ea2",
+    "config.py": "9b214b0dcfeeb740f2b75d9d2a8a08c9e06b83aed19c164096bef1c3b57f4f08",
     "main_ui.py": "d3d0f368fe4091aee9ccc655aa2d721a9fe840a6b3a4e89f40ad2c542f765464",
     "updater.py": "2e4cb5b9eb7ededcd9f195a2d866a9a4fde645b32da4c93d375ae56bd19f8037",
     "prompts/zh_cn.txt": "8216bc54309c4e93ceabdc65eeb87c977f88683577608c0b5da614197e0e1abc",
