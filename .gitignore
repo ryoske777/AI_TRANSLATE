@@ -1,0 +1,12 @@
+# 사용자 고유/민감 파일 — 절대 커밋 금지
+credentials.json
+settings.json
+.update_manifest.json
+
+# 런타임 생성물
+chrome-session/
+__pycache__/
+*.pyc
+*.part
+실패목록.txt
+failure*.txt

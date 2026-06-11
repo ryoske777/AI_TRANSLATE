@@ -1,0 +1,19 @@
+{
+  "version": "1.0.0",
+  "files": {
+    "main.py": "7ec228bfaef5770aeb36240e1c02e23b63047c4d222933970fa3fd3d954d5fcf",
+    "run_ui.bat": "d766378466c7cb6e3b396ce05a73de51decc1103f0b90e77dd7712b804964ea2",
+    "main_ui.py": "d3d0f368fe4091aee9ccc655aa2d721a9fe840a6b3a4e89f40ad2c542f765464",
+    "updater.py": "2e4cb5b9eb7ededcd9f195a2d866a9a4fde645b32da4c93d375ae56bd19f8037",
+    "prompts/zh_cn.txt": "8216bc54309c4e93ceabdc65eeb87c977f88683577608c0b5da614197e0e1abc",
+    "prompts/pt.txt": "1f8a696c58c15a92978040e869fd18c6315cda90751a37b3790d7c072925b8ef",
+    "prompts/de.txt": "9e5b32146c9b0253e406a779a6d83563ea0dffff7638a8f0295e2fdd70d924ab",
+    "prompts/tr.txt": "32d06485757a4b7cfdca11c3f0ebc8f701ebcffa78fde22a950fa630a8a96cf2",
+    "prompts/fr.txt": "76960bc3cc3bedf99b2d0cb7ec04f6b0e517ffedccb8c9f34d4c577fef60e81a",
+    "prompts/es.txt": "522184fa6f776ea3468a94b8ec9078dc0afcf30bc3289ac0ec6b37aa2912f9e1",
+    "prompts/en.txt": "7a5f7417ca40c41fc2e2f4ad44d8717dd0362d397d1c367fcb2ac3e3bd059340",
+    "prompts/id.txt": "fb670831d71b88243b03a0d6c36bbc71f5e2a25ac1272c5065d138cc3f2a45b9",
+    "prompts/th.txt": "77f6b95cc116db2e6a714034bc93f60327046d990cb71d1e972911a0beee466e",
+    "prompts/es_general.txt": "4c77c2f1cf72bddbef7d615da5d000566396a2751875d577092fc10234fb8048"
+  }
+}
