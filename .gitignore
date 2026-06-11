@@ -10,3 +10,11 @@ __pycache__/
 *.part
 실패목록.txt
 failure*.txt
+.prompt_seed.json
+_update_download.exe
+_apply_update.bat
+
+# PyInstaller 빌드 산출물
+build/
+dist/
+*.exe

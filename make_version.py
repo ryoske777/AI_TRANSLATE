@@ -1,91 +1,38 @@
 # -*- coding: utf-8 -*-
 """
-make_version.py — 배포자(개발자)용 도구
+make_version.py — 배포자(개발자)용 릴리스 도구 (EXE 배포)
 
 사용법:
-    python make_version.py 1.3.0
-    python make_version.py            (버전 미지정 시 version.txt 값 + 패치 자동 증가)
+    python make_version.py 1.0.1     # 버전 지정
+    python make_version.py           # version.txt 패치 자동 증가
 
 동작:
-    - 배포 대상 파일들의 sha256 해시를 계산해 version.json 생성
-    - version.txt 도 함께 갱신
-    - 생성된 version.json / version.txt / 코드 파일을 GitHub 에 push 하면 끝
+    - version.txt 를 새 버전으로 기록 (이 값이 exe 에 번들되어 '현재 버전'이 됨)
+    - 커밋 + 태그 + 푸시 안내 출력
 
-배포 대상: 아래 INCLUDE 패턴에 맞는 파일.
-제외: credentials.json, settings.json 등 사용자 고유 파일은 절대 포함하지 않는다.
+배포 흐름(요약):
+    1) python make_version.py 1.0.1
+    2) git add -A && git commit -m "release v1.0.1"
+    3) git tag v1.0.1 && git push origin main --tags
+    -> GitHub Actions(.github/workflows/release.yml)가 Windows 에서 exe 를 빌드하고
+       v1.0.1 릴리스에 RO_Translator.exe 를 첨부한다.
+    -> 사용자는 다음 실행 때 자동으로 업데이트를 안내받는다.
+
+해시 매니페스트(version.json)는 더 이상 쓰지 않는다. 업데이트는 GitHub
+Releases 의 태그 + exe 자산만으로 동작한다(updater.py 참조).
 """
 
 import os
 import sys
-import json
-import hashlib
-import fnmatch
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# ── 배포에 포함할 파일 패턴 ──────────────────────────────────────────────────
-INCLUDE_PATTERNS = [
-    "*.py",            # 코어 코드 (단, 아래 EXCLUDE 로 일부 제외)
-    "*.bat",           # 실행 스크립트
-    "prompts/*.txt",   # 프롬프트 (사용자 편집분은 updater 가 보존)
-    "config.py",
-]
-
-# ── 절대 배포하지 않을 파일 ──────────────────────────────────────────────────
-EXCLUDE_NAMES = {
-    "credentials.json",
-    "settings.json",
-    ".update_manifest.json",
-    "make_version.py",   # 배포자 전용 도구는 사용자에게 안 보냄
-    "version.json",      # 생성물 자체
-}
-EXCLUDE_PATTERNS = [
-    "*.part",            # 다운로드 임시파일
-    "*.pyc",
-    "test_*.py",
-    "__pycache__/*",
-]
+VERSION_TXT = os.path.join(BASE_DIR, "version.txt")
 
 
-def sha256(path):
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def matched(rel):
-    """rel 경로가 INCLUDE 에 맞고 EXCLUDE 에 안 걸리면 True"""
-    base = os.path.basename(rel)
-    if base in EXCLUDE_NAMES:
-        return False
-    for pat in EXCLUDE_PATTERNS:
-        if fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(base, pat):
-            return False
-    for pat in INCLUDE_PATTERNS:
-        if fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(base, pat):
-            return True
-    return False
-
-
-def collect_files():
-    files = {}
-    for root, dirs, names in os.walk(BASE_DIR):
-        dirs[:] = [d for d in dirs if d not in ("__pycache__", "chrome-session", ".git")]
-        for name in names:
-            full = os.path.join(root, name)
-            rel = os.path.relpath(full, BASE_DIR).replace("\\", "/")
-            if matched(rel):
-                files[rel] = sha256(full)
-    return files
-
-
-def read_version_txt():
-    p = os.path.join(BASE_DIR, "version.txt")
-    if os.path.exists(p):
-        with open(p, "r", encoding="utf-8") as f:
-            return f.read().strip()
+def read_version():
+    if os.path.exists(VERSION_TXT):
+        with open(VERSION_TXT, "r", encoding="utf-8") as f:
+            return f.read().strip() or "0.0.0"
     return "0.0.0"
 
 
@@ -102,32 +49,24 @@ def bump_patch(v):
 
 def main():
     if len(sys.argv) >= 2:
-        version = sys.argv[1].strip()
+        version = sys.argv[1].strip().lstrip("vV")
     else:
-        version = bump_patch(read_version_txt())
+        version = bump_patch(read_version())
         print(f"버전 미지정 → 자동 증가: {version}")
 
-    files = collect_files()
-    if not files:
-        print("⚠️  배포 대상 파일을 찾지 못했습니다. INCLUDE 패턴을 확인하세요.")
-        sys.exit(1)
-
-    manifest = {"version": version, "files": files}
-    with open(os.path.join(BASE_DIR, "version.json"), "w", encoding="utf-8") as f:
-        json.dump(manifest, f, ensure_ascii=False, indent=2)
-    with open(os.path.join(BASE_DIR, "version.txt"), "w", encoding="utf-8") as f:
+    with open(VERSION_TXT, "w", encoding="utf-8") as f:
         f.write(version)
 
-    print(f"\n✅ version.json 생성 완료 (v{version}, 파일 {len(files)}개)")
-    print("─" * 50)
-    for rel in sorted(files):
-        print(f"  {rel}")
-    print("─" * 50)
-    print("\n다음 단계:")
+    print(f"\n[OK] version.txt -> v{version}")
+    print("-" * 50)
+    print("다음 단계:")
     print("  1) git add -A")
     print(f'  2) git commit -m "release v{version}"')
-    print("  3) git push")
-    print("\n사용자는 다음 실행 때 자동으로 업데이트를 안내받습니다.")
+    print(f"  3) git tag v{version}")
+    print("  4) git push origin main --tags")
+    print("-" * 50)
+    print("GitHub Actions 가 exe 를 빌드해 릴리스에 첨부합니다.")
+    print("사용자는 다음 실행 때 자동 업데이트를 안내받습니다.")
 
 
 if __name__ == "__main__":
