@@ -55,13 +55,14 @@ pyinstaller RO_Translator.spec
 
 ### 릴리스 (자동 빌드)
 ```bash
-python make_version.py 1.0.1
+python make_version.py 1.0.1     # version.txt 갱신
 git add -A && git commit -m "release v1.0.1"
-git tag v1.0.1 && git push origin main --tags
+git push origin main
 ```
-태그를 푸시하면 GitHub Actions(`.github/workflows/release.yml`)가 Windows 에서
-exe 를 빌드하고 해당 릴리스에 `RO_Translator.exe` 를 첨부합니다. 사용자는 다음
-실행 때 자동 업데이트를 안내받습니다.
+`main` 에 푸시하면 GitHub Actions(`.github/workflows/release.yml`)가 Windows 에서
+exe 를 빌드하고 `version.txt` 버전(`v1.0.1`)으로 릴리스에 `RO_Translator.exe` 를
+첨부합니다. (Actions 탭에서 **Run workflow** 로 수동 실행도 가능)
+사용자는 다음 실행 때 자동 업데이트를 안내받습니다.
 
 ---
 

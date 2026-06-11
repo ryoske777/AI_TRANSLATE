@@ -1,18 +1,25 @@
 name: Build & Release EXE
 
-# 릴리스 방법 (둘 중 하나)
-#   1) 태그 푸시:    git tag v1.0.1 && git push origin main --tags
-#   2) 수동 실행:    Actions 탭 > Build & Release EXE > Run workflow > version 입력
-# 둘 다 Windows 에서 exe 를 빌드하고 해당 버전 릴리스에 RO_Translator.exe 를 첨부한다.
+# 릴리스 방법
+#   - main 에 빌드 관련 파일이 푸시되면 자동으로 exe 를 빌드하고
+#     version.txt 버전으로 릴리스에 RO_Translator.exe 를 첨부한다.
+#   - 새 버전 배포:  python make_version.py 1.0.1 → commit → push origin main
+#   - 수동 실행:     Actions > Build & Release EXE > Run workflow > version 입력
 on:
   push:
-    tags:
-      - "v*"
+    branches: [main]
+    paths:
+      - "**.py"
+      - "prompts/**"
+      - "RO_Translator.spec"
+      - "requirements.txt"
+      - "version.txt"
+      - ".github/workflows/release.yml"
   workflow_dispatch:
     inputs:
       version:
-        description: "릴리스 버전 (예: 1.0.0)"
-        required: true
+        description: "릴리스 버전 (예: 1.0.0). 비우면 version.txt 사용"
+        required: false
 
 permissions:
   contents: write       # 릴리스/태그 생성·자산 업로드에 필요
@@ -41,9 +48,10 @@ jobs:
         run: |
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             V="${GITHUB_REF_NAME#v}"
+          elif [ -n "${{ github.event.inputs.version }}" ]; then
+            V="${{ github.event.inputs.version }}"; V="${V#v}"
           else
-            V="${{ github.event.inputs.version }}"
-            V="${V#v}"
+            V="$(cat version.txt | tr -d '[:space:]')"
           fi
           echo -n "$V" > version.txt
           echo "version=$V" >> "$GITHUB_OUTPUT"
