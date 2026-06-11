@@ -42,6 +42,10 @@ RESPONSE_DONE_DELAY    = 2.0   # 응답 완료 판정 후 추가 안정화 대�
 USE_REMOTE_DEBUGGING  = True
 REMOTE_DEBUGGING_PORT = 9222
 
+#   Chrome 실행 파일 경로. 비우면 표준 설치 위치에서 자동 탐색한다.
+#   exe 사용자는 최초 설정 마법사 또는 설정창에서 지정한다.
+CHROME_BINARY_PATH = ""         # 예: r"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+
 #   USE_REMOTE_DEBUGGING=False 일 때만 사용하는 폴백 프로필 경로.
 CHROME_PROFILE_PATH = ""        # 예: r"C:\\Users\\이름\\AppData\\Local\\Google\\Chrome\\User Data"
 CHROME_PROFILE_DIR  = "Default"

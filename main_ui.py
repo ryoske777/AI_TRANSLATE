@@ -5,7 +5,7 @@ main.py의 모든 기능을 그대로 유지하며 GUI로 감싼 버전
 
 import customtkinter as ctk
 import tkinter as tk
-from tkinter import scrolledtext, messagebox
+from tkinter import scrolledtext, messagebox, filedialog
 import threading
 import queue
 import os
@@ -23,7 +23,8 @@ from main import (
     setup_driver, new_conversation, send_message, wait_for_response,
     extract_last_response, sanitize_cell, restore_cell,
     group_consecutive_rows, format_batch, parse_response, is_empty, col_to_idx,
-    list_prompt_langs, load_prompt, ensure_external_prompts, PROMPTS_DIR, LANG_LABELS,
+    list_prompt_langs, load_prompt, ensure_external_prompts, find_chrome,
+    PROMPTS_DIR, LANG_LABELS,
 )
 import config
 
@@ -791,8 +792,30 @@ class SettingsDialog(ctk.CTkToplevel):
                      font=ctk.CTkFont(size=13, weight="bold")).pack(
             anchor="w", pady=(0, 6))
         f3 = ctk.CTkFrame(scroll, fg_color="transparent")
-        f3.pack(fill="x", pady=(0, 12))
-        self.v_port = self._field(f3, "디버그 포트", config.REMOTE_DEBUGGING_PORT, 0)
+        f3.pack(fill="x", pady=(0, 4))
+
+        ctk.CTkLabel(f3, text="Chrome 경로", anchor="w").grid(
+            row=0, column=0, padx=(0, 12), pady=6, sticky="w")
+        self.v_chrome = tk.StringVar(value=getattr(config, "CHROME_BINARY_PATH", "") or "")
+        ctk.CTkEntry(f3, textvariable=self.v_chrome, width=240).grid(
+            row=0, column=1, pady=6, sticky="w")
+        ctk.CTkButton(f3, text="찾아보기", width=72,
+                      command=self._browse_chrome).grid(row=0, column=2, padx=6)
+
+        ctk.CTkLabel(f3, text="디버그 포트", anchor="w").grid(
+            row=1, column=0, padx=(0, 12), pady=6, sticky="w")
+        self.v_port = tk.StringVar(value=str(config.REMOTE_DEBUGGING_PORT))
+        ctk.CTkEntry(f3, textvariable=self.v_port, width=120).grid(
+            row=1, column=1, pady=6, sticky="w")
+
+        ctk.CTkLabel(scroll,
+                     text="※ Chrome 경로를 비우면 표준 설치 위치에서 자동으로 찾습니다.",
+                     text_color="#888", font=ctk.CTkFont(size=11)).pack(
+            anchor="w", padx=4)
+
+        ctk.CTkButton(scroll, text="🧙  최초 설정 마법사 다시 실행",
+                      fg_color="#4a5568", hover_color="#2d3748",
+                      command=self._rerun_wizard).pack(anchor="w", pady=(12, 12))
 
         # 버튼
         btn_frame = ctk.CTkFrame(self, fg_color="transparent")
@@ -812,6 +835,7 @@ class SettingsDialog(ctk.CTkToplevel):
             config.DELAY_MIN                  = float(self.v_dmin.get())
             config.DELAY_MAX                  = float(self.v_dmax.get())
             config.REMOTE_DEBUGGING_PORT      = int(self.v_port.get())
+            config.CHROME_BINARY_PATH         = self.v_chrome.get().strip()
             config.RESPONSE_INIT_WAIT         = float(self.v_init.get())
             config.RESPONSE_POLL_INTERVAL     = float(self.v_poll.get())
             config.RESPONSE_DONE_DELAY        = float(self.v_done.get())
@@ -828,6 +852,20 @@ class SettingsDialog(ctk.CTkToplevel):
             self.destroy()
         except ValueError as e:
             messagebox.showerror("입력 오류", f"숫자 형식을 확인해주세요.\n{e}", parent=self)
+
+    def _browse_chrome(self):
+        p = filedialog.askopenfilename(
+            title="Chrome 실행 파일 선택",
+            filetypes=[("Chrome", "chrome.exe"), ("실행 파일", "*.exe"),
+                       ("모든 파일", "*.*")],
+            parent=self)
+        if p:
+            self.v_chrome.set(p)
+
+    def _rerun_wizard(self):
+        parent = self.master
+        self.destroy()
+        SetupWizard(parent)
 
 
 # ── 번역 언어 빠른 선택 다이얼로그 ───────────────────────────────────────────
@@ -1002,6 +1040,7 @@ def save_settings():
         "PRESERVE_PLACEHOLDERS":      getattr(config, "PRESERVE_PLACEHOLDERS", True),
         "AI_MODE":                    getattr(config, "AI_MODE", "chatgpt"),
         "PROMPT_LANG":                getattr(config, "PROMPT_LANG", ""),
+        "CHROME_BINARY_PATH":         getattr(config, "CHROME_BINARY_PATH", ""),
     }
     with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -1031,6 +1070,7 @@ def load_settings():
         config.RESPONSE_POLL_INTERVAL     = data.get("RESPONSE_POLL_INTERVAL",     config.RESPONSE_POLL_INTERVAL)
         config.RESPONSE_DONE_DELAY        = data.get("RESPONSE_DONE_DELAY",        config.RESPONSE_DONE_DELAY)
         config.PRESERVE_PLACEHOLDERS      = data.get("PRESERVE_PLACEHOLDERS",      True)
+        config.CHROME_BINARY_PATH         = data.get("CHROME_BINARY_PATH",         getattr(config, "CHROME_BINARY_PATH", ""))
         ai_mode = (data.get("AI_MODE", "chatgpt") or "chatgpt").lower()
         config.AI_MODE = ai_mode if ai_mode in ("chatgpt", "claude") else "chatgpt"
         # 프롬프트 언어 — 저장값이 실제 존재하는 파일일 때만 적용, 아니면 첫 번째로 폴백
@@ -1047,6 +1087,155 @@ def load_settings():
 
 
 # ── 메인 앱 ──────────────────────────────────────────────────────────────────
+
+class SetupWizard(ctk.CTkToplevel):
+    """최초 설정 마법사 — 첫 실행 시(또는 설정에서 수동 호출 시) 기본값을 모은다.
+
+    exe 안에 포함되어 있어 별도 파일 없이 동작한다. Chrome 경로/스프레드시트/
+    기본 번역 설정을 한 화면에서 받고 settings.json 에 저장한다.
+    """
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self._parent = parent
+        self.title("최초 설정 마법사")
+        self.geometry("560x640")
+        self.resizable(True, True)
+        self.grab_set()
+        self.after(50, self.lift)
+        self._build()
+
+    def _row(self, parent, label, value, row, hint=None):
+        ctk.CTkLabel(parent, text=label, anchor="w").grid(
+            row=row, column=0, padx=(0, 12), pady=6, sticky="w")
+        var = tk.StringVar(value=str(value))
+        ctk.CTkEntry(parent, textvariable=var, width=300).grid(
+            row=row, column=1, columnspan=2, pady=6, sticky="w")
+        return var
+
+    def _build(self):
+        ctk.CTkLabel(self, text="환영합니다! 👋  기본 설정을 진행합니다.",
+                     font=ctk.CTkFont(size=15, weight="bold")).pack(
+            anchor="w", padx=20, pady=(16, 0))
+        ctk.CTkLabel(self,
+                     text="언제든 설정창에서 다시 실행할 수 있습니다.",
+                     text_color="#888", font=ctk.CTkFont(size=11)).pack(
+            anchor="w", padx=20, pady=(2, 8))
+
+        scroll = ctk.CTkScrollableFrame(self)
+        scroll.pack(fill="both", expand=True, padx=16, pady=(0, 0))
+
+        # 1) Chrome
+        ctk.CTkLabel(scroll, text="① Chrome",
+                     font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", pady=(4, 6))
+        cf = ctk.CTkFrame(scroll, fg_color="transparent")
+        cf.pack(fill="x")
+        ctk.CTkLabel(cf, text="Chrome 경로", anchor="w").grid(
+            row=0, column=0, padx=(0, 12), pady=6, sticky="w")
+        # 설정값이 없으면 표준 위치 자동 탐색 결과를 미리 채운다
+        prefill = (getattr(config, "CHROME_BINARY_PATH", "") or "").strip() or find_chrome()
+        self.v_chrome = tk.StringVar(value=prefill)
+        ctk.CTkEntry(cf, textvariable=self.v_chrome, width=300).grid(
+            row=0, column=1, pady=6, sticky="w")
+        ctk.CTkButton(cf, text="찾아보기", width=72,
+                      command=self._browse_chrome).grid(row=0, column=2, padx=6)
+        ctk.CTkLabel(scroll,
+                     text="※ 자동으로 찾았으면 그대로 두세요. 못 찾았으면 chrome.exe 를 직접 지정합니다.",
+                     text_color="#888", font=ctk.CTkFont(size=11)).pack(anchor="w", padx=4, pady=(0, 8))
+
+        # 2) 스프레드시트
+        ctk.CTkLabel(scroll, text="② 스프레드시트",
+                     font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", pady=(6, 6))
+        sf = ctk.CTkFrame(scroll, fg_color="transparent")
+        sf.pack(fill="x")
+        self.v_id    = self._row(sf, "스프레드시트 ID", config.SPREADSHEET_ID, 0)
+        self.v_sheet = self._row(sf, "시트 이름",       config.SHEET_NAME,      1)
+        self.v_start = self._row(sf, "시작 행 번호",    config.START_ROW,       2)
+        ctk.CTkLabel(scroll,
+                     text="※ credentials.json 을 exe 와 같은 폴더에 두고, 해당 계정에 시트 공유를 해야 합니다.",
+                     text_color="#888", font=ctk.CTkFont(size=11)).pack(anchor="w", padx=4, pady=(0, 8))
+
+        # 3) 기본 번역 설정
+        ctk.CTkLabel(scroll, text="③ 기본 번역 설정",
+                     font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", pady=(6, 6))
+        tf = ctk.CTkFrame(scroll, fg_color="transparent")
+        tf.pack(fill="x")
+        self.v_batch  = self._row(tf, "배치 크기 (행)", config.BATCH_SIZE, 0)
+        self.v_result = self._row(tf, "결과열 (A,B,C,D...)", getattr(config, "RESULT_COL", "D"), 1)
+
+        # 번역 언어
+        lf = ctk.CTkFrame(scroll, fg_color="transparent")
+        lf.pack(fill="x", pady=(6, 0))
+        ctk.CTkLabel(lf, text="번역 언어", anchor="w").grid(
+            row=0, column=0, padx=(0, 12), pady=6, sticky="w")
+        self._langs = list_prompt_langs()
+        self._lang_labels = [LANG_LABELS.get(l, l) for l in self._langs]
+        cur = getattr(config, "PROMPT_LANG", "")
+        cur_label = LANG_LABELS.get(cur, cur) if cur in self._langs else (
+            self._lang_labels[0] if self._lang_labels else "")
+        self.v_lang_label = tk.StringVar(value=cur_label)
+        if self._lang_labels:
+            ctk.CTkOptionMenu(lf, values=self._lang_labels,
+                              variable=self.v_lang_label, width=200).grid(
+                row=0, column=1, pady=6, sticky="w")
+        else:
+            ctk.CTkLabel(lf, text="(prompts 없음)", text_color="#e53e3e").grid(
+                row=0, column=1, pady=6, sticky="w")
+
+        # 버튼
+        btn = ctk.CTkFrame(self, fg_color="transparent")
+        btn.pack(side="bottom", fill="x", padx=16, pady=12)
+        ctk.CTkButton(btn, text="나중에", width=90, fg_color="#3a3a3a",
+                      command=self.destroy).pack(side="right", padx=(6, 0))
+        ctk.CTkButton(btn, text="완료", width=110,
+                      command=self._finish).pack(side="right")
+
+    def _browse_chrome(self):
+        p = filedialog.askopenfilename(
+            title="Chrome 실행 파일 선택",
+            filetypes=[("Chrome", "chrome.exe"), ("실행 파일", "*.exe"),
+                       ("모든 파일", "*.*")],
+            parent=self)
+        if p:
+            self.v_chrome.set(p)
+
+    def _finish(self):
+        try:
+            config.CHROME_BINARY_PATH = self.v_chrome.get().strip()
+            config.SPREADSHEET_ID     = self.v_id.get().strip()
+            config.SHEET_NAME         = self.v_sheet.get().strip()
+            config.START_ROW          = int(self.v_start.get())
+            config.BATCH_SIZE         = int(self.v_batch.get())
+            config.RESULT_COL         = self.v_result.get().strip().upper() or "D"
+            # 언어 라벨 → 코드
+            if self._langs:
+                label = self.v_lang_label.get()
+                lang = next((c for c, l in zip(self._langs, self._lang_labels)
+                             if l == label), self._langs[0])
+                config.PROMPT_LANG = lang
+        except ValueError as e:
+            messagebox.showerror("입력 오류", f"숫자 형식을 확인해주세요.\n{e}", parent=self)
+            return
+
+        if not config.SPREADSHEET_ID:
+            if not messagebox.askyesno(
+                    "확인", "스프레드시트 ID 가 비어 있습니다.\n그래도 저장할까요?",
+                    parent=self):
+                return
+
+        save_settings()
+        # 메인 화면 언어 표시 갱신
+        refresh = getattr(self._parent, "_refresh_lang_label", None)
+        if callable(refresh):
+            try:
+                refresh()
+            except Exception:
+                pass
+        messagebox.showinfo("설정 완료",
+                            "기본 설정을 저장했습니다.\n언제든 설정창(⚙)에서 변경할 수 있습니다.",
+                            parent=self._parent)
+        self.destroy()
+
 
 class App(ctk.CTk):
     # Clay UI 전용 컬러 팔레트
@@ -1086,12 +1275,19 @@ class App(ctk.CTk):
         self._dot_count = 0
         self._is_waiting = False
 
+        # settings.json 이 없으면 최초 실행 → 설정 마법사를 띄운다
+        self._first_run = not os.path.exists(SETTINGS_FILE)
         load_settings()
         self._build_ui()
         self._poll()
         self._animate()
         # UI가 뜬 뒤 백그라운드로 업데이트 확인 (네트워크 지연이 UI를 막지 않도록)
         self.after(800, self._check_update_async)
+        if self._first_run:
+            self.after(300, self._run_setup_wizard)
+
+    def _run_setup_wizard(self):
+        SetupWizard(self)
 
     def _build_ui(self):
         # ── 헤더
