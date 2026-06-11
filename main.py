@@ -159,6 +159,16 @@ def extract_spreadsheet_id(value):
     return s
 
 
+def get_service_account_email():
+    """credentials.json 에서 서비스 계정 이메일(client_email)을 읽어 반환. 없으면 ''."""
+    p = paths.app_path("credentials.json")
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return (json.load(f).get("client_email") or "").strip()
+    except Exception:
+        return ""
+
+
 def get_sheet():
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds = Credentials.from_service_account_file(paths.app_path("credentials.json"), scopes=scopes)
