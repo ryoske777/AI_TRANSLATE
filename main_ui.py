@@ -620,6 +620,30 @@ class TranslationWorker(threading.Thread):
 
 # ── 설정 다이얼로그 ──────────────────────────────────────────────────────────
 
+def clean_release_notes(notes):
+    """업데이트 팝업용 릴리스 노트 정리.
+
+    - GitHub URL 전부 제거
+    - 'by @사용자' 표기 제거
+    - 'Full Changelog' 줄, 'What's Changed' 머리말 줄 제거
+    - 마크다운 머리표(##, *)를 보기 좋게 정리
+    """
+    out = []
+    for line in (notes or "").splitlines():
+        if "Full Changelog" in line or "What's Changed" in line:
+            continue
+        line = re.sub(r"\bby @\S+", "", line)              # by @user 제거
+        line = re.sub(r"\bin\s+https?://\S+", "", line)    # 'in <url>' 꼬리 제거
+        line = re.sub(r"https?://\S+", "", line)           # 남은 URL 제거
+        line = re.sub(r"^\s*#+\s*", "", line)              # 마크다운 헤더(##) 제거
+        line = re.sub(r"^\s*[\*\-]\s+", "• ", line)        # 글머리표 * → •
+        line = line.rstrip(" \t-·")
+        out.append(line)
+    text = "\n".join(out)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text
+
+
 class Tooltip:
     """위젯에 마우스를 올리면 설명 풍선을 띄우는 간단한 툴팁."""
 
@@ -1715,7 +1739,7 @@ class App(ctk.CTk):
                f"  최신: v{result['version']}\n")
         if size_mb:
             msg += f"  다운로드 크기: 약 {size_mb:.1f} MB\n"
-        notes = (result.get("notes") or "").strip()
+        notes = clean_release_notes(result.get("notes") or "")
         if notes:
             snippet = notes if len(notes) <= 300 else notes[:300] + "..."
             msg += f"\n[변경 내용]\n{snippet}\n"
