@@ -72,4 +72,8 @@ jobs:
           tag_name: v${{ steps.ver.outputs.version }}
           name: v${{ steps.ver.outputs.version }}
           files: dist/RO_Translator.exe
-          generate_release_notes: true
+          # GitHub 주소/PR 링크가 섞이지 않도록 자동 생성 대신 깔끔한 본문 사용.
+          # (업데이트 팝업에 그대로 노출되므로 URL 을 넣지 않는다)
+          body: |
+            RO Localization Tool v${{ steps.ver.outputs.version }}
+            최신 기능과 개선 사항이 적용되었습니다.
