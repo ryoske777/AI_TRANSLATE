@@ -142,12 +142,44 @@ def load_prompt(lang):
 
 # ── Google Sheets 연결 ──────────────────────────────────────────────────────
 
+def extract_spreadsheet_id(value):
+    """전체 URL 또는 순수 ID 어느 쪽이 들어와도 스프레드시트 ID 만 반환.
+
+    예) https://docs.google.com/spreadsheets/d/<ID>/edit?gid=0 → <ID>
+        https://drive.google.com/open?id=<ID>                 → <ID>
+        <ID>                                                  → <ID>
+    """
+    s = (value or "").strip()
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", s)
+    if m:
+        return m.group(1)
+    m = re.search(r"[?&]id=([a-zA-Z0-9-_]+)", s)
+    if m:
+        return m.group(1)
+    return s
+
+
 def get_sheet():
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds = Credentials.from_service_account_file(paths.app_path("credentials.json"), scopes=scopes)
     client = gspread.authorize(creds)
-    sheet = client.open_by_key(config.SPREADSHEET_ID).worksheet(config.SHEET_NAME)
-    return sheet
+    sid = extract_spreadsheet_id(config.SPREADSHEET_ID)
+    try:
+        spreadsheet = client.open_by_key(sid)
+    except Exception as e:
+        raise RuntimeError(
+            "스프레드시트를 열 수 없습니다. 스프레드시트 ID 와, 서비스 계정 이메일에 "
+            f"시트 '공유'가 되어 있는지 확인하세요.\n(ID: {sid})\n원인: {e}")
+    try:
+        return spreadsheet.worksheet(config.SHEET_NAME)
+    except Exception:
+        try:
+            names = ", ".join(ws.title for ws in spreadsheet.worksheets())
+        except Exception:
+            names = "(목록을 가져오지 못함)"
+        raise RuntimeError(
+            f"'{config.SHEET_NAME}' 시트(탭)를 찾을 수 없습니다.\n"
+            f"설정의 '시트 이름'을 다음 중 하나로 맞춰주세요: {names}")
 
 
 def is_empty(val):

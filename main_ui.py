@@ -24,7 +24,7 @@ from main import (
     extract_last_response, sanitize_cell, restore_cell,
     group_consecutive_rows, format_batch, parse_response, is_empty, col_to_idx,
     list_prompt_langs, load_prompt, ensure_external_prompts, find_chrome,
-    PROMPTS_DIR, LANG_LABELS,
+    extract_spreadsheet_id, PROMPTS_DIR, LANG_LABELS,
 )
 import config
 
@@ -827,7 +827,7 @@ class SettingsDialog(ctk.CTkToplevel):
 
     def _save(self):
         try:
-            config.SPREADSHEET_ID             = self.v_id.get().strip()
+            config.SPREADSHEET_ID             = extract_spreadsheet_id(self.v_id.get())
             config.SHEET_NAME                 = self.v_sheet.get().strip()
             config.START_ROW                  = int(self.v_start.get())
             config.BATCH_SIZE                 = int(self.v_batch.get())
@@ -1251,7 +1251,7 @@ class SetupWizard(ctk.CTkToplevel):
     def _finish(self):
         try:
             config.CHROME_BINARY_PATH = self.v_chrome.get().strip()
-            config.SPREADSHEET_ID     = self.v_id.get().strip()
+            config.SPREADSHEET_ID     = extract_spreadsheet_id(self.v_id.get())
             config.SHEET_NAME         = self.v_sheet.get().strip()
             config.START_ROW          = int(self.v_start.get())
             config.BATCH_SIZE         = int(self.v_batch.get())
