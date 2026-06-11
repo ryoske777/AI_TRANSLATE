@@ -12,8 +12,9 @@ ChatGPT(또는 Claude) 웹 UI를 구동해 Google Sheets의 게임 텍스트를 
    `RO_Translator.exe` 를 받습니다. (Python 설치 필요 없음 — 더블클릭 실행)
 
 2. **`credentials.json` 준비**
-   본인 Google 서비스 계정 키 파일을 **exe 와 같은 폴더**에 둡니다.
-   (보안상 exe 에 포함하지 않습니다. 작업 담당자에게 받아 배치하세요.)
+   본인 Google 서비스 계정 키 파일을 준비합니다. (보안상 exe 에 포함하지 않습니다.)
+   첫 실행 시 뜨는 **설정 마법사에서 '찾아보기'로 이 파일을 선택**하면 자동으로
+   프로그램 폴더에 복사됩니다. (직접 exe 옆에 두어도 됩니다.)
 
 3. **Chrome 설치**
    도구가 Chrome 을 띄워 ChatGPT 웹을 조작합니다. Chrome 이 설치돼 있어야 합니다.
