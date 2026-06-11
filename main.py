@@ -370,6 +370,10 @@ def _launch_chrome_debug(binary, port):
         "--no-first-run", "--no-default-browser-check",
         "--no-restore-last-session", "--disable-session-crashed-bubble",
         "--disable-infobars",
+        # 창이 최소화/가려져도 페이지가 throttle되지 않게 (CDP 입력과 함께 백그라운드 동작 보장)
+        "--disable-background-timer-throttling",
+        "--disable-renderer-backgrounding",
+        "--disable-backgrounding-occluded-windows",
     ]
     subprocess.Popen(args, close_fds=True)
 
@@ -435,8 +439,66 @@ def new_conversation(driver):
     print("  → 새 대화 페이지 로드 완료")
 
 
+def _insert_text_cdp(driver, textarea, text):
+    """CDP(Input.insertText)로 입력창에 텍스트를 넣는다. 성공 시 True.
+
+    DOM 레벨 포커스 + 전체선택 후 신뢰된 입력 이벤트로 교체하므로, 창이
+    최소화/백그라운드/다른 가상 데스크톱에 있어도 동작한다. (OS 창 포커스 불필요)
+    """
+    try:
+        # 포커스 + 기존 내용 전체 선택 (DOM 셀렉션 — OS 포커스와 무관)
+        driver.execute_script(
+            """
+            const el = arguments[0];
+            el.focus();
+            const r = document.createRange();
+            r.selectNodeContents(el);
+            const s = window.getSelection();
+            s.removeAllRanges();
+            s.addRange(r);
+            """,
+            textarea,
+        )
+        # 선택 영역을 새 텍스트로 교체 (beforeinput/input 이벤트 동반 → 에디터가 인식)
+        driver.execute_cdp_cmd("Input.insertText", {"text": text})
+        time.sleep(0.3)
+        current = driver.execute_script("return arguments[0].innerText;", textarea)
+        return bool(current and current.strip())
+    except Exception:
+        return False
+
+
+def _click_send_button(driver, textarea):
+    """전송 버튼 클릭. JS 클릭(백그라운드 안전) → Selenium 클릭 → Enter 순서로 시도."""
+    sel = "button[data-testid='send-button']"
+    # 1) JS 클릭 — 창이 안 보여도 동작
+    try:
+        btns = driver.find_elements(By.CSS_SELECTOR, sel)
+        if btns:
+            driver.execute_script("arguments[0].click();", btns[0])
+            return
+    except Exception:
+        pass
+    # 2) Selenium 클릭
+    try:
+        btn = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, sel)))
+        btn.click()
+        return
+    except Exception:
+        pass
+    # 3) 최후 — Enter (포커스 필요, 백그라운드에선 실패할 수 있음)
+    try:
+        textarea.send_keys(Keys.RETURN)
+    except Exception:
+        pass
+
+
 def send_message(driver, text):
-    """ChatGPT 입력창에 텍스트 입력 후 전송"""
+    """ChatGPT 입력창에 텍스트 입력 후 전송.
+
+    1순위: CDP 입력(최소화/백그라운드에서도 동작). 실패 시 기존 방식(포커스 필요)으로 폴백.
+    """
     wait = WebDriverWait(driver, 30)
 
     # 입력창 찾기
@@ -452,43 +514,31 @@ def send_message(driver, text):
             )
         )
 
-    textarea.click()
-    time.sleep(0.5)
-
-    # 기존 내용 초기화
-    textarea.send_keys(Keys.CONTROL + "a")
-    textarea.send_keys(Keys.DELETE)
-    time.sleep(0.3)
-
-    # JS execCommand로 직접 입력
-    # (클립보드 붙여넣기 시 ChatGPT가 파일 첨부로 변환하는 문제 방지)
-    driver.execute_script(
-        "arguments[0].focus(); document.execCommand('insertText', false, arguments[1]);",
-        textarea, text
-    )
-    time.sleep(0.5)
-
-    # execCommand 실패 시 클립보드 폴백
-    current = driver.execute_script("return arguments[0].innerText;", textarea)
-    if not current or not current.strip():
-        pyperclip.copy(text)
-        textarea.send_keys(Keys.CONTROL + "v")
+    # ── 1순위: CDP 입력 ─────────────────────────────────────────────
+    if _insert_text_cdp(driver, textarea, text):
+        time.sleep(0.3)
+    else:
+        # ── 폴백: 기존 방식 (창이 활성화돼 있어야 함) ─────────────────
+        textarea.click()
         time.sleep(0.5)
+        textarea.send_keys(Keys.CONTROL + "a")
+        textarea.send_keys(Keys.DELETE)
+        time.sleep(0.3)
+        # JS execCommand로 직접 입력 (클립보드 붙여넣기 시 첨부로 변환되는 문제 방지)
+        driver.execute_script(
+            "arguments[0].focus(); document.execCommand('insertText', false, arguments[1]);",
+            textarea, text
+        )
+        time.sleep(0.5)
+        # execCommand 실패 시 클립보드 폴백
+        current = driver.execute_script("return arguments[0].innerText;", textarea)
+        if not current or not current.strip():
+            pyperclip.copy(text)
+            textarea.send_keys(Keys.CONTROL + "v")
+            time.sleep(0.5)
 
-    # 전송 버튼 클릭
-    try:
-        send_btn = wait.until(EC.element_to_be_clickable(
-            (By.CSS_SELECTOR, "button[data-testid='send-button']")
-        ))
-        send_btn.click()
-    except Exception:
-        try:
-            send_btn = driver.find_element(
-                By.CSS_SELECTOR, "button[data-testid='send-button']"
-            )
-            send_btn.click()
-        except NoSuchElementException:
-            textarea.send_keys(Keys.RETURN)
+    # 전송
+    _click_send_button(driver, textarea)
 
     # 전송 후 랜덤 딜레이 (봇 감지 방지)
     time.sleep(random.uniform(1.5, 3.5))
