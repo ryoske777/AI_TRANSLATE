@@ -429,6 +429,14 @@ def setup_driver():
             f"원인: {e}")
     if not config.USE_REMOTE_DEBUGGING:
         driver.maximize_window()
+
+    # 창이 최소화/백그라운드여도 페이지가 멈추지 않게: 렌더러에 '항상 포커스됨'을
+    # 에뮬레이트한다. (이미 떠 있던 크롬을 재사용해도 연결 세션에 즉시 적용됨)
+    try:
+        driver.execute_cdp_cmd("Emulation.setFocusEmulationEnabled", {"enabled": True})
+    except Exception:
+        pass
+
     return driver
 
 
