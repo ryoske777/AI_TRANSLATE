@@ -620,6 +620,45 @@ class TranslationWorker(threading.Thread):
 
 # ── 설정 다이얼로그 ──────────────────────────────────────────────────────────
 
+class Tooltip:
+    """위젯에 마우스를 올리면 설명 풍선을 띄우는 간단한 툴팁."""
+
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text = text
+        self.tip = None
+        widget.bind("<Enter>", self._show)
+        widget.bind("<Leave>", self._hide)
+
+    def _show(self, _=None):
+        if self.tip or not self.text:
+            return
+        x = self.widget.winfo_rootx() + 18
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        self.tip = tk.Toplevel(self.widget)
+        self.tip.wm_overrideredirect(True)
+        self.tip.wm_geometry(f"+{x}+{y}")
+        tk.Label(self.tip, text=self.text, justify="left",
+                 bg="#2d3748", fg="#ffffff", font=("", 9),
+                 padx=8, pady=6, wraplength=320,
+                 relief="solid", borderwidth=1).pack()
+
+    def _hide(self, _=None):
+        if self.tip:
+            self.tip.destroy()
+            self.tip = None
+
+
+def add_info_icon(parent, row, column, tip_text):
+    """지정 위치에 작은 정보(!) 아이콘을 놓고 마우스오버 설명을 단다."""
+    icon = ctk.CTkLabel(parent, text=" ⓘ", width=18,
+                        text_color="#3182ce",
+                        font=ctk.CTkFont(size=13, weight="bold"))
+    icon.grid(row=row, column=column, padx=(4, 0), sticky="w")
+    Tooltip(icon, tip_text)
+    return icon
+
+
 def make_share_help(parent, clipboard_widget):
     """스프레드시트 공유 안내 + 서비스 계정 이메일 표시 + 복사 버튼을 만든다.
 
@@ -666,13 +705,15 @@ class SettingsDialog(ctk.CTkToplevel):
         self.after(50, self.lift)
         self._build()
 
-    def _field(self, parent, label, value, row, wide=False):
+    def _field(self, parent, label, value, row, wide=False, tip=None):
         ctk.CTkLabel(parent, text=label, anchor="w").grid(
             row=row, column=0, padx=(0, 12), pady=6, sticky="w")
         var = tk.StringVar(value=str(value))
         w = 320 if wide else 200
         ctk.CTkEntry(parent, textvariable=var, width=w).grid(
             row=row, column=1, pady=6, sticky="w")
+        if tip:
+            add_info_icon(parent, row, 2, tip)
         return var
 
     def _build(self):
@@ -708,13 +749,33 @@ class SettingsDialog(ctk.CTkToplevel):
             anchor="w", pady=(0, 6))
         f2 = ctk.CTkFrame(scroll, fg_color="transparent")
         f2.pack(fill="x")
-        self.v_batch = self._field(f2, "배치 크기 (행)",       config.BATCH_SIZE,                0)
-        self.v_sends = self._field(f2, "대화당 최대 전송 횟수", config.MAX_SENDS_PER_CONVERSATION, 1)
-        self.v_dmin  = self._field(f2, "딜레이 최소 (초)",      config.DELAY_MIN,                 2)
-        self.v_dmax  = self._field(f2, "딜레이 최대 (초)",      config.DELAY_MAX,                 3)
-        self.v_init  = self._field(f2, "응답 감지 시작 대기 (초)", getattr(config, "RESPONSE_INIT_WAIT", 2.0),     4)
-        self.v_poll  = self._field(f2, "응답 폴링 간격 (초)",    getattr(config, "RESPONSE_POLL_INTERVAL", 0.5), 5)
-        self.v_done  = self._field(f2, "응답 완료 후 대기 (초)", getattr(config, "RESPONSE_DONE_DELAY", 1.0),    6)
+        self.v_batch = self._field(
+            f2, "1회 번역 분량(시트 행)", config.BATCH_SIZE, 0,
+            tip="한 번에 AI에게 보낼 시트 행 수. 크면 빠르지만 응답이 길어져 누락·오류 위험이 커지고, "
+                "작으면 안정적이지만 느립니다. (보통 20~30)")
+        self.v_sends = self._field(
+            f2, "AI 대화창 전송 횟수", config.MAX_SENDS_PER_CONVERSATION, 1,
+            tip="대화창(채팅) 하나에서 보내는 최대 횟수. 이 횟수를 넘으면 새 대화를 시작합니다. "
+                "대화가 길어지면 AI가 느려지거나 맥락이 흐트러져서, 주기적으로 새로 시작합니다.")
+        self.v_dmin  = self._field(
+            f2, "딜레이 최소 (초)", config.DELAY_MIN, 2,
+            tip="한 묶음을 보낸 뒤 다음 묶음까지 기다리는 '최소' 시간(초). "
+                "너무 짧으면 과도한 자동화로 차단될 위험이 커집니다.")
+        self.v_dmax  = self._field(
+            f2, "딜레이 최대 (초)", config.DELAY_MAX, 3,
+            tip="묶음 사이 대기의 '최대' 시간(초). 매번 최소~최대 사이에서 무작위로 쉬어 "
+                "사람이 쓰는 것처럼 보이게 합니다.")
+        self.v_init  = self._field(
+            f2, "응답 감지 시작 대기 (초)", getattr(config, "RESPONSE_INIT_WAIT", 2.0), 4,
+            tip="메시지를 보낸 직후, AI가 답을 쓰기 시작할 때까지 기다리는 초기 대기(초). "
+                "응답 시작이 느린 환경이면 늘리세요.")
+        self.v_poll  = self._field(
+            f2, "응답 폴링 간격 (초)", getattr(config, "RESPONSE_POLL_INTERVAL", 0.5), 5,
+            tip="AI 응답이 끝났는지 확인하는 주기(초). 짧을수록 빨리 감지하지만 더 자주 확인합니다.")
+        self.v_done  = self._field(
+            f2, "응답 완료 후 대기 (초)", getattr(config, "RESPONSE_DONE_DELAY", 1.0), 6,
+            tip="응답이 끝났다고 판단한 뒤, 글자가 완전히 안정될 때까지 추가로 기다리는 시간(초). "
+                "결과가 잘리면 늘려보세요.")
 
         # 플레이스홀더 유지 옵션
         ph_frame = ctk.CTkFrame(scroll, fg_color="transparent")
@@ -769,10 +830,10 @@ class SettingsDialog(ctk.CTkToplevel):
         # 결과열
         res_f = ctk.CTkFrame(col_frame, fg_color="transparent")
         res_f.pack(fill="x", pady=(6, 0))
-        ctk.CTkLabel(res_f, text="결과열", width=40, anchor="w").pack(side="left")
+        ctk.CTkLabel(res_f, text="번역 결과 기입", width=90, anchor="w").pack(side="left")
         self.v_result_col = tk.StringVar(value=getattr(config, "RESULT_COL", "D"))
         ctk.CTkEntry(res_f, textvariable=self.v_result_col, width=60).pack(side="left", padx=4)
-        ctk.CTkLabel(res_f, text="(열 문자 입력: A, B, C, D ...)",
+        ctk.CTkLabel(res_f, text="(번역 결과를 적을 열 문자: A, B, C, D ...)",
                      text_color="#888", font=ctk.CTkFont(size=11)).pack(side="left", padx=4)
 
         ctk.CTkFrame(scroll, height=1, fg_color="#3a3a4a").pack(
@@ -1225,8 +1286,8 @@ class SetupWizard(ctk.CTkToplevel):
                      font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", pady=(6, 6))
         tf = ctk.CTkFrame(scroll, fg_color="transparent")
         tf.pack(fill="x")
-        self.v_batch  = self._row(tf, "배치 크기 (행)", config.BATCH_SIZE, 0)
-        self.v_result = self._row(tf, "결과열 (A,B,C,D...)", getattr(config, "RESULT_COL", "D"), 1)
+        self.v_batch  = self._row(tf, "1회 번역 분량(시트 행)", config.BATCH_SIZE, 0)
+        self.v_result = self._row(tf, "번역 결과 기입(열)", getattr(config, "RESULT_COL", "D"), 1)
 
         # 번역 언어
         lf = ctk.CTkFrame(scroll, fg_color="transparent")

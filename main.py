@@ -79,19 +79,31 @@ def ensure_external_prompts():
         except Exception:
             pass
 
+    # 통합/삭제된 프롬프트가 외부 폴더에 남아 있으면 정리한다.
+    for name in DEPRECATED_PROMPTS:
+        p = os.path.join(dst, f"{name}.txt")
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
+
 # UI 라디오에 표시할 순서 (파일명 = 코드, 표시명은 LANG_LABELS 참조)
 # 파일명을 ASCII로 둬서 OS/브라우저 어디서도 깨지지 않게 한다.
 PROMPT_LANGS = [
-    "es", "es_general", "en", "fr", "de",
+    "es", "en", "fr", "de",
     "pt", "tr", "id", "zh_cn", "th",
 ]
 
 # 코드 → 화면 표시용 한글 라벨
 LANG_LABELS = {
-    "es": "스페인어", "es_general": "스페인어(일반)", "en": "영어",
+    "es": "스페인어", "en": "영어",
     "fr": "프랑스어", "de": "독일어", "pt": "포르투갈어",
     "tr": "튀르키어", "id": "인도네시아어", "zh_cn": "중국어(간체)", "th": "태국어",
 }
+
+# 더 이상 쓰지 않는(통합/삭제된) 프롬프트 — 외부 폴더에 남아 있으면 정리한다.
+DEPRECATED_PROMPTS = {"es_general"}
 
 # 코드가 모든 프롬프트 끝에 자동으로 붙이는 행 ID 규칙.
 # 프롬프트 파일 자체에는 ID 규칙을 두지 않는다 → 파일은 순수 번역 규칙만 유지하고,
@@ -118,6 +130,7 @@ def list_prompt_langs():
     if not os.path.isdir(PROMPTS_DIR):
         return []
     available = {f[:-4] for f in os.listdir(PROMPTS_DIR) if f.endswith(".txt")}
+    available -= DEPRECATED_PROMPTS   # 통합/삭제된 항목은 목록에서 제외
     ordered = [lang for lang in PROMPT_LANGS if lang in available]
     # PROMPT_LANGS에 없지만 폴더엔 있는 파일도 뒤에 덧붙임
     extras = sorted(available - set(PROMPT_LANGS))
