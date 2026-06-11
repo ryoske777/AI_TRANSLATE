@@ -345,6 +345,12 @@ class TranslationWorker(threading.Thread):
         total = 0
         driver = None
         try:
+            # 이번 실행의 결과만 요약에 보이도록 이전 실패 기록을 초기화한다
+            try:
+                if os.path.exists(FAIL_LOG):
+                    os.remove(FAIL_LOG)
+            except Exception:
+                pass
             self.status("Google Sheets 연결 중...", "#e0af68")
             self.log("Google Sheets 연결 중...")
             sheet = get_sheet()
