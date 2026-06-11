@@ -2,6 +2,8 @@ import time
 import re
 import sys
 import os
+import json
+import hashlib
 import random
 import pyperclip
 import gspread
@@ -14,12 +16,66 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 import config
+import paths
 
 
 # ── 프롬프트 관리 (언어별 즐겨찾기 + ID 규칙 자동 주입) ──────────────────────
 
-# 프롬프트 파일이 모여있는 폴더
-PROMPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompts")
+# 사용자가 편집/추가하는 외부 프롬프트 폴더 (exe 옆 또는 소스 폴더).
+PROMPTS_DIR = paths.app_path("prompts")
+# exe 안에 번들된 기본 프롬프트 (개발 모드에선 PROMPTS_DIR 과 동일 폴더).
+_BUNDLED_PROMPTS_DIR = paths.resource_path("prompts")
+# 번들 기본값을 외부로 시드한 시점의 해시 기록 (편집 보존 판정용).
+_PROMPT_SEED_FILE = paths.app_path(".prompt_seed.json")
+
+
+def ensure_external_prompts():
+    """exe 실행 시 번들된 기본 프롬프트를 PROMPTS_DIR 로 시드한다.
+
+    3-way 판정으로 사용자가 편집한 파일은 보존하고, 손대지 않은 파일만
+    새 기본값으로 갱신한다. (updater 의 프롬프트 보존 철학을 로컬에서 재현)
+    개발 모드(번들=외부 동일 폴더)에서는 아무 것도 하지 않는다.
+    """
+    src, dst = _BUNDLED_PROMPTS_DIR, PROMPTS_DIR
+    if os.path.abspath(src) == os.path.abspath(dst) or not os.path.isdir(src):
+        return
+    os.makedirs(dst, exist_ok=True)
+    try:
+        with open(_PROMPT_SEED_FILE, "r", encoding="utf-8") as f:
+            seed = json.load(f)
+    except Exception:
+        seed = {}
+    changed = False
+    for name in os.listdir(src):
+        if not name.endswith(".txt"):
+            continue
+        d = os.path.join(dst, name)
+        with open(os.path.join(src, name), "rb") as f:
+            bundled = f.read()
+        bhash = hashlib.sha256(bundled).hexdigest()
+        if not os.path.exists(d):
+            with open(d, "wb") as f:
+                f.write(bundled)
+            seed[name] = bhash
+            changed = True
+            continue
+        with open(d, "rb") as f:
+            chash = hashlib.sha256(f.read()).hexdigest()
+        if chash == bhash:
+            continue  # 이미 최신
+        if seed.get(name) == chash:
+            # 직전 시드본 그대로 = 사용자가 안 건드림 → 새 기본값으로 갱신
+            with open(d, "wb") as f:
+                f.write(bundled)
+            seed[name] = bhash
+            changed = True
+        # else: 사용자가 편집했거나 기록 없음 → 보존
+    if changed:
+        try:
+            with open(_PROMPT_SEED_FILE, "w", encoding="utf-8") as f:
+                json.dump(seed, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
 # UI 라디오에 표시할 순서 (파일명 = 코드, 표시명은 LANG_LABELS 참조)
 # 파일명을 ASCII로 둬서 OS/브라우저 어디서도 깨지지 않게 한다.
@@ -86,7 +142,7 @@ def load_prompt(lang):
 
 def get_sheet():
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    creds = Credentials.from_service_account_file("credentials.json", scopes=scopes)
+    creds = Credentials.from_service_account_file(paths.app_path("credentials.json"), scopes=scopes)
     client = gspread.authorize(creds)
     sheet = client.open_by_key(config.SPREADSHEET_ID).worksheet(config.SHEET_NAME)
     return sheet
@@ -154,8 +210,7 @@ def get_pending_rows(sheet):
 
 def log_failure(start_row, end_row, reason):
     """실패한 행 범위를 실패목록.txt에 기록"""
-    import os
-    log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "실패목록.txt")
+    log_path = paths.app_path("실패목록.txt")
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(f"{start_row}~{end_row}행 — {reason}\n")
     print(f"  📝 실패 기록: {start_row}~{end_row}행 ({reason})")

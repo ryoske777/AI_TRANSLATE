@@ -14,17 +14,21 @@ import sys
 from datetime import datetime
 
 # ── main.py의 모든 함수를 그대로 import ─────────────────────────────────────
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, BASE_DIR)
+# 번들 리소스 폴더를 import 경로에 추가 (exe 면 _MEIPASS, 개발이면 소스 폴더).
+import paths
+sys.path.insert(0, paths.resource_dir())
 
 from main import (
     get_sheet, get_pending_rows, log_failure, write_results, write_status,
     setup_driver, new_conversation, send_message, wait_for_response,
     extract_last_response, sanitize_cell, restore_cell,
     group_consecutive_rows, format_batch, parse_response, is_empty, col_to_idx,
-    list_prompt_langs, load_prompt, PROMPTS_DIR, LANG_LABELS,
+    list_prompt_langs, load_prompt, ensure_external_prompts, PROMPTS_DIR, LANG_LABELS,
 )
 import config
+
+# exe 실행 시 번들된 기본 프롬프트를 외부 폴더로 시드 (편집 보존).
+ensure_external_prompts()
 
 # config에 PROMPT_LANG 속성이 없으면 기본값 주입 (첫 번째 사용 가능한 언어)
 if not hasattr(config, "PROMPT_LANG"):
@@ -39,9 +43,10 @@ if not hasattr(config, "PRESERVE_PLACEHOLDERS"):
 if not hasattr(config, "AI_MODE"):
     config.AI_MODE = "chatgpt"
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-FAIL_LOG     = os.path.join(BASE_DIR, "실패목록.txt")
-SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
+# 사용자 데이터는 exe 옆(app_dir)에 둔다 — 번들 폴더가 아니라.
+BASE_DIR = paths.app_dir()
+FAIL_LOG     = paths.app_path("실패목록.txt")
+SETTINGS_FILE = paths.app_path("settings.json")
 
 
 # ── 플레이스홀더 검증 유틸 ───────────────────────────────────────────────────
@@ -1328,67 +1333,80 @@ class App(ctk.CTk):
             return
 
         # 업데이트 있음 → 항상 물어본다 (자동/수동 공통)
-        plan = result["plan"]
-        n_update = len(plan["to_update"])
-        n_skip = len(plan["skipped"])
+        size_mb = (result.get("size") or 0) / (1024 * 1024)
         msg = (f"새 버전이 있습니다.\n\n"
                f"  현재: v{result['local']}\n"
-               f"  최신: v{result['version']}\n\n"
-               f"갱신할 파일: {n_update}개")
-        if n_skip:
-            msg += f"\n보존할 파일(편집됨): {n_skip}개"
-        msg += "\n\n지금 업데이트하시겠습니까?\n(완료 후 자동으로 재시작됩니다)"
+               f"  최신: v{result['version']}\n")
+        if size_mb:
+            msg += f"  다운로드 크기: 약 {size_mb:.1f} MB\n"
+        notes = (result.get("notes") or "").strip()
+        if notes:
+            snippet = notes if len(notes) <= 300 else notes[:300] + "..."
+            msg += f"\n[변경 내용]\n{snippet}\n"
 
+        # 개발(.py) 모드에서는 exe 통째 교체가 불가능 → 안내만.
+        if not result.get("self_update"):
+            messagebox.showinfo(
+                "업데이트 가능",
+                msg + "\n\n개발 모드(.py 실행)에서는 자동 교체가 안 됩니다.\n"
+                      "최신 코드는 git pull 로 받아주세요.")
+            self._set_status("Ready", self.COLORS["text_sub"])
+            return
+
+        msg += "\n지금 업데이트하시겠습니까?\n(다운로드 후 자동으로 교체·재시작됩니다)"
         if not messagebox.askyesno("업데이트 가능", msg):
             self._set_status("Ready", self.COLORS["text_sub"])
             return
 
-        self._do_update(result["remote"], plan)
+        self._do_update(result)
 
-    def _do_update(self, remote, plan):
-        """실제 다운로드·교체 후 자동 재시작."""
-        self._add_log("업데이트를 시작합니다...", "info")
-        self._set_status("업데이트 중...", self.COLORS["accent"])
+    def _do_update(self, result):
+        """새 exe 다운로드 → 교체·재시작."""
+        self._add_log("업데이트 다운로드를 시작합니다...", "info")
+        self._set_status("업데이트 다운로드 중...", self.COLORS["accent"])
+
+        def on_progress(done, total):
+            if total:
+                pct = done * 100 // total
+                self.after(0, lambda: self._set_status(
+                    f"다운로드 중... {pct}%", self.COLORS["accent"]))
 
         def worker():
             try:
                 import updater
-                ok, failed = updater.apply_update(
-                    remote, plan,
-                    log=lambda m: self.after(0, lambda: self._add_log(m, "info")))
+                path = updater.download_update(result, progress=on_progress)
+                err = None
             except Exception as e:
-                ok, failed = 0, [("전체", str(e))]
-            self.after(0, lambda: self._after_update(ok, failed))
+                path, err = None, str(e)
+            self.after(0, lambda: self._after_download(path, err))
         threading.Thread(target=worker, daemon=True).start()
 
-    def _after_update(self, ok, failed):
-        if failed:
-            detail = "\n".join(f"  • {f[0]}: {f[1]}" for f in failed[:5])
+    def _after_download(self, path, err):
+        if err or not path:
             messagebox.showwarning(
-                "업데이트 일부 실패",
-                f"{ok}개 갱신 완료, {len(failed)}개 실패.\n\n{detail}\n\n"
-                "성공한 파일만 적용하고 재시작합니다.")
-        else:
-            messagebox.showinfo("업데이트 완료",
-                                f"{ok}개 파일을 갱신했습니다.\n프로그램을 재시작합니다.")
-        self._restart_app()
+                "업데이트 실패",
+                f"다운로드에 실패했습니다.\n\n{err or '알 수 없는 오류'}\n\n"
+                "잠시 후 다시 시도해주세요.")
+            self._set_status("Ready", self.COLORS["text_sub"])
+            return
 
-    def _restart_app(self):
-        """현재 프로세스를 종료하고 동일 인자로 새로 실행 (코어 코드 갱신 반영)."""
+        messagebox.showinfo("업데이트 준비 완료",
+                            "다운로드가 끝났습니다.\n프로그램을 교체하고 재시작합니다.")
+        try:
+            import updater
+            updater.apply_and_restart(path)
+        except Exception as e:
+            messagebox.showerror(
+                "업데이트 실패",
+                f"교체 단계에서 오류가 발생했습니다.\n\n{e}")
+            self._set_status("Ready", self.COLORS["text_sub"])
+            return
+        # 교체 스크립트가 떴으니 현재 프로세스는 종료한다.
         try:
             self.destroy()
         except Exception:
             pass
-        python = sys.executable
-        # pythonw.exe 로 실행됐으면 그대로, 아니면 현재 인터프리터로 main_ui.py 재실행
-        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "main_ui.py")
-        try:
-            os.execl(python, python, script)
-        except Exception:
-            # execl 실패 시 subprocess 폴백
-            import subprocess
-            subprocess.Popen([python, script])
-            sys.exit(0)
+        sys.exit(0)
 
     def _clear_log(self):
         if not messagebox.askyesno("로그 삭제", "시스템 로그를 삭제하시겠습니까?"):
