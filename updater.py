@@ -19,7 +19,9 @@ main.ensure_external_prompts() 가 시작 시 3-way 로 머지(편집 보존)한
 
 import os
 import sys
+import time
 import json
+import shutil
 import subprocess
 import urllib.request
 import urllib.error
@@ -177,38 +179,71 @@ def download_update(info, progress=None, timeout=180):
 
 
 # ── 교체·재실행 ──────────────────────────────────────────────────────────────
+#
+# 교체는 '새 exe 가 직접 수행'한다. 배치 스크립트의 cmd /c 인자 따옴표 버그와
+# 한글/공백 경로 인코딩 문제를 피하기 위해, 다운로드한 새 exe 를
+#   new.exe --apply-update "<구 exe 경로>"
+# 로 띄운다. 새 exe 는 구 프로세스가 종료되길 기다렸다가 자신을 구 경로에
+# 덮어쓰고(=교체) 구 경로를 재실행한다. 모든 파일 작업은 파이썬이 처리한다.
+
+APPLY_FLAG = "--apply-update"
+
+_DETACHED_PROCESS         = 0x00000008
+_CREATE_NEW_PROCESS_GROUP = 0x00000200
+
 
 def apply_and_restart(new_exe):
-    """현재 실행 중인 exe 를 new_exe 로 교체하고 재실행한다. (Windows)
+    """다운로드한 새 exe 에게 교체를 위임하고, 호출 측은 즉시 종료해야 한다.
 
-    실행 중 exe 는 잠겨 있어 직접 덮을 수 없으므로, 본 프로세스가 종료될 때까지
-    기다렸다 교체·재실행하는 배치 스크립트를 분리 프로세스로 띄운다.
-    경로(공백/한글 포함)는 인자(%1,%2)로 넘겨 bat 본문은 ASCII 만 유지한다.
+    현재(구) exe 는 실행 중이라 잠겨 있으므로 직접 덮을 수 없다. 대신 새 exe 를
+    --apply-update 모드로 띄우고, 본 프로세스는 곧바로(os._exit) 종료해 잠금을 푼다.
     """
     if not paths.is_frozen():
         raise RuntimeError("개발 모드에서는 자동 교체를 지원하지 않습니다. git pull 로 갱신하세요.")
     cur = os.path.abspath(sys.executable)
     new = os.path.abspath(new_exe)
-    bat = paths.app_path("_apply_update.bat")
-    script = (
-        "@echo off\r\n"
-        "setlocal\r\n"
-        ":retry\r\n"
-        "move /y %2 %1 >nul 2>&1\r\n"
-        "if errorlevel 1 (\r\n"
-        "  ping -n 2 127.0.0.1 >nul\r\n"
-        "  goto retry\r\n"
-        ")\r\n"
-        'start "" %1\r\n'
-        'del "%~f0"\r\n'
-    )
-    with open(bat, "w", encoding="ascii") as f:
-        f.write(script)
-
-    DETACHED_PROCESS        = 0x00000008
-    CREATE_NEW_PROCESS_GROUP = 0x00000200
     subprocess.Popen(
-        ["cmd", "/c", bat, cur, new],
-        creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+        [new, APPLY_FLAG, cur],
+        creationflags=_DETACHED_PROCESS | _CREATE_NEW_PROCESS_GROUP,
         close_fds=True,
     )
+
+
+def perform_swap(target):
+    """--apply-update 모드 진입점: 이 새 exe 를 target(구 exe)에 덮어쓰고 재실행.
+
+    구 프로세스가 종료돼 target 잠금이 풀릴 때까지 폴링하며 교체를 시도한다.
+    GUI 없이 동작하며, 끝나면 target 을 실행하고 종료한다.
+    """
+    src = os.path.abspath(sys.executable)
+    target = os.path.abspath(target)
+    deadline = time.time() + 60
+    swapped = False
+    while time.time() < deadline:
+        try:
+            shutil.copy2(src, target)   # 구 exe 가 잠겨 있으면 예외 → 재시도
+            swapped = True
+            break
+        except Exception:
+            time.sleep(0.5)
+    # 교체 성공/실패와 무관하게 target 을 재실행한다(실패 시 구버전 유지).
+    try:
+        subprocess.Popen(
+            [target],
+            creationflags=_DETACHED_PROCESS | _CREATE_NEW_PROCESS_GROUP,
+            close_fds=True,
+        )
+    except Exception:
+        pass
+    return swapped
+
+
+def cleanup_after_update():
+    """업데이트 직후 첫 실행 시 임시 다운로드 파일을 정리한다(있으면)."""
+    for name in ("_update_download.exe", "_apply_update.bat"):
+        p = paths.app_path(name)
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
