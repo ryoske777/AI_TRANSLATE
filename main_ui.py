@@ -1151,8 +1151,20 @@ class SetupWizard(ctk.CTkToplevel):
         self.v_id    = self._row(sf, "스프레드시트 ID", config.SPREADSHEET_ID, 0)
         self.v_sheet = self._row(sf, "시트 이름",       config.SHEET_NAME,      1)
         self.v_start = self._row(sf, "시작 행 번호",    config.START_ROW,       2)
+
+        # credentials.json — 파일 선택 시 exe 폴더로 복사한다
+        ctk.CTkLabel(sf, text="credentials.json", anchor="w").grid(
+            row=3, column=0, padx=(0, 12), pady=6, sticky="w")
+        self._cred_src = None
+        cred_exists = os.path.exists(paths.app_path("credentials.json"))
+        self.v_cred = tk.StringVar(value="(이미 설정됨)" if cred_exists else "")
+        ctk.CTkEntry(sf, textvariable=self.v_cred, width=224).grid(
+            row=3, column=1, pady=6, sticky="w")
+        ctk.CTkButton(sf, text="찾아보기", width=72,
+                      command=self._browse_cred).grid(row=3, column=2, padx=6)
         ctk.CTkLabel(scroll,
-                     text="※ credentials.json 을 exe 와 같은 폴더에 두고, 해당 계정에 시트 공유를 해야 합니다.",
+                     text="※ 구글 서비스 계정 키(.json)를 선택하면 프로그램 폴더로 복사됩니다.\n"
+                          "   해당 계정 이메일에 스프레드시트 '공유'가 되어 있어야 합니다.",
                      text_color="#888", font=ctk.CTkFont(size=11)).pack(anchor="w", padx=4, pady=(0, 8))
 
         # 3) 기본 번역 설정
@@ -1199,6 +1211,43 @@ class SetupWizard(ctk.CTkToplevel):
         if p:
             self.v_chrome.set(p)
 
+    def _browse_cred(self):
+        p = filedialog.askopenfilename(
+            title="credentials.json 선택",
+            filetypes=[("JSON", "*.json"), ("모든 파일", "*.*")],
+            parent=self)
+        if p:
+            self._cred_src = p
+            self.v_cred.set(p)
+
+    def _copy_credentials(self):
+        """선택한 credentials.json 을 exe 폴더로 복사. 성공/스킵 시 True."""
+        if not self._cred_src:
+            return True   # 선택 안 함 → 기존 파일 유지
+        import json as _json
+        import shutil
+        dest = paths.app_path("credentials.json")
+        try:
+            with open(self._cred_src, "r", encoding="utf-8") as f:
+                data = _json.load(f)
+            if "client_email" not in data and data.get("type") != "service_account":
+                if not messagebox.askyesno(
+                        "확인", "선택한 파일이 서비스 계정 키가 아닐 수 있습니다.\n"
+                                "그래도 사용할까요?", parent=self):
+                    return False
+        except Exception:
+            if not messagebox.askyesno(
+                    "확인", "선택한 파일이 올바른 JSON 이 아닙니다.\n"
+                            "그래도 복사할까요?", parent=self):
+                return False
+        try:
+            if os.path.abspath(self._cred_src) != os.path.abspath(dest):
+                shutil.copy2(self._cred_src, dest)
+        except Exception as e:
+            messagebox.showerror("오류", f"credentials.json 복사 실패:\n{e}", parent=self)
+            return False
+        return True
+
     def _finish(self):
         try:
             config.CHROME_BINARY_PATH = self.v_chrome.get().strip()
@@ -1222,6 +1271,10 @@ class SetupWizard(ctk.CTkToplevel):
                     "확인", "스프레드시트 ID 가 비어 있습니다.\n그래도 저장할까요?",
                     parent=self):
                 return
+
+        # credentials.json 복사 (선택했을 때만)
+        if not self._copy_credentials():
+            return
 
         save_settings()
         # 메인 화면 언어 표시 갱신
@@ -1418,7 +1471,11 @@ class App(ctk.CTk):
     def _start(self):
         creds = os.path.join(BASE_DIR, "credentials.json")
         if not os.path.exists(creds):
-            messagebox.showerror("오류", "credentials.json 파일이 없습니다.")
+            if messagebox.askyesno(
+                    "credentials.json 없음",
+                    "credentials.json 파일이 없습니다.\n"
+                    "지금 설정 마법사에서 지정할까요?"):
+                self._run_setup_wizard()
             return
         if not config.SPREADSHEET_ID:
             messagebox.showerror("오류", "설정에서 스프레드시트 ID를 입력해주세요.")
