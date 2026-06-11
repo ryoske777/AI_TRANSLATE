@@ -1,15 +1,21 @@
 name: Build & Release EXE
 
-# v로 시작하는 태그를 푸시하면 Windows 에서 exe 를 빌드하고
-# 해당 태그의 GitHub 릴리스에 RO_Translator.exe 를 첨부한다.
+# 릴리스 방법 (둘 중 하나)
+#   1) 태그 푸시:    git tag v1.0.1 && git push origin main --tags
+#   2) 수동 실행:    Actions 탭 > Build & Release EXE > Run workflow > version 입력
+# 둘 다 Windows 에서 exe 를 빌드하고 해당 버전 릴리스에 RO_Translator.exe 를 첨부한다.
 on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:   # 수동 실행도 허용
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "릴리스 버전 (예: 1.0.0)"
+        required: true
 
 permissions:
-  contents: write       # 릴리스 생성/자산 업로드에 필요
+  contents: write       # 릴리스/태그 생성·자산 업로드에 필요
 
 jobs:
   build-windows:
@@ -29,14 +35,19 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Sync version.txt to tag
+      - name: Resolve version & sync version.txt
+        id: ver
         shell: bash
         run: |
-          TAG="${GITHUB_REF_NAME#v}"
-          if [ -n "$TAG" ] && [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            echo -n "$TAG" > version.txt
-            echo "version.txt = $TAG"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            V="${GITHUB_REF_NAME#v}"
+          else
+            V="${{ github.event.inputs.version }}"
+            V="${V#v}"
           fi
+          echo -n "$V" > version.txt
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Building v$V"
 
       - name: Build exe
         run: pyinstaller RO_Translator.spec
@@ -47,9 +58,10 @@ jobs:
           name: RO_Translator
           path: dist/RO_Translator.exe
 
-      - name: Attach exe to release
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Publish release (create tag if needed)
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: v${{ steps.ver.outputs.version }}
           files: dist/RO_Translator.exe
           generate_release_notes: true
