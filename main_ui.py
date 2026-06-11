@@ -24,7 +24,8 @@ from main import (
     extract_last_response, sanitize_cell, restore_cell,
     group_consecutive_rows, format_batch, parse_response, is_empty, col_to_idx,
     list_prompt_langs, load_prompt, ensure_external_prompts, find_chrome,
-    extract_spreadsheet_id, get_service_account_email, PROMPTS_DIR, LANG_LABELS,
+    extract_spreadsheet_id, get_service_account_email, test_connection,
+    check_logged_in, PROMPTS_DIR, LANG_LABELS,
 )
 import config
 
@@ -302,6 +303,10 @@ class TranslationWorker(threading.Thread):
     def waiting(self, msg):
         self.log_q.put(("waiting", msg))
 
+    def wait_text(self, msg):
+        """대기 중 베이스 문구만 갱신(점 애니메이션/상태 유지). 진행 경과 표시용."""
+        self.log_q.put(("waiting_text", msg))
+
     def done_waiting(self):
         self.log_q.put(("done_waiting", None))
 
@@ -346,7 +351,8 @@ class TranslationWorker(threading.Thread):
 
             pending_rows = get_pending_rows(sheet)
             if not pending_rows:
-                self.log("처리할 행이 없습니다.", "warn")
+                self.log("번역 대상 행이 없습니다.", "warn")
+                self.log_q.put(("empty", None))
                 self.done_callback(0, 0, [])
                 return
 
@@ -371,9 +377,26 @@ class TranslationWorker(threading.Thread):
                         raise Exception(f"Chrome 연결 실패 (5회 시도). {detail}")
             self.log("Chrome 연결 완료", "success")
 
+            # ── ChatGPT 로그인 사전 확인 (ChatGPT 모드만) ──────────────────
+            # 미로그인 상태면 5분 대기 후 실패하지 않고 즉시 안내한다.
+            if ai_mode != "claude":
+                self.waiting("ChatGPT 로그인 확인 중")
+                new_conversation(driver)
+                logged_in = check_logged_in(driver, timeout=12)
+                self.done_waiting()
+                if self.stop_flag:
+                    return
+                if not logged_in:
+                    raise Exception(
+                        "ChatGPT에 로그인되어 있지 않은 것 같습니다. "
+                        "열린 Chrome 창에서 chatgpt.com 에 로그인한 뒤 다시 RUN 하세요.")
+
             self.status("번역 진행 중...", "#9ece6a")
             self.send_count = 0
             groups = group_consecutive_rows(pending_rows)
+            import math as _math
+            total_batches = sum(_math.ceil(len(g) / max(1, config.BATCH_SIZE)) for g in groups)
+            batch_no = 0
             gi = 0
             bi = 0
 
@@ -441,7 +464,7 @@ class TranslationWorker(threading.Thread):
                     self.log("페이지 로드 완료", "info")
                     self.waiting("고정 프롬프트 전송 중")
                     send_message(driver, config.FIXED_PROMPT)
-                    wait_for_response(driver)
+                    wait_for_response(driver, should_stop=lambda: self.stop_flag)
                     self.done_waiting()
                     self.send_count = 0
                     self.force_new_conv = False
@@ -449,14 +472,23 @@ class TranslationWorker(threading.Thread):
 
                 batch = group[bi: bi + config.BATCH_SIZE]
                 s_row, e_row = batch[0][0], batch[-1][0]
+                batch_no += 1
                 label = " (구멍 그룹)" if len(group) < config.BATCH_SIZE else ""
                 self.log(f"배치 전송: {s_row}~{e_row}행 ({len(batch)}행{label})")
-                self.waiting(f"{s_row}~{e_row}행 번역 요청 중")
+                self.waiting(f"{s_row}~{e_row}행 번역 요청 중 · 배치 {batch_no}/{total_batches}")
                 send_message(driver, format_batch(batch))
                 self.done_waiting()
-                self.waiting(f"ChatGPT 응답 대기 중")
-                wait_for_response(driver)
+                if self.stop_flag:
+                    break
+                self.waiting(f"ChatGPT 응답 대기 중 · 배치 {batch_no}/{total_batches}")
+                _base = f"ChatGPT 응답 대기 중 · 배치 {batch_no}/{total_batches}"
+                wait_for_response(
+                    driver,
+                    should_stop=lambda: self.stop_flag,
+                    on_tick=lambda e: self.wait_text(f"{_base} · {int(e)}초"))
                 self.done_waiting()
+                if self.stop_flag:
+                    break
 
                 response = None
                 for attempt in range(1, 4):
@@ -489,7 +521,7 @@ class TranslationWorker(threading.Thread):
                         )
                         self.waiting("한글 포함 행 재번역 중")
                         send_message(driver, retry_msg)
-                        wait_for_response(driver)
+                        wait_for_response(driver, should_stop=lambda: self.stop_flag)
                         self.done_waiting()
                         retry_resp = extract_last_response(driver)
                         if retry_resp:
@@ -532,7 +564,7 @@ class TranslationWorker(threading.Thread):
                                 )
                                 self.waiting("플레이스홀더 불일치 행 재번역 중")
                                 send_message(driver, retry_msg)
-                                wait_for_response(driver)
+                                wait_for_response(driver, should_stop=lambda: self.stop_flag)
                                 self.done_waiting()
                                 retry_resp = extract_last_response(driver)
                                 if retry_resp:
@@ -572,9 +604,16 @@ class TranslationWorker(threading.Thread):
 
                 import time as _t
                 import random as _r
-                _t.sleep(_r.uniform(config.DELAY_MIN, config.DELAY_MAX))
+                # STOP 즉시 반응: 긴 딜레이를 0.2초 단위로 쪼개 중지 플래그를 자주 확인
+                delay = _r.uniform(config.DELAY_MIN, config.DELAY_MAX)
+                waited = 0.0
+                while waited < delay and not self.stop_flag:
+                    _t.sleep(min(0.2, delay - waited))
+                    waited += 0.2
+                if self.stop_flag:
+                    break
 
-                # 일시정지 대기
+                # 일시정지 대기 (정지 시 즉시 빠져나오도록 stop()이 이벤트도 set)
                 self._pause_event.wait()
                 if self.stop_flag:
                     break
@@ -681,6 +720,91 @@ def add_info_icon(parent, row, column, tip_text):
     icon.grid(row=row, column=column, padx=(4, 0), sticky="w")
     Tooltip(icon, tip_text)
     return icon
+
+
+def validate_config_values(d):
+    """설정값 검증. 문제가 있으면 한국어 오류 메시지(str), 없으면 None 반환.
+
+    d 는 {필드명: 값} 딕셔너리. 저장 직전 SettingsDialog/SetupWizard 에서 공용 사용.
+    숫자 변환 오류도 여기서 잡아 친절한 메시지로 돌려준다.
+    """
+    def _num(key, label, cast, minv=None, maxv=None):
+        if key not in d:
+            return None
+        try:
+            v = cast(d[key])
+        except (TypeError, ValueError):
+            return f"'{label}' 값이 올바른 숫자가 아닙니다."
+        if minv is not None and v < minv:
+            return f"'{label}' 값은 {minv} 이상이어야 합니다."
+        if maxv is not None and v > maxv:
+            return f"'{label}' 값은 {maxv} 이하여야 합니다."
+        return None
+
+    checks = [
+        ("BATCH_SIZE", "1회 번역 분량(시트 행)", int, 1, None),
+        ("MAX_SENDS_PER_CONVERSATION", "AI 대화창 전송 횟수", int, 1, None),
+        ("START_ROW", "시작 행 번호", int, 1, None),
+        ("DELAY_MIN", "딜레이 최소", float, 0, None),
+        ("DELAY_MAX", "딜레이 최대", float, 0, None),
+        ("RESPONSE_INIT_WAIT", "응답 감지 시작 대기", float, 0, None),
+        ("RESPONSE_POLL_INTERVAL", "응답 폴링 간격", float, 0, None),
+        ("RESPONSE_DONE_DELAY", "응답 완료 후 대기", float, 0, None),
+        ("REMOTE_DEBUGGING_PORT", "디버그 포트", int, 1, 65535),
+    ]
+    for args in checks:
+        err = _num(*args)
+        if err:
+            return err
+
+    if "DELAY_MIN" in d and "DELAY_MAX" in d:
+        try:
+            if float(d["DELAY_MAX"]) < float(d["DELAY_MIN"]):
+                return "'딜레이 최대'는 '딜레이 최소'보다 크거나 같아야 합니다."
+        except (TypeError, ValueError):
+            pass
+
+    if "RESULT_COL" in d:
+        rc = str(d["RESULT_COL"]).strip()
+        if not re.fullmatch(r"[A-Za-z]+", rc):
+            return "'번역 결과 기입'은 열 문자만 입력하세요. (예: A, B, C, D, AA)"
+
+    return None
+
+
+def run_connection_test(parent, button, spreadsheet=None, sheet_name=None):
+    """입력한 설정으로 시트 연결을 백그라운드에서 점검하고 결과를 팝업으로 보여준다.
+
+    저장 전이라도 현재 입력값으로 바로 확인할 수 있게, 전달된 값을 잠시 config 에
+    반영해 test_connection()을 호출한 뒤 원복한다. (실제 저장은 '저장/완료'가 담당)
+    """
+    saved = (config.SPREADSHEET_ID, getattr(config, "SHEET_NAME", ""))
+    if spreadsheet is not None:
+        config.SPREADSHEET_ID = extract_spreadsheet_id(spreadsheet)
+    if sheet_name is not None and str(sheet_name).strip():
+        config.SHEET_NAME = str(sheet_name).strip()
+    try:
+        button.configure(state="disabled", text="테스트 중...")
+    except Exception:
+        pass
+
+    def worker():
+        ok, msg = test_connection()
+
+        def show():
+            try:
+                button.configure(state="normal", text="🔌 연결 테스트")
+            except Exception:
+                pass
+            config.SPREADSHEET_ID, config.SHEET_NAME = saved  # 저장 전이므로 원복
+            if ok:
+                messagebox.showinfo("연결 테스트", msg, parent=parent)
+            else:
+                messagebox.showerror("연결 테스트 실패", msg, parent=parent)
+
+        parent.after(0, show)
+
+    threading.Thread(target=worker, daemon=True).start()
 
 
 def make_share_help(parent, clipboard_widget):
@@ -956,34 +1080,58 @@ class SettingsDialog(ctk.CTkToplevel):
                       command=self.destroy).pack(side="right", padx=(6, 0))
         ctk.CTkButton(btn_frame, text="저장", width=90,
                       command=self._save).pack(side="right")
+        self.btn_test = ctk.CTkButton(btn_frame, text="🔌 연결 테스트", width=120,
+                                      fg_color="#3182ce", hover_color="#2b6cb0",
+                                      command=self._test_connection)
+        self.btn_test.pack(side="left")
+
+    def _test_connection(self):
+        run_connection_test(self, self.btn_test,
+                            spreadsheet=self.v_id.get(), sheet_name=self.v_sheet.get())
+
+    def _collect(self):
+        """입력값을 dict 로 모은다 (검증용)."""
+        return {
+            "START_ROW": self.v_start.get(),
+            "BATCH_SIZE": self.v_batch.get(),
+            "MAX_SENDS_PER_CONVERSATION": self.v_sends.get(),
+            "DELAY_MIN": self.v_dmin.get(),
+            "DELAY_MAX": self.v_dmax.get(),
+            "REMOTE_DEBUGGING_PORT": self.v_port.get(),
+            "RESPONSE_INIT_WAIT": self.v_init.get(),
+            "RESPONSE_POLL_INTERVAL": self.v_poll.get(),
+            "RESPONSE_DONE_DELAY": self.v_done.get(),
+            "RESULT_COL": self.v_result_col.get().strip(),
+        }
 
     def _save(self):
-        try:
-            config.SPREADSHEET_ID             = extract_spreadsheet_id(self.v_id.get())
-            config.SHEET_NAME                 = self.v_sheet.get().strip()
-            config.START_ROW                  = int(self.v_start.get())
-            config.BATCH_SIZE                 = int(self.v_batch.get())
-            config.MAX_SENDS_PER_CONVERSATION = int(self.v_sends.get())
-            config.DELAY_MIN                  = float(self.v_dmin.get())
-            config.DELAY_MAX                  = float(self.v_dmax.get())
-            config.REMOTE_DEBUGGING_PORT      = int(self.v_port.get())
-            config.CHROME_BINARY_PATH         = self.v_chrome.get().strip()
-            config.RESPONSE_INIT_WAIT         = float(self.v_init.get())
-            config.RESPONSE_POLL_INTERVAL     = float(self.v_poll.get())
-            config.RESPONSE_DONE_DELAY        = float(self.v_done.get())
-            config.PRESERVE_PLACEHOLDERS      = bool(self.v_preserve_ph.get())
-            # 열 설정 저장
-            for attr, var in self.col_vars.items():
-                val = var.get()
-                setattr(config, attr, None if val == "None" else val)
-            config.RESULT_COL = self.v_result_col.get().strip().upper() or "D"
-            ai_mode = (self.v_ai_mode.get() or "chatgpt").lower()
-            config.AI_MODE = ai_mode if ai_mode in ("chatgpt", "claude") else "chatgpt"
-            config.PROMPT_LANG = self.v_prompt_lang.get()
-            save_settings()
-            self.destroy()
-        except ValueError as e:
-            messagebox.showerror("입력 오류", f"숫자 형식을 확인해주세요.\n{e}", parent=self)
+        err = validate_config_values(self._collect())
+        if err:
+            messagebox.showerror("입력 오류", err, parent=self)
+            return
+        config.SPREADSHEET_ID             = extract_spreadsheet_id(self.v_id.get())
+        config.SHEET_NAME                 = self.v_sheet.get().strip()
+        config.START_ROW                  = int(self.v_start.get())
+        config.BATCH_SIZE                 = int(self.v_batch.get())
+        config.MAX_SENDS_PER_CONVERSATION = int(self.v_sends.get())
+        config.DELAY_MIN                  = float(self.v_dmin.get())
+        config.DELAY_MAX                  = float(self.v_dmax.get())
+        config.REMOTE_DEBUGGING_PORT      = int(self.v_port.get())
+        config.CHROME_BINARY_PATH         = self.v_chrome.get().strip()
+        config.RESPONSE_INIT_WAIT         = float(self.v_init.get())
+        config.RESPONSE_POLL_INTERVAL     = float(self.v_poll.get())
+        config.RESPONSE_DONE_DELAY        = float(self.v_done.get())
+        config.PRESERVE_PLACEHOLDERS      = bool(self.v_preserve_ph.get())
+        # 열 설정 저장
+        for attr, var in self.col_vars.items():
+            val = var.get()
+            setattr(config, attr, None if val == "None" else val)
+        config.RESULT_COL = self.v_result_col.get().strip().upper() or "D"
+        ai_mode = (self.v_ai_mode.get() or "chatgpt").lower()
+        config.AI_MODE = ai_mode if ai_mode in ("chatgpt", "claude") else "chatgpt"
+        config.PROMPT_LANG = self.v_prompt_lang.get()
+        save_settings()
+        self.destroy()
 
     def _browse_chrome(self):
         p = filedialog.askopenfilename(
@@ -1214,6 +1362,29 @@ def load_settings():
             config.PROMPT_LANG = langs[0]
         else:
             config.PROMPT_LANG = ""
+        _clamp_settings()
+    except Exception:
+        pass
+
+
+def _clamp_settings():
+    """수기 편집/손상된 settings.json 의 비정상 값을 안전 범위로 보정한다."""
+    try:
+        if config.BATCH_SIZE < 1:
+            config.BATCH_SIZE = 1
+        if config.MAX_SENDS_PER_CONVERSATION < 1:
+            config.MAX_SENDS_PER_CONVERSATION = 1
+        if config.START_ROW < 1:
+            config.START_ROW = 1
+        if config.DELAY_MIN < 0:
+            config.DELAY_MIN = 0.0
+        if config.DELAY_MAX < config.DELAY_MIN:
+            config.DELAY_MIN, config.DELAY_MAX = config.DELAY_MAX, config.DELAY_MIN
+        for attr in ("RESPONSE_INIT_WAIT", "RESPONSE_POLL_INTERVAL", "RESPONSE_DONE_DELAY"):
+            if getattr(config, attr, 0) < 0:
+                setattr(config, attr, 0.0)
+        if not (1 <= config.REMOTE_DEBUGGING_PORT <= 65535):
+            config.REMOTE_DEBUGGING_PORT = 9222
     except Exception:
         pass
 
@@ -1339,6 +1510,17 @@ class SetupWizard(ctk.CTkToplevel):
                       command=self.destroy).pack(side="right", padx=(6, 0))
         ctk.CTkButton(btn, text="완료", width=110,
                       command=self._finish).pack(side="right")
+        self.btn_test = ctk.CTkButton(btn, text="🔌 연결 테스트", width=120,
+                                      fg_color="#3182ce", hover_color="#2b6cb0",
+                                      command=self._test_connection)
+        self.btn_test.pack(side="left")
+
+    def _test_connection(self):
+        # 마법사에서 고른 credentials 가 아직 폴더에 없으면 먼저 복사해 테스트한다
+        if self._cred_src and not self._copy_credentials():
+            return
+        run_connection_test(self, self.btn_test,
+                            spreadsheet=self.v_id.get(), sheet_name=self.v_sheet.get())
 
     def _browse_chrome(self):
         p = filedialog.askopenfilename(
@@ -1396,6 +1578,14 @@ class SetupWizard(ctk.CTkToplevel):
         return True
 
     def _finish(self):
+        err = validate_config_values({
+            "START_ROW": self.v_start.get(),
+            "BATCH_SIZE": self.v_batch.get(),
+            "RESULT_COL": self.v_result.get().strip(),
+        })
+        if err:
+            messagebox.showerror("입력 오류", err, parent=self)
+            return
         try:
             config.CHROME_BINARY_PATH = self.v_chrome.get().strip()
             config.SPREADSHEET_ID     = extract_spreadsheet_id(self.v_id.get())
@@ -1654,9 +1844,11 @@ class App(ctk.CTk):
     def _stop(self):
         if self.worker:
             self.worker.stop_flag = True
+            # 일시정지 중이거나 대기 중이어도 즉시 빠져나오게 이벤트를 깨운다
+            self.worker._pause_event.set()
         self.btn_stop.configure(state="disabled")
         self.btn_pause.configure(state="disabled")
-        self._add_log("중지 요청됨 — 현재 배치 완료 후 종료됩니다.", "warn")
+        self._add_log("중지 요청됨 — 곧 종료됩니다.", "warn")
 
     def _pause(self):
         if self.worker and not self.worker.pause_flag:
@@ -1860,6 +2052,19 @@ class App(ctk.CTk):
                     self._waiting_msg = msg_text
                     self._is_waiting = True
                     self._dot_count = 0
+                elif kind == "waiting_text":
+                    # 베이스 문구만 갱신(경과 시간 표시). 상태/점 카운트는 유지.
+                    _, msg_text = msg
+                    if self._is_waiting:
+                        self._waiting_msg = msg_text
+                elif kind == "empty":
+                    messagebox.showinfo(
+                        "번역 대상 없음",
+                        "번역할 행을 찾지 못했습니다.\n\n다음을 확인해보세요:\n"
+                        "• 결과열(번역 결과 기입)이 이미 채워져 있지 않은지\n"
+                        "• 시작 행 번호가 올바른지\n"
+                        "• 원본/대상 열 역할(설정 → 열 설정)이 맞는지\n"
+                        "• '시트(탭) 이름'이 실제 작업 탭과 같은지")
                 elif kind == "done_waiting":
                     self._is_waiting = False
                     self._waiting_msg = ""
