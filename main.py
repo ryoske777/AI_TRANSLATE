@@ -5,6 +5,8 @@ import os
 import json
 import hashlib
 import random
+import socket
+import subprocess
 import pyperclip
 import gspread
 from google.oauth2.service_account import Credentials
@@ -242,17 +244,86 @@ def write_status(sheet, row_num, status_text):
 
 # ── Chrome / Selenium ────────────────────────────────────────────────────────
 
+# 표준 Chrome 설치 위치 (자동 탐색용)
+_CHROME_CANDIDATES = [
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+]
+
+
+def find_chrome():
+    """Chrome 실행 파일 경로를 반환. 설정값 우선, 없으면 표준 위치 탐색. 못 찾으면 ''."""
+    p = (getattr(config, "CHROME_BINARY_PATH", "") or "").strip()
+    if p and os.path.exists(p):
+        return p
+    for c in _CHROME_CANDIDATES:
+        if c and os.path.exists(c):
+            return c
+    return ""
+
+
+def _is_port_open(port, host="127.0.0.1"):
+    """host:port 에 누군가 listen 중이면 True."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.5)
+        return s.connect_ex((host, port)) == 0
+
+
+def _launch_chrome_debug(binary, port):
+    """전용 프로필로 Chrome 을 디버깅 모드로 띄운다. (run_ui.bat 의 앱 내장판)
+
+    일반 Chrome 창은 건드리지 않도록 전용 user-data-dir(chrome-session)을 쓴다.
+    """
+    session = paths.app_path("chrome-session")
+    os.makedirs(session, exist_ok=True)
+    args = [
+        binary,
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={session}",
+        "--no-first-run", "--no-default-browser-check",
+        "--no-restore-last-session", "--disable-session-crashed-bubble",
+        "--disable-infobars",
+    ]
+    subprocess.Popen(args, close_fds=True)
+
+
+def ensure_chrome_running(port, timeout=20):
+    """디버깅 포트가 안 열려 있으면 Chrome 을 띄우고 열릴 때까지 대기.
+
+    이미 열려 있으면 재사용한다. Chrome 을 못 찾으면 안내 메시지와 함께 예외.
+    """
+    if _is_port_open(port):
+        return True
+    binary = find_chrome()
+    if not binary:
+        raise RuntimeError(
+            "Chrome 실행 파일을 찾을 수 없습니다. 설정에서 Chrome 경로를 지정하거나 "
+            "최초 설정 마법사를 다시 실행해주세요.")
+    _launch_chrome_debug(binary, port)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _is_port_open(port):
+            return True
+        time.sleep(0.5)
+    raise RuntimeError("Chrome 디버깅 포트가 열리지 않았습니다. 잠시 후 다시 시도해주세요.")
+
+
 def setup_driver():
     options = Options()
 
     if config.USE_REMOTE_DEBUGGING:
-        # 이미 열려있는 크롬에 붙이기
+        # 포트가 안 열려 있으면 설정된 Chrome 을 직접 띄워 연결 (exe 자립 실행)
+        ensure_chrome_running(config.REMOTE_DEBUGGING_PORT)
         options.add_experimental_option(
             "debuggerAddress", f"127.0.0.1:{config.REMOTE_DEBUGGING_PORT}"
         )
-        print(f"  → 실행 중인 크롬에 연결 중 (포트 {config.REMOTE_DEBUGGING_PORT})...")
+        print(f"  → 크롬에 연결 중 (포트 {config.REMOTE_DEBUGGING_PORT})...")
     else:
         # 프로필 경로로 새 크롬 실행
+        binary = find_chrome()
+        if binary:
+            options.binary_location = binary
         options.add_argument(f"--user-data-dir={config.CHROME_PROFILE_PATH}")
         options.add_argument(f"--profile-directory={config.CHROME_PROFILE_DIR}")
         options.add_argument("--no-sandbox")
