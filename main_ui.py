@@ -24,7 +24,7 @@ from main import (
     extract_last_response, sanitize_cell, restore_cell,
     group_consecutive_rows, format_batch, parse_response, is_empty, col_to_idx,
     list_prompt_langs, load_prompt, ensure_external_prompts, find_chrome,
-    extract_spreadsheet_id, PROMPTS_DIR, LANG_LABELS,
+    extract_spreadsheet_id, get_service_account_email, PROMPTS_DIR, LANG_LABELS,
 )
 import config
 
@@ -619,6 +619,42 @@ class TranslationWorker(threading.Thread):
 
 # ── 설정 다이얼로그 ──────────────────────────────────────────────────────────
 
+def make_share_help(parent, clipboard_widget):
+    """스프레드시트 공유 안내 + 서비스 계정 이메일 표시 + 복사 버튼을 만든다.
+
+    반환: (frame, set_email)  — set_email(email) 으로 이메일 표시를 갱신할 수 있다.
+    """
+    box = ctk.CTkFrame(parent, fg_color="#eef6ff", corner_radius=10)
+    ctk.CTkLabel(box, text="⚠️  스프레드시트 공유가 안 되어 있으면 열리지 않습니다",
+                 text_color="#2b6cb0",
+                 font=ctk.CTkFont(size=12, weight="bold")).pack(
+        anchor="w", padx=12, pady=(10, 2))
+    ctk.CTkLabel(
+        box, justify="left", text_color="#4a5568", font=ctk.CTkFont(size=11),
+        text=("방법 1) 아래 '서비스 계정 이메일'을 복사해, 스프레드시트 우상단 [공유]에\n"
+              "          붙여넣고 '편집자'로 추가하세요. (가장 안전)\n"
+              "방법 2) 스프레드시트 [공유] → '링크가 있는 모든 사용자'를 '편집자'로 변경. (간단)")
+        ).pack(anchor="w", padx=12, pady=(0, 6))
+    row = ctk.CTkFrame(box, fg_color="transparent")
+    row.pack(fill="x", padx=12, pady=(0, 10))
+    ctk.CTkLabel(row, text="서비스 계정 이메일", width=110, anchor="w").pack(side="left")
+    email_var = tk.StringVar(value="(credentials.json 지정 후 표시됩니다)")
+    ctk.CTkEntry(row, textvariable=email_var, width=300).pack(side="left")
+
+    def _copy():
+        v = email_var.get().strip()
+        if v and "@" in v:
+            clipboard_widget.clipboard_clear()
+            clipboard_widget.clipboard_append(v)
+
+    ctk.CTkButton(row, text="복사", width=56, command=_copy).pack(side="left", padx=6)
+
+    def set_email(email):
+        email_var.set(email if email else "(credentials.json 이 없습니다 — 먼저 지정하세요)")
+
+    return box, set_email
+
+
 class SettingsDialog(ctk.CTkToplevel):
     def __init__(self, parent):
         super().__init__(parent)
@@ -648,9 +684,19 @@ class SettingsDialog(ctk.CTkToplevel):
             anchor="w", pady=(0, 6))
         f1 = ctk.CTkFrame(scroll, fg_color="transparent")
         f1.pack(fill="x")
-        self.v_id    = self._field(f1, "스프레드시트 ID", config.SPREADSHEET_ID, 0, True)
-        self.v_sheet = self._field(f1, "시트 이름",       config.SHEET_NAME,      1)
-        self.v_start = self._field(f1, "시작 행 번호",    config.START_ROW,       2)
+        self.v_id    = self._field(f1, "스프레드시트 주소", config.SPREADSHEET_ID, 0, True)
+        self.v_sheet = self._field(f1, "시트(탭) 이름",    config.SHEET_NAME,      1)
+        self.v_start = self._field(f1, "시작 행 번호",     config.START_ROW,       2)
+        ctk.CTkLabel(scroll, justify="left", text_color="#888",
+                     font=ctk.CTkFont(size=11),
+                     text=("· 주소: 브라우저의 스프레드시트 주소(URL)를 그대로 붙여넣으면 됩니다.\n"
+                           "· 시트(탭) 이름: 화면 아래쪽 탭 이름과 똑같이 입력하세요. (예: 시트1)\n"
+                           "· 시작 행 번호: 번역을 시작할 행. 보통 1행은 제목이라 2 입니다.")
+                     ).pack(anchor="w", padx=4, pady=(2, 6))
+
+        share_box, set_email = make_share_help(scroll, self)
+        share_box.pack(fill="x", pady=(0, 4))
+        set_email(get_service_account_email())
 
         ctk.CTkFrame(scroll, height=1, fg_color="#3a3a4a").pack(
             fill="x", pady=10)
@@ -1148,9 +1194,9 @@ class SetupWizard(ctk.CTkToplevel):
                      font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", pady=(6, 6))
         sf = ctk.CTkFrame(scroll, fg_color="transparent")
         sf.pack(fill="x")
-        self.v_id    = self._row(sf, "스프레드시트 ID", config.SPREADSHEET_ID, 0)
-        self.v_sheet = self._row(sf, "시트 이름",       config.SHEET_NAME,      1)
-        self.v_start = self._row(sf, "시작 행 번호",    config.START_ROW,       2)
+        self.v_id    = self._row(sf, "스프레드시트 주소", config.SPREADSHEET_ID, 0)
+        self.v_sheet = self._row(sf, "시트(탭) 이름",    config.SHEET_NAME,      1)
+        self.v_start = self._row(sf, "시작 행 번호",     config.START_ROW,       2)
 
         # credentials.json — 파일 선택 시 exe 폴더로 복사한다
         ctk.CTkLabel(sf, text="credentials.json", anchor="w").grid(
@@ -1162,10 +1208,16 @@ class SetupWizard(ctk.CTkToplevel):
             row=3, column=1, pady=6, sticky="w")
         ctk.CTkButton(sf, text="찾아보기", width=72,
                       command=self._browse_cred).grid(row=3, column=2, padx=6)
-        ctk.CTkLabel(scroll,
-                     text="※ 구글 서비스 계정 키(.json)를 선택하면 프로그램 폴더로 복사됩니다.\n"
-                          "   해당 계정 이메일에 스프레드시트 '공유'가 되어 있어야 합니다.",
-                     text_color="#888", font=ctk.CTkFont(size=11)).pack(anchor="w", padx=4, pady=(0, 8))
+        ctk.CTkLabel(scroll, justify="left", text_color="#888",
+                     font=ctk.CTkFont(size=11),
+                     text=("· 주소: 브라우저의 스프레드시트 주소(URL)를 그대로 붙여넣으세요.\n"
+                           "· 시트(탭) 이름: 화면 아래쪽 탭 이름과 똑같이. (예: 시트1)\n"
+                           "· credentials.json: 구글 서비스 계정 키(.json). 선택하면 폴더로 복사됩니다.")
+                     ).pack(anchor="w", padx=4, pady=(2, 6))
+
+        share_box, self._set_email = make_share_help(scroll, self)
+        share_box.pack(fill="x", padx=4, pady=(0, 8))
+        self._set_email(get_service_account_email())
 
         # 3) 기본 번역 설정
         ctk.CTkLabel(scroll, text="③ 기본 번역 설정",
@@ -1219,6 +1271,15 @@ class SetupWizard(ctk.CTkToplevel):
         if p:
             self._cred_src = p
             self.v_cred.set(p)
+            # 선택한 키 파일에서 서비스 계정 이메일을 읽어 공유 안내에 표시
+            try:
+                import json as _json
+                with open(p, "r", encoding="utf-8") as f:
+                    email = (_json.load(f).get("client_email") or "").strip()
+                if email:
+                    self._set_email(email)
+            except Exception:
+                pass
 
     def _copy_credentials(self):
         """선택한 credentials.json 을 exe 폴더로 복사. 성공/스킵 시 True."""
