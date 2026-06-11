@@ -20,9 +20,13 @@ datas = [
 ]
 # customtkinter 는 테마/이미지 등 데이터 파일이 함께 있어야 동작한다.
 datas += collect_data_files("customtkinter")
+# selenium 의 selenium-manager.exe(드라이버 자동 설치 도구)가 반드시 포함돼야
+# 한다. 누락되면 exe 에서 webdriver.Chrome() 이 chromedriver 를 못 구해 실패한다.
+datas += collect_data_files("selenium")
 
 hiddenimports = []
 hiddenimports += collect_submodules("customtkinter")
+hiddenimports += collect_submodules("selenium")
 
 block_cipher = None
 

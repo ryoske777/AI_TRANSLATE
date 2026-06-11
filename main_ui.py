@@ -363,11 +363,12 @@ class TranslationWorker(threading.Thread):
                     driver = setup_driver()
                     break
                 except Exception as e:
+                    detail = str(e).replace("\n", " ")[:200]
                     if attempt < 5:
-                        self.log(f"Chrome 연결 시도 {attempt}/5 실패 — 2초 후 재시도...", "warn")
+                        self.log(f"Chrome 연결 시도 {attempt}/5 실패: {detail}", "warn")
                         _t.sleep(2)
                     else:
-                        raise Exception("Chrome 연결 실패 (5회 시도). Chrome을 다시 실행해주세요.")
+                        raise Exception(f"Chrome 연결 실패 (5회 시도). {detail}")
             self.log("Chrome 연결 완료", "success")
 
             self.status("번역 진행 중...", "#9ece6a")

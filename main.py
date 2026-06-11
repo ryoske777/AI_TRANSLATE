@@ -372,7 +372,13 @@ def setup_driver():
         options.add_argument("--disable-dev-shm-usage")
         print("  → 새 크롬 실행 중...")
 
-    driver = webdriver.Chrome(options=options)
+    try:
+        driver = webdriver.Chrome(options=options)
+    except Exception as e:
+        raise RuntimeError(
+            "Chrome 드라이버(chromedriver) 시작 실패. 보통 인터넷에서 드라이버를 "
+            "자동 설치하지 못할 때 발생합니다. 인터넷 연결을 확인하고 다시 시도하세요.\n"
+            f"원인: {e}")
     if not config.USE_REMOTE_DEBUGGING:
         driver.maximize_window()
     return driver
