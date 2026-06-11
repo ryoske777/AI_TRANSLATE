@@ -206,6 +206,31 @@ def get_sheet():
             f"설정의 '시트 이름'을 다음 중 하나로 맞춰주세요: {names}")
 
 
+def test_connection():
+    """현재 설정으로 시트 연결을 즉시 점검한다. (성공여부, 메시지) 반환.
+
+    UI의 '연결 테스트' 버튼이 호출한다. 네트워크 작업이므로 호출 측에서 스레드로 돌린다.
+    """
+    if not os.path.exists(paths.app_path("credentials.json")):
+        return False, "credentials.json 파일이 없습니다. 설정/마법사에서 먼저 지정하세요."
+    if not (config.SPREADSHEET_ID or "").strip():
+        return False, "스프레드시트 주소(또는 ID)가 비어 있습니다."
+    try:
+        sheet = get_sheet()
+    except Exception as e:
+        return False, str(e)
+    title = getattr(sheet, "title", config.SHEET_NAME)
+    try:
+        pending_txt = f"\n번역 대기: {len(get_pending_rows(sheet))}행"
+    except Exception:
+        pending_txt = ""
+    email = get_service_account_email()
+    msg = f"연결 성공 ✓\n시트(탭): {title}{pending_txt}"
+    if email:
+        msg += f"\n서비스 계정: {email}"
+    return True, msg
+
+
 def is_empty(val):
     """빈 값 또는 nan 여부 확인"""
     v = val.strip().lower()
@@ -213,8 +238,13 @@ def is_empty(val):
 
 
 def col_to_idx(letter):
-    """열 문자 → 0-based 인덱스 (A→0, B→1, ...)"""
-    return ord(letter.upper()) - ord('A')
+    """열 문자 → 0-based 인덱스 (A→0, B→1, ... Z→25, AA→26, AB→27 ...)"""
+    idx = 0
+    for ch in str(letter).strip().upper():
+        if not ("A" <= ch <= "Z"):
+            continue
+        idx = idx * 26 + (ord(ch) - ord("A") + 1)
+    return idx - 1 if idx > 0 else 0
 
 
 def get_col_roles():
@@ -465,13 +495,29 @@ def send_message(driver, text):
     print("  → 메시지 전송 완료, 응답 대기 중...")
 
 
-def wait_for_response(driver, timeout=300):
-    """ChatGPT 응답 완료까지 대기 — 출현 후 소멸 방식"""
+def wait_for_response(driver, timeout=300, should_stop=None, on_tick=None):
+    """ChatGPT 응답 완료까지 대기 — 출현 후 소멸 방식.
+
+    should_stop: 호출 시 True면 즉시 중단하고 "STOPPED" 반환 (STOP 즉시 반응용)
+    on_tick:     매 폴링마다 on_tick(경과초)를 호출 (진행 상태 표시용)
+    """
     init_wait     = getattr(config, 'RESPONSE_INIT_WAIT',     2.0)
     poll_interval = getattr(config, 'RESPONSE_POLL_INTERVAL', 0.5)
     done_delay    = getattr(config, 'RESPONSE_DONE_DELAY',    1.0)
 
+    def _stopped():
+        return should_stop is not None and should_stop()
+
+    def _tick(elapsed):
+        if on_tick:
+            try:
+                on_tick(elapsed)
+            except Exception:
+                pass
+
     time.sleep(init_wait)
+    if _stopped():
+        return "STOPPED"
 
     stop_selectors = [
         "button[data-testid='stop-button']",
@@ -483,6 +529,8 @@ def wait_for_response(driver, timeout=300):
     appeared = False
     start = time.time()
     while time.time() - start < 30:
+        if _stopped():
+            return "STOPPED"
         for sel in stop_selectors:
             elems = driver.find_elements(By.CSS_SELECTOR, sel)
             if elems and elems[0].is_displayed():
@@ -490,6 +538,7 @@ def wait_for_response(driver, timeout=300):
                 break
         if appeared:
             break
+        _tick(time.time() - start)
         time.sleep(poll_interval)
 
     if not appeared:
@@ -498,6 +547,8 @@ def wait_for_response(driver, timeout=300):
     # 2단계: Stop 버튼이 사라질 때까지 대기
     start = time.time()
     while time.time() - start < timeout:
+        if _stopped():
+            return "STOPPED"
         try:
             found = False
             for sel in stop_selectors:
@@ -511,10 +562,34 @@ def wait_for_response(driver, timeout=300):
                 return
         except Exception:
             pass
+        _tick(time.time() - start)
         time.sleep(poll_interval)
 
     print("  ⚠️ 응답 완료 감지 타임아웃 — 계속 진행")
     time.sleep(done_delay)
+
+
+def check_logged_in(driver, timeout=10):
+    """ChatGPT 입력창이 보이면 로그인된 것으로 판단한다.
+
+    new_conversation 등으로 chatgpt.com 이 이미 로드된 상태에서 호출한다.
+    timeout 초 안에 입력창이 안 나타나면 (로그인 안 됨/페이지 미로드로) False.
+    """
+    selectors = [
+        (By.ID, "prompt-textarea"),
+        (By.CSS_SELECTOR, "div[contenteditable='true']"),
+    ]
+    end = time.time() + timeout
+    while time.time() < end:
+        for how, sel in selectors:
+            try:
+                elems = driver.find_elements(how, sel)
+                if elems and elems[0].is_displayed():
+                    return True
+            except Exception:
+                pass
+        time.sleep(0.5)
+    return False
 
 
 def extract_last_response(driver):
