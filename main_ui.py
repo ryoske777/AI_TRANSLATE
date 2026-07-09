@@ -1900,22 +1900,24 @@ class App(ctk.CTk):
         self.prog_lbl.pack(side="right")
 
         # ── 작업 모드 선택 (번역 / 용어집 검수 / 일반 검수)
+        # 무채색 알약형 커스텀 세그먼트 — 선택된 항목만 흰 알약 + 포인트 색 글자.
         mode_row = ctk.CTkFrame(card, fg_color="transparent")
-        mode_row.pack(fill="x", padx=20, pady=(0, 6))
-        self._mode_labels = [WORK_MODE_LABELS[m] for m in
-                             ("translate", "review_glossary", "review_general")]
-        self._label_to_mode = {v: k for k, v in WORK_MODE_LABELS.items()}
-        self.mode_seg = ctk.CTkSegmentedButton(
-            mode_row, values=self._mode_labels,
-            font=ctk.CTkFont(size=12, weight="bold"),
-            selected_color=self.COLORS["accent"],
-            selected_hover_color=self.COLORS["accent_hover"],
-            unselected_color="#e2e8f0",
-            unselected_hover_color="#cbd5e0",
-            text_color=self.COLORS["text_main"],
-            command=self._on_mode_change)
-        self.mode_seg.set(WORK_MODE_LABELS.get(_current_mode(), "번역"))
-        self.mode_seg.pack(fill="x")
+        mode_row.pack(fill="x", padx=20, pady=(0, 8))
+        self._mode_font        = ctk.CTkFont(size=12)
+        self._mode_font_bold   = ctk.CTkFont(size=12, weight="bold")
+        seg_wrap = ctk.CTkFrame(mode_row, fg_color="#eef2f7", corner_radius=18)
+        seg_wrap.pack(fill="x")
+        self._mode_btns = {}
+        for m in ("translate", "review_glossary", "review_general"):
+            btn = ctk.CTkButton(
+                seg_wrap, text=WORK_MODE_LABELS[m], height=30, corner_radius=14,
+                font=self._mode_font,
+                fg_color="transparent", hover_color="#e2e8f0",
+                text_color=self.COLORS["text_sub"],
+                command=lambda mm=m: self._on_mode_change(mm))
+            btn.pack(side="left", expand=True, fill="x", padx=3, pady=3)
+            self._mode_btns[m] = btn
+        self._update_mode_buttons()
 
         # ── 언어 표시 영역 (모드에 따라 내용이 바뀜)
         #   번역 모드: 현재 번역 언어 표시 / 검수 모드: 원문 → 대상 언어 선택
@@ -2050,7 +2052,7 @@ class App(ctk.CTk):
         self.btn_start.configure(state="disabled")
         self.btn_stop.configure(state="normal")
         # 실행 중 모드 전환 방지 (열 역할/프롬프트가 도중에 바뀌면 안 됨)
-        self.mode_seg.configure(state="disabled")
+        self._set_mode_selector_state("disabled")
 
         self.btn_pause.configure(state="normal", text="PAUSE",
                                 fg_color=self.COLORS["secondary"],
@@ -2097,13 +2099,17 @@ class App(ctk.CTk):
             self._rev_label_to_code = {LANG_LABELS.get(c, c): c for c in REVIEW_LANGS}
             src = getattr(config, "REVIEW_SRC_LANG", "ko")
             tgt = getattr(config, "REVIEW_TGT_LANG", "es")
+            # 무채색 플랫 드롭다운 — 카드 톤에 맞춰 초록 계열 제거
             menu_style = dict(
-                values=labels, width=118, height=26,
+                values=labels, width=150, height=28, corner_radius=8,
                 font=ctk.CTkFont(size=12),
-                fg_color="#edf2f7",
-                button_color=self.COLORS["accent"],
-                button_hover_color=self.COLORS["accent_hover"],
+                fg_color="#eef2f7",
+                button_color="#e2e8f0",
+                button_hover_color="#cbd5e0",
                 text_color=self.COLORS["text_main"],
+                dropdown_fg_color="#ffffff",
+                dropdown_hover_color="#eef2f7",
+                dropdown_text_color=self.COLORS["text_main"],
                 command=lambda _v: self._on_review_lang())
             self._rev_src_var = tk.StringVar(value=LANG_LABELS.get(src, src))
             ctk.CTkOptionMenu(self.lang_area, variable=self._rev_src_var,
@@ -2124,9 +2130,26 @@ class App(ctk.CTk):
                 font=ctk.CTkFont(size=12, weight="bold"),
                 text_color=self.COLORS["accent"]).pack(side="left")
 
-    def _on_mode_change(self, label):
+    def _update_mode_buttons(self):
+        """모드 세그먼트 표시 갱신 — 선택된 모드만 흰 알약 + 포인트 색 글자."""
+        cur = _current_mode()
+        for m, btn in self._mode_btns.items():
+            if m == cur:
+                btn.configure(fg_color="#ffffff", hover_color="#ffffff",
+                              text_color=self.COLORS["accent"],
+                              font=self._mode_font_bold)
+            else:
+                btn.configure(fg_color="transparent", hover_color="#e2e8f0",
+                              text_color=self.COLORS["text_sub"],
+                              font=self._mode_font)
+
+    def _set_mode_selector_state(self, state):
+        """실행 중 모드 전환 방지용 — 세그먼트 버튼 일괄 활성/비활성."""
+        for btn in self._mode_btns.values():
+            btn.configure(state=state)
+
+    def _on_mode_change(self, mode):
         """모드 세그먼트 버튼 — 열 역할 프리셋 교체 + 언어 영역 갱신 + 저장."""
-        mode = self._label_to_mode.get(label, "translate")
         if mode == _current_mode():
             return
         # 지금 화면의 열 역할을 '이전 모드' 프리셋에 보관한 뒤 새 모드 프리셋을 적용
@@ -2134,6 +2157,7 @@ class App(ctk.CTk):
         config.WORK_MODE = mode
         apply_mode_columns()
         save_settings()
+        self._update_mode_buttons()
         self._build_lang_area()
         self._add_log(f"작업 모드 전환: {WORK_MODE_LABELS.get(mode, mode)}", "info")
 
@@ -2355,7 +2379,7 @@ class App(ctk.CTk):
                     self.btn_start.configure(state="normal")
                     self.btn_stop.configure(state="disabled")
                     self.btn_pause.configure(state="disabled")
-                    self.mode_seg.configure(state="normal")
+                    self._set_mode_selector_state("normal")
                     DoneDialog(self, processed, total, fail_lines)
         except queue.Empty:
             pass
