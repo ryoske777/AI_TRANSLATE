@@ -98,9 +98,37 @@ PROMPT_LANGS = [
 
 # 코드 → 화면 표시용 한글 라벨
 LANG_LABELS = {
+    "ko": "한국어",
     "es": "스페인어", "en": "영어",
     "fr": "프랑스어", "de": "독일어", "pt": "포르투갈어",
     "tr": "튀르키예어", "id": "인도네시아어", "zh_cn": "중국어(간체)", "th": "태국어",
+}
+
+# ── 작업 모드 (번역 / 검수) ──────────────────────────────────────────────────
+
+WORK_MODE_LABELS = {
+    "translate":       "번역",
+    "review_glossary": "용어집 검수",
+    "review_general":  "일반 검수",
+}
+REVIEW_MODES = ("review_glossary", "review_general")
+
+# 검수 모드에서 고를 수 있는 언어 (원문/대상 공통 — 한국어 포함)
+REVIEW_LANGS = ["ko"] + PROMPT_LANGS
+
+# 검수 프롬프트에 주입되는 언어 설명 — 유럽 서비스 기준의 지역 변형을 명시한다.
+# (예: 스페인어는 중남미식이 아니라 유럽 스페인어(es-ES) 기준으로 검수하도록)
+REVIEW_LANG_DESC = {
+    "ko":    "한국어",
+    "en":    "영어",
+    "es":    "스페인어 — 유럽 스페인어(스페인 본토, es-ES) 기준. 중남미식 어휘·표현이 섞이면 지적 대상",
+    "fr":    "프랑스어 — 프랑스 본토(fr-FR) 표준 기준",
+    "de":    "독일어 — 독일 표준(de-DE) 기준",
+    "pt":    "포르투갈어 — 유럽 포르투갈어(포르투갈 본토, pt-PT) 기준. 브라질식 어휘·표현이 섞이면 지적 대상",
+    "tr":    "튀르키예어 — 현대 표준 튀르키예어 기준",
+    "id":    "인도네시아어 — 표준 인도네시아어(Bahasa Indonesia) 기준",
+    "zh_cn": "중국어 간체 — 중국 본토 표준(푸퉁화, zh-CN) 기준",
+    "th":    "태국어 — 표준 태국어 기준",
 }
 
 # 더 이상 쓰지 않는(통합/삭제된) 프롬프트 — 외부 폴더에 남아 있으면 정리한다.
@@ -132,6 +160,7 @@ def list_prompt_langs():
         return []
     available = {f[:-4] for f in os.listdir(PROMPTS_DIR) if f.endswith(".txt")}
     available -= DEPRECATED_PROMPTS   # 통합/삭제된 항목은 목록에서 제외
+    available = {a for a in available if not a.startswith("review_")}  # 검수 템플릿 제외
     ordered = [lang for lang in PROMPT_LANGS if lang in available]
     # PROMPT_LANGS에 없지만 폴더엔 있는 파일도 뒤에 덧붙임
     extras = sorted(available - set(PROMPT_LANGS))
@@ -152,6 +181,43 @@ def load_prompt(lang):
     with open(path, "r", encoding="utf-8") as f:
         body = f.read().strip()
     return body + ID_RULE_BLOCK
+
+
+# 검수 모드용 행 ID 규칙 — 출력이 '번역'이 아니라 '검수 결과'라는 점만 다르다.
+REVIEW_ID_RULE_BLOCK = """
+
+────────────────────────────────
+[ 행 식별자(ID) 규칙 — 시스템 필수 (다른 모든 출력 규칙에 우선) ]
+────────────────────────────────
+
+- 입력의 각 줄은 맨 앞에 'R숫자' 식별자가 탭(TAB)으로 붙어 제공됩니다.
+  예) R12<탭>SRC=원문<탭>CAT=카테고리<탭>TGT=검수할 번역
+- 출력도 각 줄 맨 앞에 입력과 '완전히 동일한' R숫자를 붙이고, 탭(TAB) 뒤에 검수 결과를 적으십시오.
+  예) R12<탭>OK     /     R12<탭>수정: ... | 사유: ...
+- R숫자 식별자는 변경·삭제하지 말고, 숫자도 절대 바꾸지 마십시오. (그대로 복사)
+- 입력 한 줄당 출력도 정확히 한 줄. 줄을 합치거나 쪼개지 마십시오.
+- 출력 순서는 입력과 동일하게 유지하되, 매칭 기준은 R숫자입니다.
+"""
+
+
+def load_review_prompt(mode, src_lang, tgt_lang):
+    """검수 모드 프롬프트 로드 — prompts/{mode}.txt 를 읽어 언어 토큰을 치환해 반환.
+
+    템플릿 안의 {SRC_LANG} / {TGT_LANG} 토큰을 선택된 언어 설명으로 바꾸고,
+    끝에 검수용 행 ID 규칙을 자동 주입한다. 파일이 없으면 빈 문자열 + 경고.
+    """
+    if mode not in REVIEW_MODES:
+        return ""
+    path = os.path.join(PROMPTS_DIR, f"{mode}.txt")
+    if not os.path.exists(path):
+        print(f"⚠️  검수 프롬프트 파일이 없습니다: {path}")
+        return ""
+    with open(path, "r", encoding="utf-8") as f:
+        body = f.read().strip()
+    src = REVIEW_LANG_DESC.get(src_lang, LANG_LABELS.get(src_lang, src_lang))
+    tgt = REVIEW_LANG_DESC.get(tgt_lang, LANG_LABELS.get(tgt_lang, tgt_lang))
+    body = body.replace("{SRC_LANG}", src).replace("{TGT_LANG}", tgt)
+    return body + REVIEW_ID_RULE_BLOCK
 
 
 # ── Google Sheets 연결 ──────────────────────────────────────────────────────
@@ -258,13 +324,19 @@ def get_col_roles():
 
 
 def get_pending_rows(sheet):
-    """설정된 입력열 기준으로 미번역 행 반환 (nan 포함 공백 처리)"""
+    """설정된 입력열 기준으로 미처리 행 반환 (nan 포함 공백 처리)
+
+    반환 튜플: (행번호, source, ref, placeholder, category, review)
+    검수 모드(WORK_MODE=review_*)에서는 '검수대상(review)' 열이 비어 있는 행은
+    검수할 번역문이 없으므로 건너뛴다.
+    """
     all_values = sheet.get_all_values()
     pending = []
     skipped = 0
+    no_target = 0
     result_idx = col_to_idx(getattr(config, 'RESULT_COL', 'D'))
     col_roles = get_col_roles()
-    input_idxs = [idx for idx, _ in col_roles]
+    is_review = getattr(config, "WORK_MODE", "translate") in REVIEW_MODES
 
     for i, row in enumerate(all_values[config.START_ROW - 1:], start=config.START_ROW):
         # 결과열 값
@@ -280,19 +352,26 @@ def get_pending_rows(sheet):
         if not any(vals.values()):
             continue
 
+        # 검수 모드: 검수대상 번역문이 없는 행은 처리 불가 → 건너뜀
+        if is_review and not vals.get("review"):
+            no_target += 1
+            continue
+
         if is_empty(d):
-            if any(vals.values()):
-                # (row_num, source, ref, placeholder) 형태 유지
-                pending.append((
-                    i,
-                    vals.get("source", ""),
-                    vals.get("ref", ""),
-                    vals.get("placeholder", "")
-                ))
+            pending.append((
+                i,
+                vals.get("source", ""),
+                vals.get("ref", ""),
+                vals.get("placeholder", ""),
+                vals.get("category", ""),
+                vals.get("review", ""),
+            ))
         else:
             skipped += 1
     if skipped > 0:
-        print(f"  → {skipped}행 건너뜀 (D열 이미 완료)")
+        print(f"  → {skipped}행 건너뜀 (결과열 이미 완료)")
+    if no_target > 0:
+        print(f"  → {no_target}행 건너뜀 (검수대상 열이 빈 칸)")
     return pending
 
 
@@ -768,6 +847,32 @@ def format_batch(batch_rows):
             key = role_to_key.get(role)
             if key is not None:
                 parts.append(sanitize_cell(row[key]))
+        lines.append("\t".join(parts))
+    return "\n".join(lines)
+
+
+def format_review_batch(batch_rows):
+    """
+    검수 배치를 ChatGPT 입력 형식으로 변환 — 각 필드에 태그(SRC/CAT/TGT/REF)를 붙인다.
+
+    열 순서가 사용자마다 달라도 모델이 필드 역할을 오해하지 않도록,
+    값 앞에 역할 태그를 명시한다. 행 ID(R{행번호})는 번역 배치와 동일하게 맨 앞.
+      예) R12<탭>SRC=마그누스 엑소시스무스<탭>CAT=스킬<탭>TGT=Magnus Exorcismus
+    """
+    col_roles = get_col_roles()
+    role_order = [role for _, role in col_roles]
+
+    role_to_key = {"source": 1, "ref": 2, "placeholder": 3, "category": 4, "review": 5}
+    role_tags = {"source": "SRC", "ref": "REF", "placeholder": "PH",
+                 "category": "CAT", "review": "TGT"}
+    lines = []
+    for row in batch_rows:
+        parts = [row_id(row[0])]  # 맨 앞에 행 ID
+        for role in role_order:
+            key = role_to_key.get(role)
+            if key is None or key >= len(row):
+                continue
+            parts.append(f"{role_tags[role]}={sanitize_cell(row[key])}")
         lines.append("\t".join(parts))
     return "\n".join(lines)
 
