@@ -25,6 +25,7 @@ from main import (
     group_consecutive_rows, format_batch, format_review_batch, parse_response,
     is_empty, col_to_idx,
     list_prompt_langs, load_prompt, load_review_prompt, ensure_external_prompts,
+    parse_review_verdict, write_review_notes, next_col_letter,
     find_chrome,
     extract_spreadsheet_id, get_service_account_email, test_connection,
     check_logged_in, PROMPTS_DIR, LANG_LABELS,
@@ -681,21 +682,36 @@ class TranslationWorker(threading.Thread):
                         for r in cleared_rows:
                             self.log(f"🧹 {r}행 → 정상, E열 표시 제거", "success")
 
-                    # ── 검수 모드: 수정 제안 요약 로그 ────────────────
+                    # ── 검수 모드: 판정 파싱 → 결과열엔 최종 단어, 비고열엔 판정 ──
+                    # OK        → 결과열: 기존 번역 그대로 / 비고열: OK
+                    # 수정: X…  → 결과열: 수정안 X만     / 비고열: '수정: X | 사유: …' 전체
                     if is_review:
-                        issue_rows = [
-                            s_row + i for i, ln in enumerate(lines)
-                            if ln and ln.strip().rstrip(".").upper() != "OK"
-                        ]
+                        finals, notes = [], []
+                        for i, ln in enumerate(lines):
+                            orig = batch[i][5] if i < len(batch) and len(batch[i]) > 5 else ""
+                            f_val, n_val = parse_review_verdict(ln, orig)
+                            finals.append(f_val)
+                            notes.append(n_val)
+
+                        issue_rows = [s_row + i for i, n in enumerate(notes)
+                                      if n and n != "OK"]
                         if issue_rows:
                             head = ", ".join(str(r) for r in issue_rows[:30])
                             more = "" if len(issue_rows) <= 30 else f" 외 {len(issue_rows) - 30}행"
                             self.log(f"🔎 수정 제안 {len(issue_rows)}행: {head}{more}", "warn")
                         else:
                             self.log("🔎 이 배치는 전부 OK", "success")
+                        unparsed = [s_row + i for i, (f_val, n_val)
+                                    in enumerate(zip(finals, notes)) if n_val and not f_val]
+                        if unparsed:
+                            self.log(f"⚠️ 판정 형식을 해석하지 못한 행(비고만 기입, 재실행 시 재검수): {unparsed}", "warn")
 
-                    count = len(lines)  # batch와 항상 같은 길이 (누락 행은 빈 칸)
-                    write_results(sheet, s_row, lines)
+                        count = len(finals)
+                        write_results(sheet, s_row, finals)
+                        write_review_notes(sheet, s_row, notes)
+                    else:
+                        count = len(lines)  # batch와 항상 같은 길이 (누락 행은 빈 칸)
+                        write_results(sheet, s_row, lines)
                     processed += count
                     self.progress(processed, total)
                     self.log(f"✅ {count}행 기입 완료 (누적: {processed}/{total})", "success")
@@ -1112,6 +1128,12 @@ class SettingsDialog(ctk.CTkToplevel):
         ctk.CTkEntry(res_f, textvariable=self.v_result_col, width=60).pack(side="left", padx=4)
         ctk.CTkLabel(res_f, text="(결과를 적을 열 문자: A, B, C, D ...)",
                      text_color="#888", font=ctk.CTkFont(size=11)).pack(side="left", padx=4)
+        if is_review_mode:
+            _rc = getattr(config, "RESULT_COL", "D")
+            ctk.CTkLabel(col_frame,
+                         text=f"  · 결과열({_rc})엔 최종 단어만, 바로 다음 열({next_col_letter(_rc)})엔 판정(OK / 수정+사유)이 기입됩니다.",
+                         text_color="#888", font=ctk.CTkFont(size=11)).pack(
+                anchor="w", padx=4, pady=(2, 0))
 
         ctk.CTkFrame(scroll, height=1, fg_color="#3a3a4a").pack(
             fill="x", pady=10)
