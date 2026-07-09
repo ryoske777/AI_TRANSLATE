@@ -195,7 +195,10 @@ make_version.py
   검수용 행 ID 규칙(REVIEW_ID_RULE_BLOCK)이 자동 주입됨 (main.load_review_prompt).
   이 파일들은 list_prompt_langs() 언어 목록에서 제외됨 (review_ 접두사).
 - **배치 포맷**: format_review_batch — 열 순서 무관하게 `SRC=/CAT=/TGT=/REF=` 태그 부착.
-- **결과 기입**: 결과열에 `OK` 또는 `수정: <제안> | 사유: <한국어>`. 행 ID 매칭은 번역과 동일.
+- **결과 기입**: 모델 판정(`OK` / `수정: <제안> | 사유: <한국어>`)을 parse_review_verdict 가
+  파싱해 **결과열엔 최종 단어만**(OK면 기존 번역 그대로, 수정이면 수정안),
+  **결과열 바로 다음 열엔 판정 전체**(write_review_notes)를 기입. 행 ID 매칭은 번역과 동일.
+  판정 형식을 해석 못 한 행은 결과열을 비워 재실행 시 재검수되게 한다.
 - **검수 모드에서 비활성화되는 것**: 한글 감지 재시도(사유가 한국어라 정상),
   플레이스홀더 검증 재시도, E열 자동 표시/재검증 스윕.
 - get_pending_rows 는 이제 6-튜플 (행, source, ref, placeholder, category, review) 반환.

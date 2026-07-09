@@ -332,6 +332,21 @@ def col_to_idx(letter):
     return idx - 1 if idx > 0 else 0
 
 
+def idx_to_col(idx):
+    """0-based 인덱스 → 열 문자 (0→A, 25→Z, 26→AA ...)"""
+    idx += 1
+    s = ""
+    while idx > 0:
+        idx, r = divmod(idx - 1, 26)
+        s = chr(ord("A") + r) + s
+    return s
+
+
+def next_col_letter(col):
+    """열 문자의 바로 다음 열 (D→E, Z→AA)"""
+    return idx_to_col(col_to_idx(col) + 1)
+
+
 def get_col_roles():
     """config에서 열 역할 설정 반환 [(col_idx, role), ...] 순서 보장"""
     roles = []
@@ -868,6 +883,50 @@ def format_batch(batch_rows):
                 parts.append(sanitize_cell(row[key]))
         lines.append("\t".join(parts))
     return "\n".join(lines)
+
+
+# 검수 판정 '수정: <제안> | 사유: ...' 에서 제안 부분만 떼어내는 패턴
+# 콜론은 반각(:)·전각(：) 둘 다 허용 (모델이 섞어 쓰는 경우 대비)
+_REVIEW_FIX_RE = re.compile(r"^\s*수정\s*[:：]\s*(.+?)\s*(?:\|.*)?$", re.S)
+
+
+def parse_review_verdict(verdict, original):
+    """검수 응답 한 줄을 (최종 결과, 비고) 로 분리한다.
+
+    - 'OK'              → (original 그대로, "OK")     : 문제 없음 → 결과열에 기존 번역 유지
+    - '수정: X | 사유: …' → (X, 판정 전체)             : 결과열엔 수정안만, 비고열엔 판정+사유
+    - 빈 값(응답 누락)    → ("", "")                    : 결과열 빈 칸 → 재실행 시 재검수
+    - 그 외(형식 이탈)    → ("", 판정 전체)             : 비고만 남기고 결과열은 비워 재검수 유도
+    """
+    v = (verdict or "").strip()
+    if not v:
+        return "", ""
+    core = v.strip("`").strip().rstrip(".").strip()
+    if core.upper() == "OK":
+        return original, "OK"
+    m = _REVIEW_FIX_RE.match(v)
+    if m and m.group(1).strip():
+        return m.group(1).strip(), v
+    return "", v
+
+
+def write_review_notes(sheet, start_row, notes):
+    """검수 비고(OK / 수정+사유)를 결과열 바로 다음 열에 일괄 기입.
+
+    빈 비고(응답 누락 행)는 건드리지 않는다. 결과열이 D면 비고는 E에 들어간다.
+    """
+    note_col = next_col_letter(getattr(config, "RESULT_COL", "D"))
+    updates = [
+        {"range": f"{note_col}{start_row + i}", "values": [[n]]}
+        for i, n in enumerate(notes) if n
+    ]
+    if not updates:
+        return
+    try:
+        sheet.batch_update(updates)
+        print(f"  → 검수 비고 기입 완료 ({note_col}열, {len(updates)}행)")
+    except Exception as e:
+        print(f"  ❌ 검수 비고 기입 실패: {e}")
 
 
 def format_review_batch(batch_rows):
