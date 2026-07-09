@@ -63,6 +63,10 @@ WORK_MODE       = "translate"
 REVIEW_SRC_LANG = "ko"   # 검수 원문 언어 (ko 포함 가능)
 REVIEW_TGT_LANG = "es"   # 검수 대상(번역문) 언어
 
+#   검수 크로스체크: '수정' 판정이 나온 행을 같은 대화에서 한 번 더 재검토시켜,
+#   다른 언어 규칙·취향을 근거로 한 잘못된 수정 제안을 OK로 걸러낸다.
+REVIEW_CROSS_CHECK = True
+
 #   모드별 열 역할 프리셋 — 모드를 전환하면 아래 값이 COL_*_ROLE/RESULT_COL 에 적용된다.
 #   실제 정본은 settings.json 의 MODE_COL_ROLES (설정창에서 편집 시 현재 모드에 저장됨).
 MODE_COL_ROLES = {

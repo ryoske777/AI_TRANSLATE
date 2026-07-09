@@ -693,6 +693,47 @@ class TranslationWorker(threading.Thread):
                             finals.append(f_val)
                             notes.append(n_val)
 
+                        # ── 크로스체크: '수정' 판정을 판정 원칙 기준으로 재검토 ──
+                        # 다른 언어 표기 규칙(예: 독일어 von 소문자)이나 취향을 근거로 한
+                        # 잘못된 수정 제안을 같은 대화에서 한 번 더 걸러 OK로 정정한다.
+                        fix_idxs = [i for i, (f_val, n_val) in enumerate(zip(finals, notes))
+                                    if n_val and n_val != "OK" and f_val]
+                        if fix_idxs and getattr(config, "REVIEW_CROSS_CHECK", True) and not self.stop_flag:
+                            self.log(f"🔁 수정 판정 {len(fix_idxs)}건 크로스체크 중...", "info")
+                            cc_batch = [batch[i] for i in fix_idxs]
+                            cc_lines = format_review_batch(cc_batch).split("\n")
+                            body = "\n".join(
+                                f"{line}\t현재판정={notes[i]}"
+                                for line, i in zip(cc_lines, fix_idxs))
+                            cc_msg = (
+                                "아래는 방금 당신이 내린 '수정' 판정들입니다. [판정 원칙]에 따라 재검토하십시오.\n"
+                                "- 사유가 대상 언어의 규칙이 아니라 다른 언어의 표기 관습이거나 단순 취향이면 OK로 정정하십시오.\n"
+                                "- 사유가 대상 언어 기준으로 타당하면 같은 판정을 그대로 다시 출력하십시오.\n"
+                                "각 줄 맨 앞의 R숫자 ID는 그대로 두고, 각 행마다 'OK' 또는\n"
+                                "'수정: <제안> | 사유: <한국어>' 형식으로만 코드블록에 출력하십시오.\n\n"
+                                + body)
+                            self.waiting("수정 판정 크로스체크 중")
+                            send_message(driver, cc_msg)
+                            wait_for_response(driver, should_stop=lambda: self.stop_flag)
+                            self.done_waiting()
+                            cc_resp = extract_last_response(driver)
+                            if cc_resp:
+                                cc_verdicts, _ = parse_response(cc_resp, cc_batch)
+                                reverted = []
+                                for j, i in enumerate(fix_idxs):
+                                    v = cc_verdicts[j] if j < len(cc_verdicts) else ""
+                                    if not v:
+                                        continue  # 재검토 응답 누락 → 1차 판정 유지
+                                    orig = batch[i][5] if len(batch[i]) > 5 else ""
+                                    f2, n2 = parse_review_verdict(v, orig)
+                                    if n2 == "OK":
+                                        finals[i], notes[i] = orig, "OK"
+                                        reverted.append(s_row + i)
+                                    elif f2:
+                                        finals[i], notes[i] = f2, n2
+                                if reverted:
+                                    self.log(f"  ↩️ 크로스체크로 OK 정정: {reverted}", "success")
+
                         issue_rows = [s_row + i for i, n in enumerate(notes)
                                       if n and n != "OK"]
                         if issue_rows:
@@ -1134,6 +1175,12 @@ class SettingsDialog(ctk.CTkToplevel):
                          text=f"  · 결과열({_rc})엔 최종 단어만, 바로 다음 열({next_col_letter(_rc)})엔 판정(OK / 수정+사유)이 기입됩니다.",
                          text_color="#888", font=ctk.CTkFont(size=11)).pack(
                 anchor="w", padx=4, pady=(2, 0))
+            self.v_cross = tk.BooleanVar(
+                value=getattr(config, "REVIEW_CROSS_CHECK", True))
+            ctk.CTkCheckBox(
+                col_frame,
+                text="수정 판정 크로스체크 (다른 언어 규칙·취향 근거의 오탐을 한 번 더 걸러냄)",
+                variable=self.v_cross).pack(anchor="w", padx=4, pady=(8, 0))
 
         ctk.CTkFrame(scroll, height=1, fg_color="#3a3a4a").pack(
             fill="x", pady=10)
@@ -1281,6 +1328,8 @@ class SettingsDialog(ctk.CTkToplevel):
         ai_mode = (self.v_ai_mode.get() or "chatgpt").lower()
         config.AI_MODE = ai_mode if ai_mode in ("chatgpt", "claude") else "chatgpt"
         config.PROMPT_LANG = self.v_prompt_lang.get()
+        if hasattr(self, "v_cross"):
+            config.REVIEW_CROSS_CHECK = bool(self.v_cross.get())
         save_settings()
         self.destroy()
 
@@ -1490,6 +1539,7 @@ def save_settings():
         "WORK_MODE":                  _current_mode(),
         "REVIEW_SRC_LANG":            getattr(config, "REVIEW_SRC_LANG", "ko"),
         "REVIEW_TGT_LANG":            getattr(config, "REVIEW_TGT_LANG", "es"),
+        "REVIEW_CROSS_CHECK":         getattr(config, "REVIEW_CROSS_CHECK", True),
         "MODE_COL_ROLES":             _mode_presets(),
     }
     with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
@@ -1540,6 +1590,7 @@ def load_settings():
         tgt = data.get("REVIEW_TGT_LANG", getattr(config, "REVIEW_TGT_LANG", "es"))
         config.REVIEW_SRC_LANG = src if src in REVIEW_LANGS else "ko"
         config.REVIEW_TGT_LANG = tgt if tgt in REVIEW_LANGS else "es"
+        config.REVIEW_CROSS_CHECK = bool(data.get("REVIEW_CROSS_CHECK", True))
 
         presets = data.get("MODE_COL_ROLES")
         if isinstance(presets, dict):
