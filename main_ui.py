@@ -22,10 +22,13 @@ from main import (
     get_sheet, get_pending_rows, log_failure, write_results, write_status,
     setup_driver, new_conversation, send_message, wait_for_response,
     extract_last_response, sanitize_cell, restore_cell,
-    group_consecutive_rows, format_batch, parse_response, is_empty, col_to_idx,
-    list_prompt_langs, load_prompt, ensure_external_prompts, find_chrome,
+    group_consecutive_rows, format_batch, format_review_batch, parse_response,
+    is_empty, col_to_idx,
+    list_prompt_langs, load_prompt, load_review_prompt, ensure_external_prompts,
+    find_chrome,
     extract_spreadsheet_id, get_service_account_email, test_connection,
     check_logged_in, PROMPTS_DIR, LANG_LABELS,
+    WORK_MODE_LABELS, REVIEW_MODES, REVIEW_LANGS,
 )
 import config
 
@@ -44,6 +47,70 @@ if not hasattr(config, "PRESERVE_PLACEHOLDERS"):
 # AI 모드: "chatgpt"(기본) 또는 "claude" — 어느 웹을 셀레니움으로 구동할지 결정
 if not hasattr(config, "AI_MODE"):
     config.AI_MODE = "chatgpt"
+
+# 작업 모드: "translate"(번역) / "review_glossary"(용어집 검수) / "review_general"(일반 검수)
+if not hasattr(config, "WORK_MODE"):
+    config.WORK_MODE = "translate"
+if not hasattr(config, "REVIEW_SRC_LANG"):
+    config.REVIEW_SRC_LANG = "ko"
+if not hasattr(config, "REVIEW_TGT_LANG"):
+    config.REVIEW_TGT_LANG = "es"
+
+
+# ── 모드별 열 역할 프리셋 ────────────────────────────────────────────────────
+# 번역과 검수는 시트 구성이 다르므로(검수엔 '검수대상'·'카테고리' 열이 필요),
+# 모드마다 열 역할을 따로 기억해 두고 모드를 전환하면 자동으로 적용한다.
+# 정본은 config.MODE_COL_ROLES (settings.json 에 저장) — COL_*_ROLE 은 현재 모드의 사본.
+
+DEFAULT_MODE_COLS = {
+    "translate":       {"COL_A_ROLE": "source", "COL_B_ROLE": "placeholder", "COL_C_ROLE": None,     "RESULT_COL": "D"},
+    "review_glossary": {"COL_A_ROLE": "source", "COL_B_ROLE": "category",    "COL_C_ROLE": "review", "RESULT_COL": "D"},
+    "review_general":  {"COL_A_ROLE": "source", "COL_B_ROLE": "review",      "COL_C_ROLE": None,     "RESULT_COL": "D"},
+}
+
+
+def _mode_presets():
+    """config.MODE_COL_ROLES 를 항상 완전한 형태(모든 모드·모든 키)로 보정해 반환."""
+    presets = getattr(config, "MODE_COL_ROLES", None)
+    if not isinstance(presets, dict):
+        presets = {}
+    for mode, defaults in DEFAULT_MODE_COLS.items():
+        cur = presets.get(mode)
+        if not isinstance(cur, dict):
+            cur = {}
+        merged = dict(defaults)
+        for k in defaults:
+            if k in cur:
+                merged[k] = cur[k]
+        presets[mode] = merged
+    config.MODE_COL_ROLES = presets
+    return presets
+
+
+def _current_mode():
+    mode = getattr(config, "WORK_MODE", "translate")
+    return mode if mode in DEFAULT_MODE_COLS else "translate"
+
+
+def store_mode_columns():
+    """현재 config 의 열 역할(COL_*_ROLE/RESULT_COL)을 현재 모드 프리셋에 기록."""
+    presets = _mode_presets()
+    presets[_current_mode()] = {
+        "COL_A_ROLE": getattr(config, "COL_A_ROLE", None),
+        "COL_B_ROLE": getattr(config, "COL_B_ROLE", None),
+        "COL_C_ROLE": getattr(config, "COL_C_ROLE", None),
+        "RESULT_COL": getattr(config, "RESULT_COL", "D"),
+    }
+
+
+def apply_mode_columns():
+    """현재 모드의 열 역할 프리셋을 config(COL_*_ROLE/RESULT_COL)에 적용."""
+    presets = _mode_presets()
+    p = presets[_current_mode()]
+    config.COL_A_ROLE = p.get("COL_A_ROLE")
+    config.COL_B_ROLE = p.get("COL_B_ROLE")
+    config.COL_C_ROLE = p.get("COL_C_ROLE")
+    config.RESULT_COL = (p.get("RESULT_COL") or "D")
 
 # 사용자 데이터는 exe 옆(app_dir)에 둔다 — 번들 폴더가 아니라.
 BASE_DIR = paths.app_dir()
@@ -341,6 +408,21 @@ class TranslationWorker(threading.Thread):
             )
             self.log("AI 모드: ChatGPT (chatgpt.com 웹)", "info")
 
+        # ── 작업 모드 (번역/검수) — 실행 시작 시점에 한 번 확정 ─────────
+        work_mode = _current_mode()
+        is_review = work_mode in REVIEW_MODES
+        work_word = "검수" if is_review else "번역"
+        fmt_batch = format_review_batch if is_review else format_batch
+        if is_review:
+            src = getattr(config, "REVIEW_SRC_LANG", "ko")
+            tgt = getattr(config, "REVIEW_TGT_LANG", "es")
+            self.log(
+                f"작업 모드: {WORK_MODE_LABELS.get(work_mode, work_mode)} "
+                f"({LANG_LABELS.get(src, src)} → {LANG_LABELS.get(tgt, tgt)})",
+                "info")
+        else:
+            self.log("작업 모드: 번역", "info")
+
         processed = 0
         total = 0
         driver = None
@@ -357,7 +439,7 @@ class TranslationWorker(threading.Thread):
 
             pending_rows = get_pending_rows(sheet)
             if not pending_rows:
-                self.log("번역 대상 행이 없습니다.", "warn")
+                self.log(f"{work_word} 대상 행이 없습니다.", "warn")
                 self.log_q.put(("empty", None))
                 self.done_callback(0, 0, [])
                 return
@@ -397,7 +479,7 @@ class TranslationWorker(threading.Thread):
                         "ChatGPT에 로그인되어 있지 않은 것 같습니다. "
                         "열린 Chrome 창에서 chatgpt.com 에 로그인한 뒤 다시 RUN 하세요.")
 
-            self.status("번역 진행 중...", "#9ece6a")
+            self.status(f"{work_word} 진행 중...", "#9ece6a")
             self.send_count = 0
             groups = group_consecutive_rows(pending_rows)
             import math as _math
@@ -410,48 +492,50 @@ class TranslationWorker(threading.Thread):
                 group = groups[gi]
 
                 if self.send_count == 0 or self.send_count >= config.MAX_SENDS_PER_CONVERSATION or self.force_new_conv:
-                    # ── E열 특이사항 재검증 스윕 ──────────────────────
+                    # ── E열 특이사항 재검증 스윕 (번역 모드 전용) ─────
                     # 한글 포함/플레이스홀더 불일치 표시를 현재 C/D 기준으로 다시 보고,
                     # 실제로 정상이면 표시만 지운다. (무엇을 발견/검증했는지 로그로 노출)
-                    self.waiting("E열 특이사항 재검증 중")
-                    cc = cross_check_flagged_rows(sheet)
-                    self.done_waiting()
+                    # 검수 모드는 E열 자동 표시를 쓰지 않으므로 건너뛴다.
+                    if not is_review:
+                        self.waiting("E열 특이사항 재검증 중")
+                        cc = cross_check_flagged_rows(sheet)
+                        self.done_waiting()
 
-                    if not cc["ok"]:
-                        self.log(f"⚠️ E열 재검증 실패 — 시트 읽기 오류로 건너뜀: {cc['error']}", "error")
-                    else:
-                        cleared = cc["cleared"]
-                        kept_ph = cc["kept_ph"]
-                        kept_ko = cc["kept_ko"]
-                        kept_unv = cc["kept_unverifiable"]
-                        found = len(cleared) + len(kept_ph) + len(kept_ko) + len(kept_unv)
-
-                        if found == 0:
-                            self.log("E열 재검증: 특이사항 행을 찾지 못함 (검사 대상 0건)", "info")
+                        if not cc["ok"]:
+                            self.log(f"⚠️ E열 재검증 실패 — 시트 읽기 오류로 건너뜀: {cc['error']}", "error")
                         else:
-                            self.log(
-                                f"E열 재검증: 특이사항 {found}행 발견 "
-                                f"→ 정리 {len(cleared)} / 유지 {len(kept_ph) + len(kept_ko) + len(kept_unv)}",
-                                "info"
-                            )
+                            cleared = cc["cleared"]
+                            kept_ph = cc["kept_ph"]
+                            kept_ko = cc["kept_ko"]
+                            kept_unv = cc["kept_unverifiable"]
+                            found = len(cleared) + len(kept_ph) + len(kept_ko) + len(kept_unv)
 
-                            def _preview(rows, limit=40):
-                                head = ", ".join(str(r) for r in rows[:limit])
-                                return head + ("" if len(rows) <= limit else f" 외 {len(rows) - limit}행")
-
-                            if cleared:
-                                self.log(f"  🧹 정리(이제 정상): {_preview(cleared)}행", "success")
-                            if kept_ph:
-                                self.log(f"  📌 유지(여전히 플레이스홀더 불일치): {_preview(kept_ph)}행", "warn")
-                            if kept_ko:
-                                self.log(f"  📌 유지(여전히 한글 포함): {_preview(kept_ko)}행", "warn")
-                            if kept_unv:
+                            if found == 0:
+                                self.log("E열 재검증: 특이사항 행을 찾지 못함 (검사 대상 0건)", "info")
+                            else:
                                 self.log(
-                                    f"  ⚠️ 검증 불가(플레이스홀더 원본열 미설정): {_preview(kept_unv)}행",
-                                    "warn"
+                                    f"E열 재검증: 특이사항 {found}행 발견 "
+                                    f"→ 정리 {len(cleared)} / 유지 {len(kept_ph) + len(kept_ko) + len(kept_unv)}",
+                                    "info"
                                 )
-                        if cc["ph_col"] is None:
-                            self.log("  ↳ 참고: 플레이스홀더 원본열이 설정돼 있지 않아 불일치 행은 검증하지 못했습니다.", "warn")
+
+                                def _preview(rows, limit=40):
+                                    head = ", ".join(str(r) for r in rows[:limit])
+                                    return head + ("" if len(rows) <= limit else f" 외 {len(rows) - limit}행")
+
+                                if cleared:
+                                    self.log(f"  🧹 정리(이제 정상): {_preview(cleared)}행", "success")
+                                if kept_ph:
+                                    self.log(f"  📌 유지(여전히 플레이스홀더 불일치): {_preview(kept_ph)}행", "warn")
+                                if kept_ko:
+                                    self.log(f"  📌 유지(여전히 한글 포함): {_preview(kept_ko)}행", "warn")
+                                if kept_unv:
+                                    self.log(
+                                        f"  ⚠️ 검증 불가(플레이스홀더 원본열 미설정): {_preview(kept_unv)}행",
+                                        "warn"
+                                    )
+                            if cc["ph_col"] is None:
+                                self.log("  ↳ 참고: 플레이스홀더 원본열이 설정돼 있지 않아 불일치 행은 검증하지 못했습니다.", "warn")
 
                     if self.send_count > 0:
                         self.log("시트 재스캔 중 (실패 구멍 수거)...")
@@ -481,8 +565,8 @@ class TranslationWorker(threading.Thread):
                 batch_no += 1
                 label = " (구멍 그룹)" if len(group) < config.BATCH_SIZE else ""
                 self.log(f"배치 전송: {s_row}~{e_row}행 ({len(batch)}행{label})")
-                self.waiting(f"{s_row}~{e_row}행 번역 요청 중 · 배치 {batch_no}/{total_batches}")
-                send_message(driver, format_batch(batch))
+                self.waiting(f"{s_row}~{e_row}행 {work_word} 요청 중 · 배치 {batch_no}/{total_batches}")
+                send_message(driver, fmt_batch(batch))
                 self.done_waiting()
                 if self.stop_flag:
                     break
@@ -513,9 +597,10 @@ class TranslationWorker(threading.Thread):
                                     f"응답 행 ID 누락 ({len(missing)}행)")
                     ph_sources = None  # 플레이스홀더 컬럼 값 (검증 대상일 때만 채워짐)
 
-                    # ── 한글 감지 → 1회 즉시 재시도 ──────────────────
+                    # ── 한글 감지 → 1회 즉시 재시도 (번역 모드 전용) ──
+                    # 검수 모드는 결과에 한국어 사유가 포함되는 것이 정상이므로 검사하지 않는다.
                     from main import has_korean, filter_korean_lines
-                    korean_idxs = filter_korean_lines(lines)
+                    korean_idxs = [] if is_review else filter_korean_lines(lines)
                     if korean_idxs:
                         self.log(f"⚠️ 한글 감지 ({len(korean_idxs)}행) — 재번역 시도...", "warn")
                         retry_batch = [batch[i] for i in korean_idxs if i < len(batch)]
@@ -538,8 +623,9 @@ class TranslationWorker(threading.Thread):
                                         lines[idx] = retry_lines[j]
                         # (E열 '한글 포함' 표시/정리는 아래 reconcile_status에서 일괄 처리)
 
-                    # ── 플레이스홀더 검증 → 1회 즉시 재시도 ──────────
-                    if getattr(config, "PRESERVE_PLACEHOLDERS", True):
+                    # ── 플레이스홀더 검증 → 1회 즉시 재시도 (번역 모드 전용) ──
+                    # 검수 모드의 결과는 번역문이 아니라 판정 텍스트라 검증 대상이 아니다.
+                    if not is_review and getattr(config, "PRESERVE_PLACEHOLDERS", True):
                         ph_col = get_placeholder_col_letter()
                         if ph_col:
                             ph_sources = get_placeholder_sources(sheet, s_row, len(batch), ph_col)
@@ -580,18 +666,33 @@ class TranslationWorker(threading.Thread):
                                             if retry_lines[j]:
                                                 lines[idx] = retry_lines[j]
 
-                    # ── E열 상태 최종 정리 (한글 + 플레이스홀더 통합) ──
+                    # ── E열 상태 최종 정리 (번역 모드 전용) ───────────
                     # 최종 결과(lines)를 다시 검사해 불일치/한글은 표시하고,
                     # 정상이 된 행에 남아있던 자동 표시는 셀을 완전히 비운다.
-                    mismatch_rows, korean_rows, cleared_rows = reconcile_status(
-                        sheet, s_row, lines, ph_sources
-                    )
-                    for r in mismatch_rows:
-                        self.log(f"📝 {r}행 → 플레이스홀더 불일치, E열: 플레이스홀더 불일치", "warn")
-                    for r in korean_rows:
-                        self.log(f"📝 {r}행 → 한글 포함, E열: 한글 포함", "warn")
-                    for r in cleared_rows:
-                        self.log(f"🧹 {r}행 → 정상, E열 표시 제거", "success")
+                    # 검수 모드 결과(OK/수정 제안)에는 해당 없음.
+                    if not is_review:
+                        mismatch_rows, korean_rows, cleared_rows = reconcile_status(
+                            sheet, s_row, lines, ph_sources
+                        )
+                        for r in mismatch_rows:
+                            self.log(f"📝 {r}행 → 플레이스홀더 불일치, E열: 플레이스홀더 불일치", "warn")
+                        for r in korean_rows:
+                            self.log(f"📝 {r}행 → 한글 포함, E열: 한글 포함", "warn")
+                        for r in cleared_rows:
+                            self.log(f"🧹 {r}행 → 정상, E열 표시 제거", "success")
+
+                    # ── 검수 모드: 수정 제안 요약 로그 ────────────────
+                    if is_review:
+                        issue_rows = [
+                            s_row + i for i, ln in enumerate(lines)
+                            if ln and ln.strip().rstrip(".").upper() != "OK"
+                        ]
+                        if issue_rows:
+                            head = ", ".join(str(r) for r in issue_rows[:30])
+                            more = "" if len(issue_rows) <= 30 else f" 외 {len(issue_rows) - 30}행"
+                            self.log(f"🔎 수정 제안 {len(issue_rows)}행: {head}{more}", "warn")
+                        else:
+                            self.log("🔎 이 배치는 전부 OK", "success")
 
                     count = len(lines)  # batch와 항상 같은 길이 (누락 행은 빈 칸)
                     write_results(sheet, s_row, lines)
@@ -952,13 +1053,24 @@ class SettingsDialog(ctk.CTkToplevel):
         ctk.CTkFrame(scroll, height=1, fg_color="#3a3a4a").pack(
             fill="x", pady=10)
 
-        # 열 설정
-        ctk.CTkLabel(scroll, text="📋  열 설정",
+        # 열 설정 — 현재 작업 모드 기준 (모드별로 따로 저장됨)
+        cur_mode = _current_mode()
+        is_review_mode = cur_mode in REVIEW_MODES
+        ctk.CTkLabel(scroll,
+                     text=f"📋  열 설정 — 현재 모드: {WORK_MODE_LABELS.get(cur_mode, cur_mode)}",
                      font=ctk.CTkFont(size=13, weight="bold")).pack(
             anchor="w", pady=(0, 6))
+        ctk.CTkLabel(scroll,
+                     text="※ 열 역할은 모드(번역/검수)별로 따로 저장됩니다. 모드는 메인 화면에서 전환하세요.",
+                     text_color="#888", font=ctk.CTkFont(size=11)).pack(
+            anchor="w", padx=4, pady=(0, 4))
 
-        ROLES = ["source", "ref", "placeholder", None]
-        ROLE_LABELS = {"source": "원본", "ref": "참조", "placeholder": "플레이스홀더", None: "제외"}
+        if is_review_mode:
+            ROLES = ["source", "review", "category", "ref", None]
+        else:
+            ROLES = ["source", "ref", "placeholder", None]
+        ROLE_LABELS = {"source": "원본", "ref": "참조", "placeholder": "플레이스홀더",
+                       "category": "카테고리", "review": "검수대상", None: "제외"}
 
         col_frame = ctk.CTkFrame(scroll, fg_color="transparent")
         col_frame.pack(fill="x", pady=(0, 4))
@@ -972,22 +1084,33 @@ class SettingsDialog(ctk.CTkToplevel):
             row_f = ctk.CTkFrame(col_frame, fg_color="transparent")
             row_f.pack(fill="x", pady=3)
             ctk.CTkLabel(row_f, text=f"{desc}", width=40, anchor="w").pack(side="left")
-            var = tk.StringVar(value=str(getattr(config, attr, None)))
+            cur_role = getattr(config, attr, None)
+            # 현재 값이 이 모드의 선택지에 없으면 '제외'로 표시 (모드 간 역할 혼입 방지)
+            if cur_role not in ROLES:
+                cur_role = None
+            var = tk.StringVar(value=str(cur_role))
             self.col_vars[attr] = var
             for role in ROLES:
                 label = ROLE_LABELS[role]
                 val = str(role)
                 rb = ctk.CTkRadioButton(row_f, text=label, variable=var, value=val,
-                                        width=90)
-                rb.pack(side="left", padx=4)
+                                        width=80 if is_review_mode else 90)
+                rb.pack(side="left", padx=3)
+
+        if is_review_mode:
+            ctk.CTkLabel(col_frame,
+                         text="  · 검수대상: 검수할 번역문이 있는 열 (필수) / 카테고리: 용어 분류 열 (용어집 검수용)",
+                         text_color="#888", font=ctk.CTkFont(size=11)).pack(
+                anchor="w", padx=4, pady=(2, 0))
 
         # 결과열
         res_f = ctk.CTkFrame(col_frame, fg_color="transparent")
         res_f.pack(fill="x", pady=(6, 0))
-        ctk.CTkLabel(res_f, text="번역 결과 기입", width=90, anchor="w").pack(side="left")
+        result_label = "검수 결과 기입" if is_review_mode else "번역 결과 기입"
+        ctk.CTkLabel(res_f, text=result_label, width=90, anchor="w").pack(side="left")
         self.v_result_col = tk.StringVar(value=getattr(config, "RESULT_COL", "D"))
         ctk.CTkEntry(res_f, textvariable=self.v_result_col, width=60).pack(side="left", padx=4)
-        ctk.CTkLabel(res_f, text="(번역 결과를 적을 열 문자: A, B, C, D ...)",
+        ctk.CTkLabel(res_f, text="(결과를 적을 열 문자: A, B, C, D ...)",
                      text_color="#888", font=ctk.CTkFont(size=11)).pack(side="left", padx=4)
 
         ctk.CTkFrame(scroll, height=1, fg_color="#3a3a4a").pack(
@@ -1229,15 +1352,28 @@ class PromptDialog(ctk.CTkToplevel):
         self._build()
 
     def _build(self):
-        self.lang = getattr(config, "PROMPT_LANG", "")
-        self.prompt_file = os.path.join(PROMPTS_DIR, f"{self.lang}.txt")
+        # 현재 작업 모드에 맞는 프롬프트 파일을 연다:
+        #   번역 모드 → prompts/{언어}.txt / 검수 모드 → prompts/review_*.txt 템플릿
+        mode = _current_mode()
+        self.is_review = mode in REVIEW_MODES
+        if self.is_review:
+            self.lang = mode  # 파일명 키로 모드명을 그대로 사용
+            self.prompt_file = os.path.join(PROMPTS_DIR, f"{mode}.txt")
+            title_txt = f"프롬프트 편집 — {WORK_MODE_LABELS.get(mode, mode)} 템플릿"
+            hint_txt = ("※ {SRC_LANG} / {TGT_LANG} 토큰은 실행 시 메인 화면에서 고른 검수 언어로 자동 치환됩니다. "
+                        "행 ID 규칙은 자동으로 덧붙습니다.")
+        else:
+            self.lang = getattr(config, "PROMPT_LANG", "")
+            self.prompt_file = os.path.join(PROMPTS_DIR, f"{self.lang}.txt")
+            title_txt = f"프롬프트 편집 — 현재 언어: {LANG_LABELS.get(self.lang, self.lang) or '(미선택)'}"
+            hint_txt = "※ 여기엔 순수 번역 규칙만 작성하세요. 행 ID 규칙은 작업 시 자동으로 덧붙습니다."
 
         ctk.CTkLabel(self,
-                     text=f"프롬프트 편집 — 현재 언어: {LANG_LABELS.get(self.lang, self.lang) or '(미선택)'}",
+                     text=title_txt,
                      font=ctk.CTkFont(size=13, weight="bold")).pack(
             anchor="w", padx=20, pady=(16, 2))
         ctk.CTkLabel(self,
-                     text="※ 여기엔 순수 번역 규칙만 작성하세요. 행 ID 규칙은 작업 시 자동으로 덧붙습니다.",
+                     text=hint_txt,
                      text_color="#888", font=ctk.CTkFont(size=11)).pack(
             anchor="w", padx=20, pady=(0, 6))
 
@@ -1273,7 +1409,7 @@ class PromptDialog(ctk.CTkToplevel):
 class DoneDialog(ctk.CTkToplevel):
     def __init__(self, parent, processed, total, fail_lines):
         super().__init__(parent)
-        self.title("번역 완료 — 결과 요약")
+        self.title("작업 완료 — 결과 요약")
         self.geometry("460x380")
         self.grab_set()
         self.after(50, self.lift)
@@ -1307,6 +1443,8 @@ class DoneDialog(ctk.CTkToplevel):
 def save_settings():
     """현재 config 값을 settings.json에 저장"""
     import json
+    # COL_*_ROLE 은 현재 모드의 사본이므로, 저장 전에 모드 프리셋에 동기화한다
+    store_mode_columns()
     data = {
         "SPREADSHEET_ID":             config.SPREADSHEET_ID,
         "SHEET_NAME":                 config.SHEET_NAME,
@@ -1327,6 +1465,10 @@ def save_settings():
         "AI_MODE":                    getattr(config, "AI_MODE", "chatgpt"),
         "PROMPT_LANG":                getattr(config, "PROMPT_LANG", ""),
         "CHROME_BINARY_PATH":         getattr(config, "CHROME_BINARY_PATH", ""),
+        "WORK_MODE":                  _current_mode(),
+        "REVIEW_SRC_LANG":            getattr(config, "REVIEW_SRC_LANG", "ko"),
+        "REVIEW_TGT_LANG":            getattr(config, "REVIEW_TGT_LANG", "es"),
+        "MODE_COL_ROLES":             _mode_presets(),
     }
     with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -1368,6 +1510,31 @@ def load_settings():
             config.PROMPT_LANG = langs[0]
         else:
             config.PROMPT_LANG = ""
+
+        # ── 작업 모드 + 모드별 열 역할 ─────────────────────────────
+        wm = (data.get("WORK_MODE", "translate") or "translate")
+        config.WORK_MODE = wm if wm in DEFAULT_MODE_COLS else "translate"
+        src = data.get("REVIEW_SRC_LANG", getattr(config, "REVIEW_SRC_LANG", "ko"))
+        tgt = data.get("REVIEW_TGT_LANG", getattr(config, "REVIEW_TGT_LANG", "es"))
+        config.REVIEW_SRC_LANG = src if src in REVIEW_LANGS else "ko"
+        config.REVIEW_TGT_LANG = tgt if tgt in REVIEW_LANGS else "es"
+
+        presets = data.get("MODE_COL_ROLES")
+        if isinstance(presets, dict):
+            config.MODE_COL_ROLES = presets
+        else:
+            # 구버전 settings.json — 위에서 읽은 COL_* 값을 번역 모드 프리셋으로 승격
+            config.MODE_COL_ROLES = {
+                "translate": {
+                    "COL_A_ROLE": config.COL_A_ROLE,
+                    "COL_B_ROLE": config.COL_B_ROLE,
+                    "COL_C_ROLE": config.COL_C_ROLE,
+                    "RESULT_COL": config.RESULT_COL,
+                }
+            }
+        # 프리셋 보정 후 현재 모드의 열 역할을 COL_* 에 적용
+        apply_mode_columns()
+
         _clamp_settings()
     except Exception:
         pass
@@ -1732,16 +1899,29 @@ class App(ctk.CTk):
                                       text_color=self.COLORS["text_sub"])
         self.prog_lbl.pack(side="right")
 
-        # 현재 선택된 번역 언어 표시 (RUN 전에 무슨 언어로 도는지 한눈에)
-        lang_row = ctk.CTkFrame(card, fg_color="transparent")
-        lang_row.pack(fill="x", padx=20, pady=(0, 2))
-        ctk.CTkLabel(lang_row, text="🌍",
-                     font=ctk.CTkFont(size=12)).pack(side="left")
-        self.lang_lbl = ctk.CTkLabel(
-            lang_row, text=f" 번역 언어: {LANG_LABELS.get(getattr(config, 'PROMPT_LANG', ''), getattr(config, 'PROMPT_LANG', '')) or '(미선택)'}",
+        # ── 작업 모드 선택 (번역 / 용어집 검수 / 일반 검수)
+        mode_row = ctk.CTkFrame(card, fg_color="transparent")
+        mode_row.pack(fill="x", padx=20, pady=(0, 6))
+        self._mode_labels = [WORK_MODE_LABELS[m] for m in
+                             ("translate", "review_glossary", "review_general")]
+        self._label_to_mode = {v: k for k, v in WORK_MODE_LABELS.items()}
+        self.mode_seg = ctk.CTkSegmentedButton(
+            mode_row, values=self._mode_labels,
             font=ctk.CTkFont(size=12, weight="bold"),
-            text_color=self.COLORS["accent"])
-        self.lang_lbl.pack(side="left")
+            selected_color=self.COLORS["accent"],
+            selected_hover_color=self.COLORS["accent_hover"],
+            unselected_color="#e2e8f0",
+            unselected_hover_color="#cbd5e0",
+            text_color=self.COLORS["text_main"],
+            command=self._on_mode_change)
+        self.mode_seg.set(WORK_MODE_LABELS.get(_current_mode(), "번역"))
+        self.mode_seg.pack(fill="x")
+
+        # ── 언어 표시 영역 (모드에 따라 내용이 바뀜)
+        #   번역 모드: 현재 번역 언어 표시 / 검수 모드: 원문 → 대상 언어 선택
+        self.lang_area = ctk.CTkFrame(card, fg_color="transparent")
+        self.lang_area.pack(fill="x", padx=20, pady=(0, 2))
+        self._build_lang_area()
 
         self.progress = ctk.CTkProgressBar(card, height=12, corner_radius=6,
                                            fg_color=self.COLORS["progress_bg"],
@@ -1824,21 +2004,53 @@ class App(ctk.CTk):
             messagebox.showerror("오류", "설정에서 스프레드시트 ID를 입력해주세요.")
             return
 
-        # 선택된 언어 프롬프트 로드 (+ ID 규칙은 load_prompt가 자동 주입)
-        lang = getattr(config, "PROMPT_LANG", "")
-        loaded = load_prompt(lang)
-        if not loaded:
-            langs = list_prompt_langs()
-            if not langs:
-                messagebox.showerror("오류", f"prompts 폴더에 프롬프트 파일이 없습니다.\n({PROMPTS_DIR})")
+        mode = _current_mode()
+        if mode in REVIEW_MODES:
+            # ── 검수 모드: 언어쌍/열 역할 확인 + 검수 템플릿 로드 ────────
+            src = getattr(config, "REVIEW_SRC_LANG", "ko")
+            tgt = getattr(config, "REVIEW_TGT_LANG", "es")
+            if src == tgt:
+                messagebox.showerror(
+                    "오류", "검수 원문 언어와 대상 언어가 같습니다.\n"
+                           "메인 화면에서 서로 다른 언어를 선택해주세요.")
                 return
-            messagebox.showerror("오류", f"프롬프트 '{lang}'을(를) 불러오지 못했습니다.\n설정에서 언어를 선택해주세요.")
-            return
-        config.FIXED_PROMPT = loaded
-        self._add_log(f"프롬프트 로드: {lang} (행 ID 규칙 자동 적용)", "info")
+            roles = [getattr(config, a, None)
+                     for a in ("COL_A_ROLE", "COL_B_ROLE", "COL_C_ROLE")]
+            if "review" not in roles:
+                messagebox.showerror(
+                    "오류", "검수 대상 열이 지정되지 않았습니다.\n"
+                           "설정(⚙) → 열 설정에서 '검수대상' 열을 선택해주세요.")
+                return
+            loaded = load_review_prompt(mode, src, tgt)
+            if not loaded:
+                messagebox.showerror(
+                    "오류", f"검수 프롬프트 파일을 불러오지 못했습니다.\n"
+                           f"(prompts/{mode}.txt)")
+                return
+            config.FIXED_PROMPT = loaded
+            if mode == "review_glossary" and "category" not in roles:
+                self._add_log("⚠️ 카테고리 열이 지정되지 않았습니다 — 카테고리 없이 검수합니다.", "warn")
+            self._add_log(
+                f"검수 프롬프트 로드: {WORK_MODE_LABELS.get(mode, mode)} · "
+                f"{LANG_LABELS.get(src, src)} → {LANG_LABELS.get(tgt, tgt)}", "info")
+        else:
+            # ── 번역 모드: 선택된 언어 프롬프트 로드 (+ ID 규칙 자동 주입) ──
+            lang = getattr(config, "PROMPT_LANG", "")
+            loaded = load_prompt(lang)
+            if not loaded:
+                langs = list_prompt_langs()
+                if not langs:
+                    messagebox.showerror("오류", f"prompts 폴더에 프롬프트 파일이 없습니다.\n({PROMPTS_DIR})")
+                    return
+                messagebox.showerror("오류", f"프롬프트 '{lang}'을(를) 불러오지 못했습니다.\n설정에서 언어를 선택해주세요.")
+                return
+            config.FIXED_PROMPT = loaded
+            self._add_log(f"프롬프트 로드: {lang} (행 ID 규칙 자동 적용)", "info")
 
         self.btn_start.configure(state="disabled")
         self.btn_stop.configure(state="normal")
+        # 실행 중 모드 전환 방지 (열 역할/프롬프트가 도중에 바뀌면 안 됨)
+        self.mode_seg.configure(state="disabled")
 
         self.btn_pause.configure(state="normal", text="PAUSE",
                                 fg_color=self.COLORS["secondary"],
@@ -1870,12 +2082,73 @@ class App(ctk.CTk):
                                      text_color=self.COLORS["text_main"])
             self._set_status("Infusing...", self.COLORS["accent"])
 
-    def _refresh_lang_label(self):
-        """메인 화면 상태 카드의 '번역 언어' 표시를 현재 config 기준으로 갱신"""
-        if hasattr(self, "lang_lbl"):
+    def _build_lang_area(self):
+        """언어 표시 영역 구성 — 번역 모드는 언어 라벨, 검수 모드는 원문→대상 선택."""
+        for w in self.lang_area.winfo_children():
+            w.destroy()
+        mode = _current_mode()
+        if mode in REVIEW_MODES:
+            ctk.CTkLabel(self.lang_area, text="🔍",
+                         font=ctk.CTkFont(size=12)).pack(side="left")
+            ctk.CTkLabel(self.lang_area, text=" 검수 언어: ",
+                         font=ctk.CTkFont(size=12, weight="bold"),
+                         text_color=self.COLORS["accent"]).pack(side="left")
+            labels = [LANG_LABELS.get(c, c) for c in REVIEW_LANGS]
+            self._rev_label_to_code = {LANG_LABELS.get(c, c): c for c in REVIEW_LANGS}
+            src = getattr(config, "REVIEW_SRC_LANG", "ko")
+            tgt = getattr(config, "REVIEW_TGT_LANG", "es")
+            menu_style = dict(
+                values=labels, width=118, height=26,
+                font=ctk.CTkFont(size=12),
+                fg_color="#edf2f7",
+                button_color=self.COLORS["accent"],
+                button_hover_color=self.COLORS["accent_hover"],
+                text_color=self.COLORS["text_main"],
+                command=lambda _v: self._on_review_lang())
+            self._rev_src_var = tk.StringVar(value=LANG_LABELS.get(src, src))
+            ctk.CTkOptionMenu(self.lang_area, variable=self._rev_src_var,
+                              **menu_style).pack(side="left")
+            ctk.CTkLabel(self.lang_area, text=" → ",
+                         font=ctk.CTkFont(size=12, weight="bold"),
+                         text_color=self.COLORS["text_sub"]).pack(side="left")
+            self._rev_tgt_var = tk.StringVar(value=LANG_LABELS.get(tgt, tgt))
+            ctk.CTkOptionMenu(self.lang_area, variable=self._rev_tgt_var,
+                              **menu_style).pack(side="left")
+        else:
+            ctk.CTkLabel(self.lang_area, text="🌍",
+                         font=ctk.CTkFont(size=12)).pack(side="left")
             _lang = getattr(config, "PROMPT_LANG", "")
-            self.lang_lbl.configure(
-                text=f" 번역 언어: {LANG_LABELS.get(_lang, _lang) or '(미선택)'}")
+            ctk.CTkLabel(
+                self.lang_area,
+                text=f" 번역 언어: {LANG_LABELS.get(_lang, _lang) or '(미선택)'}",
+                font=ctk.CTkFont(size=12, weight="bold"),
+                text_color=self.COLORS["accent"]).pack(side="left")
+
+    def _on_mode_change(self, label):
+        """모드 세그먼트 버튼 — 열 역할 프리셋 교체 + 언어 영역 갱신 + 저장."""
+        mode = self._label_to_mode.get(label, "translate")
+        if mode == _current_mode():
+            return
+        # 지금 화면의 열 역할을 '이전 모드' 프리셋에 보관한 뒤 새 모드 프리셋을 적용
+        store_mode_columns()
+        config.WORK_MODE = mode
+        apply_mode_columns()
+        save_settings()
+        self._build_lang_area()
+        self._add_log(f"작업 모드 전환: {WORK_MODE_LABELS.get(mode, mode)}", "info")
+
+    def _on_review_lang(self):
+        """검수 원문/대상 언어 드롭다운 변경 — 즉시 config 반영·저장."""
+        src = self._rev_label_to_code.get(self._rev_src_var.get(), "ko")
+        tgt = self._rev_label_to_code.get(self._rev_tgt_var.get(), "es")
+        config.REVIEW_SRC_LANG = src
+        config.REVIEW_TGT_LANG = tgt
+        save_settings()
+
+    def _refresh_lang_label(self):
+        """메인 화면 상태 카드의 언어 표시를 현재 config 기준으로 갱신"""
+        if hasattr(self, "lang_area"):
+            self._build_lang_area()
 
     def _open_settings(self):
         dlg = SettingsDialog(self)
@@ -2065,11 +2338,12 @@ class App(ctk.CTk):
                         self._waiting_msg = msg_text
                 elif kind == "empty":
                     messagebox.showinfo(
-                        "번역 대상 없음",
-                        "번역할 행을 찾지 못했습니다.\n\n다음을 확인해보세요:\n"
-                        "• 결과열(번역 결과 기입)이 이미 채워져 있지 않은지\n"
+                        "대상 없음",
+                        "처리할 행을 찾지 못했습니다.\n\n다음을 확인해보세요:\n"
+                        "• 결과열(결과 기입)이 이미 채워져 있지 않은지\n"
                         "• 시작 행 번호가 올바른지\n"
                         "• 원본/대상 열 역할(설정 → 열 설정)이 맞는지\n"
+                        "• (검수 모드) '검수대상' 열에 검수할 번역문이 들어있는지\n"
                         "• '시트(탭) 이름'이 실제 작업 탭과 같은지")
                 elif kind == "done_waiting":
                     self._is_waiting = False
@@ -2081,6 +2355,7 @@ class App(ctk.CTk):
                     self.btn_start.configure(state="normal")
                     self.btn_stop.configure(state="disabled")
                     self.btn_pause.configure(state="disabled")
+                    self.mode_seg.configure(state="normal")
                     DoneDialog(self, processed, total, fail_lines)
         except queue.Empty:
             pass

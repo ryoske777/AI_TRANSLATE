@@ -55,6 +55,22 @@ PRESERVE_PLACEHOLDERS = True       # 플레이스홀더 보존 + 재시도
 AI_MODE               = "chatgpt"  # "chatgpt" | "claude"
 PROMPT_LANG           = "es"       # prompts/{PROMPT_LANG}.txt — 존재하는 값으로 폴백됨
 
+# ── 작업 모드 ────────────────────────────────────────────────────────────────
+#   "translate"       : 기존 번역 모드
+#   "review_glossary" : 용어집 검수 (단어 + 카테고리, 동음이의어/게임 용어 자연스러움 검수)
+#   "review_general"  : 일반 검수 (문장 단위, 원문→대상 언어 번역 품질 검수)
+WORK_MODE       = "translate"
+REVIEW_SRC_LANG = "ko"   # 검수 원문 언어 (ko 포함 가능)
+REVIEW_TGT_LANG = "es"   # 검수 대상(번역문) 언어
+
+#   모드별 열 역할 프리셋 — 모드를 전환하면 아래 값이 COL_*_ROLE/RESULT_COL 에 적용된다.
+#   실제 정본은 settings.json 의 MODE_COL_ROLES (설정창에서 편집 시 현재 모드에 저장됨).
+MODE_COL_ROLES = {
+    "translate":       {"COL_A_ROLE": "source", "COL_B_ROLE": "placeholder", "COL_C_ROLE": None,     "RESULT_COL": "D"},
+    "review_glossary": {"COL_A_ROLE": "source", "COL_B_ROLE": "category",    "COL_C_ROLE": "review", "RESULT_COL": "D"},
+    "review_general":  {"COL_A_ROLE": "source", "COL_B_ROLE": "review",      "COL_C_ROLE": None,     "RESULT_COL": "D"},
+}
+
 # ── 런타임 주입 ──────────────────────────────────────────────────────────────
 #   load_prompt(PROMPT_LANG) 결과가 실행 시 여기에 채워진다. 직접 편집 불필요.
 FIXED_PROMPT = ""

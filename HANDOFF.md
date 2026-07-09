@@ -175,7 +175,35 @@ make_version.py
 
 ---
 
-## 7. 빠른 점검 명령
+## 7. 작업 모드 — 번역 / 검수 (2026-07 추가)
+
+메인 화면 상단 세그먼트 버튼으로 3가지 모드를 전환한다 (config.WORK_MODE).
+
+- **번역(translate)**: 기존 동작 그대로.
+- **용어집 검수(review_glossary)**: 단어+카테고리 시트. 동음이의어(카테고리 문맥),
+  지역 변형(예: 유럽 스페인어 es-ES), 게임 용어로서의 자연스러움을 검수.
+- **일반 검수(review_general)**: 문장 시트. 원문→대상 언어 번역 품질(정확성/자연스러움/
+  지역 기준/형식 보존)을 검수.
+
+구조:
+- **열 역할은 모드별 프리셋** (config.MODE_COL_ROLES, settings.json 저장).
+  모드 전환 시 apply_mode_columns()가 COL_*_ROLE/RESULT_COL 에 적용. 검수 모드엔
+  새 역할 `review`(검수대상, 필수)와 `category`(용어집 검수용)가 있음.
+- **검수 언어쌍**은 메인 화면 드롭다운 (REVIEW_SRC_LANG → REVIEW_TGT_LANG, ko 포함).
+- **프롬프트 템플릿**: prompts/review_glossary.txt, prompts/review_general.txt.
+  {SRC_LANG}/{TGT_LANG} 토큰이 실행 시 REVIEW_LANG_DESC(지역 변형 명시)로 치환되고,
+  검수용 행 ID 규칙(REVIEW_ID_RULE_BLOCK)이 자동 주입됨 (main.load_review_prompt).
+  이 파일들은 list_prompt_langs() 언어 목록에서 제외됨 (review_ 접두사).
+- **배치 포맷**: format_review_batch — 열 순서 무관하게 `SRC=/CAT=/TGT=/REF=` 태그 부착.
+- **결과 기입**: 결과열에 `OK` 또는 `수정: <제안> | 사유: <한국어>`. 행 ID 매칭은 번역과 동일.
+- **검수 모드에서 비활성화되는 것**: 한글 감지 재시도(사유가 한국어라 정상),
+  플레이스홀더 검증 재시도, E열 자동 표시/재검증 스윕.
+- get_pending_rows 는 이제 6-튜플 (행, source, ref, placeholder, category, review) 반환.
+  검수 모드에선 검수대상이 빈 행은 건너뜀.
+
+---
+
+## 8. 빠른 점검 명령
 
 ```bash
 # 문법 검사
