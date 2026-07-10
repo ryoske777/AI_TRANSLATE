@@ -23,6 +23,8 @@ from main import (
     setup_driver, new_conversation, send_message, wait_for_response,
     extract_last_response, sanitize_cell, restore_cell,
     group_consecutive_rows, format_batch, format_review_batch, parse_response,
+    auto_batch_count, mask_placeholders_in_batch, unmask_placeholders,
+    placeholder_legend,
     is_empty, col_to_idx,
     list_prompt_langs, load_prompt, load_review_prompt, ensure_external_prompts,
     parse_review_verdict, write_review_notes, next_col_letter,
@@ -484,7 +486,25 @@ class TranslationWorker(threading.Thread):
             self.send_count = 0
             groups = group_consecutive_rows(pending_rows)
             import math as _math
-            total_batches = sum(_math.ceil(len(g) / max(1, config.BATCH_SIZE)) for g in groups)
+            auto_batch = bool(getattr(config, "AUTO_BATCH_SIZE", False))
+
+            def plan_batches(gs):
+                """앞으로 전송될 배치 수 추정 (진행 표시용)."""
+                if not auto_batch:
+                    return sum(_math.ceil(len(g) / max(1, config.BATCH_SIZE)) for g in gs)
+                n = 0
+                for g in gs:
+                    i = 0
+                    while i < len(g):
+                        i += auto_batch_count(g, i, fmt_batch)
+                        n += 1
+                return n
+
+            total_batches = plan_batches(groups)
+            if auto_batch:
+                self.log(
+                    f"1회 번역 분량: 자동 — 셀 글자 수 기준으로 행 수를 배치마다 결정합니다 "
+                    f"(예상 배치 {total_batches}개)", "info")
             batch_no = 0
             gi = 0
             bi = 0
@@ -547,6 +567,7 @@ class TranslationWorker(threading.Thread):
                             gi = 0
                             bi = 0
                             group = groups[gi]
+                            total_batches = batch_no + plan_batches(groups)
                             self.log(f"재스캔 완료: {len(fresh)}행 / {len(groups)}개 그룹")
                     self.log(f"새 대화 시작 (누적: {processed}/{total}행)")
                     self.waiting("새 ChatGPT 페이지 로딩 중")
@@ -561,13 +582,35 @@ class TranslationWorker(threading.Thread):
                     self.force_new_conv = False
                     self.log("고정 프롬프트 전송 완료", "success")
 
-                batch = group[bi: bi + config.BATCH_SIZE]
+                if auto_batch:
+                    n_rows = auto_batch_count(group, bi, fmt_batch)
+                else:
+                    n_rows = config.BATCH_SIZE
+                batch = group[bi: bi + n_rows]
                 s_row, e_row = batch[0][0], batch[-1][0]
                 batch_no += 1
-                label = " (구멍 그룹)" if len(group) < config.BATCH_SIZE else ""
+                if auto_batch:
+                    label = " · 자동 분량"
+                else:
+                    label = " (구멍 그룹)" if len(group) < config.BATCH_SIZE else ""
                 self.log(f"배치 전송: {s_row}~{e_row}행 ({len(batch)}행{label})")
+
+                # ── 플레이스홀더 마스킹 (번역 모드 전용) ─────────
+                # «T:내용» 을 «T:번호» 불투명 토큰으로 바꿔 보내고 응답에서 복원.
+                # 모델이 플레이스홀더 내부를 번역/축약해 훼손하는 사고를 원천 차단.
+                mask_ph = (not is_review) and bool(getattr(config, "MASK_PLACEHOLDERS", True))
+                if mask_ph:
+                    masked_batch, ph_map = mask_placeholders_in_batch(batch)
+                else:
+                    masked_batch, ph_map = batch, {}
+
+                batch_msg = fmt_batch(masked_batch)
+                if ph_map:
+                    # 참고표: 토큰의 실제 내용을 문맥용으로 제공 (출력은 토큰 유지)
+                    batch_msg = placeholder_legend(ph_map) + "\n\n" + batch_msg
+
                 self.waiting(f"{s_row}~{e_row}행 {work_word} 요청 중 · 배치 {batch_no}/{total_batches}")
-                send_message(driver, fmt_batch(batch))
+                send_message(driver, batch_msg)
                 self.done_waiting()
                 if self.stop_flag:
                     break
@@ -592,6 +635,7 @@ class TranslationWorker(threading.Thread):
 
                 if response:
                     lines, missing = parse_response(response, batch)
+                    lines = unmask_placeholders(lines, ph_map)
                     if missing:
                         self.log(f"⚠️ 응답 행 ID 누락 {len(missing)}행 (빈 칸 유지): {missing}", "warn")
                         log_failure(missing[0], missing[-1],
@@ -604,13 +648,15 @@ class TranslationWorker(threading.Thread):
                     korean_idxs = [] if is_review else filter_korean_lines(lines)
                     if korean_idxs:
                         self.log(f"⚠️ 한글 감지 ({len(korean_idxs)}행) — 재번역 시도...", "warn")
-                        retry_batch = [batch[i] for i in korean_idxs if i < len(batch)]
+                        retry_batch = [masked_batch[i] for i in korean_idxs if i < len(masked_batch)]
                         retry_msg = (
                             "아래 항목에 한글이 포함되어 있습니다.\n"
                             "한글 없이 목표 언어로만 재번역하여 코드블록으로 출력하세요.\n"
                             "각 줄 맨 앞의 R숫자 ID는 그대로 두세요.\n\n"
                             + format_batch(retry_batch)
                         )
+                        if ph_map:
+                            retry_msg = placeholder_legend(ph_map) + "\n\n" + retry_msg
                         self.waiting("한글 포함 행 재번역 중")
                         send_message(driver, retry_msg)
                         wait_for_response(driver, should_stop=lambda: self.stop_flag)
@@ -618,6 +664,7 @@ class TranslationWorker(threading.Thread):
                         retry_resp = extract_last_response(driver)
                         if retry_resp:
                             retry_lines, _ = parse_response(retry_resp, retry_batch)
+                            retry_lines = unmask_placeholders(retry_lines, ph_map)
                             for j, idx in enumerate(korean_idxs):
                                 if j < len(retry_lines) and idx < len(lines):
                                     if retry_lines[j]:
@@ -635,15 +682,19 @@ class TranslationWorker(threading.Thread):
                                 self.log(f"⚠️ 플레이스홀더 불일치 감지 ({len(ph_idxs)}행) — 재번역 시도...", "warn")
 
                                 # 어떤 행에 어떤 플레이스홀더가 필요한지 명시
+                                # (마스킹 모드에서는 모델이 본 «T:번호» 토큰 기준으로 안내)
                                 hint_lines = []
                                 for idx in ph_idxs:
                                     if idx < len(ph_sources):
-                                        phs = extract_placeholders(ph_sources[idx])
+                                        if mask_ph and idx < len(masked_batch):
+                                            phs = extract_placeholders(masked_batch[idx][3])
+                                        else:
+                                            phs = extract_placeholders(ph_sources[idx])
                                         if phs:
                                             phs_str = " ".join(phs)
                                             hint_lines.append(f"  · 행 {s_row + idx}: {phs_str}")
 
-                                retry_batch = [batch[i] for i in ph_idxs if i < len(batch)]
+                                retry_batch = [masked_batch[i] for i in ph_idxs if i < len(masked_batch)]
                                 retry_msg = (
                                     "아래 항목의 플레이스홀더가 원본과 다릅니다.\n"
                                     "«T:...» 형식의 플레이스홀더는 절대 번역·변형·삭제하지 말고,\n"
@@ -655,6 +706,8 @@ class TranslationWorker(threading.Thread):
                                        if hint_lines else "")
                                     + format_batch(retry_batch)
                                 )
+                                if ph_map:
+                                    retry_msg = placeholder_legend(ph_map) + "\n\n" + retry_msg
                                 self.waiting("플레이스홀더 불일치 행 재번역 중")
                                 send_message(driver, retry_msg)
                                 wait_for_response(driver, should_stop=lambda: self.stop_flag)
@@ -662,6 +715,7 @@ class TranslationWorker(threading.Thread):
                                 retry_resp = extract_last_response(driver)
                                 if retry_resp:
                                     retry_lines, _ = parse_response(retry_resp, retry_batch)
+                                    retry_lines = unmask_placeholders(retry_lines, ph_map)
                                     for j, idx in enumerate(ph_idxs):
                                         if j < len(retry_lines) and idx < len(lines):
                                             if retry_lines[j]:
@@ -1017,16 +1071,21 @@ class SettingsDialog(ctk.CTkToplevel):
         self.after(50, self.lift)
         self._build()
 
-    def _field(self, parent, label, value, row, wide=False, tip=None):
+    def _field(self, parent, label, value, row, wide=False, tip=None, return_entry=False):
         ctk.CTkLabel(parent, text=label, anchor="w").grid(
             row=row, column=0, padx=(0, 12), pady=6, sticky="w")
         var = tk.StringVar(value=str(value))
         w = 320 if wide else 200
-        ctk.CTkEntry(parent, textvariable=var, width=w).grid(
-            row=row, column=1, pady=6, sticky="w")
+        entry = ctk.CTkEntry(parent, textvariable=var, width=w)
+        entry.grid(row=row, column=1, pady=6, sticky="w")
         if tip:
             add_info_icon(parent, row, 2, tip)
-        return var
+        return (var, entry) if return_entry else var
+
+    def _toggle_auto_batch(self):
+        """자동 분량 체크 상태에 따라 '1회 번역 분량' 숫자 입력을 활성/비활성."""
+        state = "disabled" if self.v_auto_batch.get() else "normal"
+        self.e_batch.configure(state=state)
 
     def _build(self):
         scroll = ctk.CTkScrollableFrame(self)
@@ -1059,12 +1118,33 @@ class SettingsDialog(ctk.CTkToplevel):
         ctk.CTkLabel(scroll, text="⚙️  번역 설정",
                      font=ctk.CTkFont(size=13, weight="bold")).pack(
             anchor="w", pady=(0, 6))
+        # 자동 분량 — 켜면 아래 '1회 번역 분량' 숫자 입력이 비활성화된다
+        auto_f = ctk.CTkFrame(scroll, fg_color="transparent")
+        auto_f.pack(fill="x", pady=(0, 2))
+        self.v_auto_batch = tk.BooleanVar(
+            value=bool(getattr(config, "AUTO_BATCH_SIZE", False)))
+        ctk.CTkCheckBox(
+            auto_f,
+            text="자동 — 1회 번역 분량을 글자 수 기준으로 자동 결정",
+            variable=self.v_auto_batch,
+            command=self._toggle_auto_batch,
+        ).pack(anchor="w", padx=4)
+        ctk.CTkLabel(
+            auto_f,
+            text="  · 보낼 셀의 글자 수를 미리 계산해, AI가 한 번에 무리 없이 처리할 만큼만 행 수를 정합니다.\n"
+                 "  · 긴 설명문은 1~10행, 짧은 용어는 최대 30행까지 자동 조절. 켜면 아래 숫자 입력은 무시됩니다.",
+            text_color="#888", font=ctk.CTkFont(size=11), justify="left",
+        ).pack(anchor="w", padx=24, pady=(2, 2))
+
         f2 = ctk.CTkFrame(scroll, fg_color="transparent")
         f2.pack(fill="x")
-        self.v_batch = self._field(
+        self.v_batch, self.e_batch = self._field(
             f2, "1회 번역 분량(시트 행)", config.BATCH_SIZE, 0,
             tip="한 번에 AI에게 보낼 시트 행 수. 크면 빠르지만 응답이 길어져 누락·오류 위험이 커지고, "
-                "작으면 안정적이지만 느립니다. (보통 20~30)")
+                "작으면 안정적이지만 느립니다. (보통 20~30) "
+                "위 '자동'을 켜면 이 값 대신 글자 수 기준으로 자동 결정됩니다.",
+            return_entry=True)
+        self._toggle_auto_batch()  # 저장된 자동 분량 상태를 입력칸에 반영
         self.v_sends = self._field(
             f2, "AI 대화창 전송 횟수", config.MAX_SENDS_PER_CONVERSATION, 1,
             tip="대화창(채팅) 하나에서 보내는 최대 횟수. 이 횟수를 넘으면 새 대화를 시작합니다. "
@@ -1105,6 +1185,23 @@ class SettingsDialog(ctk.CTkToplevel):
             text="  · «T:내용» 형식 토큰이 원본과 동일한 개수·내용으로 유지됐는지 검사",
             text_color="#888",
             font=ctk.CTkFont(size=11)
+        ).pack(anchor="w", padx=24, pady=(2, 0))
+        self.v_mask_ph = tk.BooleanVar(
+            value=getattr(config, "MASK_PLACEHOLDERS", True)
+        )
+        ctk.CTkCheckBox(
+            ph_frame,
+            text="플레이스홀더 마스킹 전송 (훼손 원천 차단, 권장)",
+            variable=self.v_mask_ph
+        ).pack(anchor="w", padx=4, pady=(8, 0))
+        ctk.CTkLabel(
+            ph_frame,
+            text="  · 번역 대상 열의 «T:긴 이름» 을 «T:1» 번호 토큰으로 바꿔 보내고, 응답에서 원문으로 자동 복원\n"
+                 "  · 실제 내용은 참고표로 함께 전달해 번역 품질(성수 일치·어순)은 유지하면서,\n"
+                 "    AI가 플레이스홀더 내부를 번역하거나 잘라먹는 사고를 원천 차단합니다 (번역 모드 전용)",
+            text_color="#888",
+            font=ctk.CTkFont(size=11),
+            justify="left"
         ).pack(anchor="w", padx=24, pady=(2, 0))
 
         ctk.CTkFrame(scroll, height=1, fg_color="#3a3a4a").pack(
@@ -1311,6 +1408,7 @@ class SettingsDialog(ctk.CTkToplevel):
         config.SHEET_NAME                 = self.v_sheet.get().strip()
         config.START_ROW                  = int(self.v_start.get())
         config.BATCH_SIZE                 = int(self.v_batch.get())
+        config.AUTO_BATCH_SIZE            = bool(self.v_auto_batch.get())
         config.MAX_SENDS_PER_CONVERSATION = int(self.v_sends.get())
         config.DELAY_MIN                  = float(self.v_dmin.get())
         config.DELAY_MAX                  = float(self.v_dmax.get())
@@ -1320,6 +1418,7 @@ class SettingsDialog(ctk.CTkToplevel):
         config.RESPONSE_POLL_INTERVAL     = float(self.v_poll.get())
         config.RESPONSE_DONE_DELAY        = float(self.v_done.get())
         config.PRESERVE_PLACEHOLDERS      = bool(self.v_preserve_ph.get())
+        config.MASK_PLACEHOLDERS          = bool(self.v_mask_ph.get())
         # 열 설정 저장
         for attr, var in self.col_vars.items():
             val = var.get()
@@ -1521,6 +1620,7 @@ def save_settings():
         "SHEET_NAME":                 config.SHEET_NAME,
         "START_ROW":                  config.START_ROW,
         "BATCH_SIZE":                 config.BATCH_SIZE,
+        "AUTO_BATCH_SIZE":            getattr(config, "AUTO_BATCH_SIZE", False),
         "MAX_SENDS_PER_CONVERSATION": config.MAX_SENDS_PER_CONVERSATION,
         "DELAY_MIN":                  config.DELAY_MIN,
         "DELAY_MAX":                  config.DELAY_MAX,
@@ -1533,6 +1633,7 @@ def save_settings():
         "RESPONSE_POLL_INTERVAL":     config.RESPONSE_POLL_INTERVAL,
         "RESPONSE_DONE_DELAY":        config.RESPONSE_DONE_DELAY,
         "PRESERVE_PLACEHOLDERS":      getattr(config, "PRESERVE_PLACEHOLDERS", True),
+        "MASK_PLACEHOLDERS":          getattr(config, "MASK_PLACEHOLDERS", True),
         "AI_MODE":                    getattr(config, "AI_MODE", "chatgpt"),
         "PROMPT_LANG":                getattr(config, "PROMPT_LANG", ""),
         "CHROME_BINARY_PATH":         getattr(config, "CHROME_BINARY_PATH", ""),
@@ -1558,6 +1659,8 @@ def load_settings():
         config.SHEET_NAME                 = data.get("SHEET_NAME",                 config.SHEET_NAME)
         config.START_ROW                  = data.get("START_ROW",                  config.START_ROW)
         config.BATCH_SIZE                 = data.get("BATCH_SIZE",                 config.BATCH_SIZE)
+        config.AUTO_BATCH_SIZE            = bool(data.get("AUTO_BATCH_SIZE",
+                                                          getattr(config, "AUTO_BATCH_SIZE", False)))
         config.MAX_SENDS_PER_CONVERSATION = data.get("MAX_SENDS_PER_CONVERSATION", config.MAX_SENDS_PER_CONVERSATION)
         config.DELAY_MIN                  = data.get("DELAY_MIN",                  config.DELAY_MIN)
         config.DELAY_MAX                  = data.get("DELAY_MAX",                  config.DELAY_MAX)
@@ -1570,6 +1673,8 @@ def load_settings():
         config.RESPONSE_POLL_INTERVAL     = data.get("RESPONSE_POLL_INTERVAL",     config.RESPONSE_POLL_INTERVAL)
         config.RESPONSE_DONE_DELAY        = data.get("RESPONSE_DONE_DELAY",        config.RESPONSE_DONE_DELAY)
         config.PRESERVE_PLACEHOLDERS      = data.get("PRESERVE_PLACEHOLDERS",      True)
+        config.MASK_PLACEHOLDERS          = bool(data.get("MASK_PLACEHOLDERS",
+                                                          getattr(config, "MASK_PLACEHOLDERS", True)))
         config.CHROME_BINARY_PATH         = data.get("CHROME_BINARY_PATH",         getattr(config, "CHROME_BINARY_PATH", ""))
         ai_mode = (data.get("AI_MODE", "chatgpt") or "chatgpt").lower()
         config.AI_MODE = ai_mode if ai_mode in ("chatgpt", "claude") else "chatgpt"
