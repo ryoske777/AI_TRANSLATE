@@ -55,6 +55,7 @@ CHROME_PROFILE_DIR  = "Default"
 
 # ── 번역 동작 ────────────────────────────────────────────────────────────────
 PRESERVE_PLACEHOLDERS = True       # 플레이스홀더 보존 + 재시도
+MASK_PLACEHOLDERS     = True       # «T:내용» → «T:번호» 로 숨겨 전송, 응답에서 복원 (훼손 원천 차단)
 AI_MODE               = "chatgpt"  # "chatgpt" | "claude"
 PROMPT_LANG           = "es"       # prompts/{PROMPT_LANG}.txt — 존재하는 값으로 폴백됨
 

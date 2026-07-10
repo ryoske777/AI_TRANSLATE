@@ -955,6 +955,83 @@ def format_review_batch(batch_rows):
     return "\n".join(lines)
 
 
+# RO 로컬라이제이션 플레이스홀더 형식 (main_ui.PLACEHOLDER_PATTERN 과 동일 규칙)
+PLACEHOLDER_RE = re.compile(r'«T:[^«»]*»')
+
+
+# get_pending_rows 행 튜플에서 번역 대상(placeholder 역할) 열의 인덱스
+_PH_CELL_IDX = 3
+
+
+def mask_placeholders_in_batch(batch_rows):
+    """번역 대상 열(placeholder 역할)의 «T:...» 를 «T:번호» 토큰으로 치환한다.
+
+    모델이 플레이스홀더 내부 텍스트를 번역·축약·변형하는 사고(예:
+    «T:Asistencia diaria» → «T diaria»)를 원천 차단하기 위해, '복사만 해야
+    하는' 대상 열의 토큰 내용을 숨긴다. KR 원문/EN 참조 열은 그대로 보내므로
+    모델은 문장의 의미·문맥을 온전히 파악할 수 있다. «T:...» 형식 자체는
+    유지되므로 기존 프롬프트 규칙과 검증 로직이 그대로 적용된다.
+    응답은 unmask_placeholders() 로 복원한다.
+
+    반환: (masked_rows, mapping)  — mapping: {"«T:1»": "«T:원문»", ...}
+    번호는 배치 전체에서 고유하다 (행이 밀려도 복원 결과는 항상 원문).
+    """
+    mapping = {}
+    counter = [0]
+
+    def repl(m):
+        counter[0] += 1
+        token = f"«T:{counter[0]}»"
+        mapping[token] = m.group(0)
+        return token
+
+    masked_rows = []
+    for row in batch_rows:
+        new_row = list(row)
+        cell = row[_PH_CELL_IDX] if len(row) > _PH_CELL_IDX else None
+        if isinstance(cell, str) and cell:
+            new_row[_PH_CELL_IDX] = PLACEHOLDER_RE.sub(repl, cell)
+        masked_rows.append(tuple(new_row))
+    return masked_rows, mapping
+
+
+def placeholder_legend(mapping):
+    """마스킹된 «T:번호» 토큰의 실제 내용을 알려주는 참고 블록을 만든다.
+
+    내용을 완전히 숨기면 성·수 일치, 관사/전치사 선택, 어순 판단 등 번역
+    품질이 떨어질 수 있으므로, 모델에게 '내용은 참고하되 출력에는 번호
+    토큰을 그대로 쓰라'고 명시한 대응표를 배치 메시지 상단에 붙인다.
+    """
+    if not mapping:
+        return ""
+    lines = [
+        "[플레이스홀더 참고표 — 아래 «T:번호» 토큰의 실제 내용입니다.",
+        " 의미·성수 일치·관사/전치사·어순 판단에만 참고하고,",
+        " 출력에는 반드시 «T:번호» 토큰을 원형 그대로 유지하십시오.",
+        " 토큰을 실제 내용으로 풀어 쓰거나 내용을 번역해 넣지 마십시오.]",
+    ]
+    for token, original in mapping.items():
+        inner = original[3:-1]  # «T:내용» → 내용
+        lines.append(f"{token} = {inner}")
+    return "\n".join(lines)
+
+
+def unmask_placeholders(lines, mapping):
+    """번역 결과 줄들의 «T:번호» 토큰을 원래 플레이스홀더로 복원한다.
+
+    단일 패스 정규식 치환이라, 원문 플레이스홀더 안에 우연히 «T:숫자» 가
+    있어도 재치환되지 않는다. 매핑에 없는 토큰(모델이 번호를 바꾼 경우)은
+    그대로 두어 이후 플레이스홀더 검증에서 불일치로 드러나게 한다.
+    """
+    if not mapping:
+        return lines
+
+    def repl(m):
+        return mapping.get(m.group(0), m.group(0))
+
+    return [PLACEHOLDER_RE.sub(repl, ln) if ln else ln for ln in lines]
+
+
 def auto_batch_count(group, start, formatter=None):
     """자동 분량 모드: 글자 수 예산에 맞춰 이번 배치에 담을 행 수를 결정한다.
 
@@ -1136,7 +1213,15 @@ def main():
             else:
                 print(f"  배치 전송: {start_row_num}~{end_row_num}행 ({len(batch)}행)")
 
-            batch_text = format_batch(batch)
+            # 플레이스홀더 마스킹: 내부 내용을 숨긴 «T:번호» 토큰으로 전송
+            if getattr(config, "MASK_PLACEHOLDERS", True):
+                masked_batch, ph_map = mask_placeholders_in_batch(batch)
+            else:
+                masked_batch, ph_map = batch, {}
+
+            batch_text = format_batch(masked_batch)
+            if ph_map:
+                batch_text = placeholder_legend(ph_map) + "\n\n" + batch_text
             send_message(driver, batch_text)
             wait_for_response(driver)
 
@@ -1152,6 +1237,7 @@ def main():
 
             if response:
                 lines, missing = parse_response(response, batch)
+                lines = unmask_placeholders(lines, ph_map)
                 if missing:
                     log_failure(missing[0], missing[-1],
                                 f"응답 행 ID 누락 ({len(missing)}행)")
@@ -1160,7 +1246,7 @@ def main():
                 korean_idxs = filter_korean_lines(lines)
                 if korean_idxs:
                     print(f"  ⚠️ 한글 감지 ({len(korean_idxs)}행) — 재번역 요청 중...")
-                    retry_batch = [batch[i] for i in korean_idxs if i < len(batch)]
+                    retry_batch = [masked_batch[i] for i in korean_idxs if i < len(masked_batch)]
                     retry_msg = (
                         "아래 항목의 결과값에 한글이 포함되어 있습니다.\n"
                         "한글을 완전히 제거하고 목표 언어로만 재번역하여 "
@@ -1168,12 +1254,15 @@ def main():
                         "각 줄 맨 앞의 R숫자 ID는 그대로 두세요.\n\n"
                         + format_batch(retry_batch)
                     )
+                    if ph_map:
+                        retry_msg = placeholder_legend(ph_map) + "\n\n" + retry_msg
                     send_message(driver, retry_msg)
                     wait_for_response(driver)
                     retry_response = extract_last_response(driver)
                     if retry_response:
                         # 재시도도 ID 기반 — retry_batch 순서대로 정렬된 결과를 받음
                         retry_lines, _ = parse_response(retry_response, retry_batch)
+                        retry_lines = unmask_placeholders(retry_lines, ph_map)
                         for j, idx in enumerate(korean_idxs):
                             if j < len(retry_lines) and idx < len(lines):
                                 if retry_lines[j] and not has_korean(retry_lines[j]):

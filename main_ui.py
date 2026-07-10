@@ -23,7 +23,8 @@ from main import (
     setup_driver, new_conversation, send_message, wait_for_response,
     extract_last_response, sanitize_cell, restore_cell,
     group_consecutive_rows, format_batch, format_review_batch, parse_response,
-    auto_batch_count,
+    auto_batch_count, mask_placeholders_in_batch, unmask_placeholders,
+    placeholder_legend,
     is_empty, col_to_idx,
     list_prompt_langs, load_prompt, load_review_prompt, ensure_external_prompts,
     parse_review_verdict, write_review_notes, next_col_letter,
@@ -593,8 +594,23 @@ class TranslationWorker(threading.Thread):
                 else:
                     label = " (구멍 그룹)" if len(group) < config.BATCH_SIZE else ""
                 self.log(f"배치 전송: {s_row}~{e_row}행 ({len(batch)}행{label})")
+
+                # ── 플레이스홀더 마스킹 (번역 모드 전용) ─────────
+                # «T:내용» 을 «T:번호» 불투명 토큰으로 바꿔 보내고 응답에서 복원.
+                # 모델이 플레이스홀더 내부를 번역/축약해 훼손하는 사고를 원천 차단.
+                mask_ph = (not is_review) and bool(getattr(config, "MASK_PLACEHOLDERS", True))
+                if mask_ph:
+                    masked_batch, ph_map = mask_placeholders_in_batch(batch)
+                else:
+                    masked_batch, ph_map = batch, {}
+
+                batch_msg = fmt_batch(masked_batch)
+                if ph_map:
+                    # 참고표: 토큰의 실제 내용을 문맥용으로 제공 (출력은 토큰 유지)
+                    batch_msg = placeholder_legend(ph_map) + "\n\n" + batch_msg
+
                 self.waiting(f"{s_row}~{e_row}행 {work_word} 요청 중 · 배치 {batch_no}/{total_batches}")
-                send_message(driver, fmt_batch(batch))
+                send_message(driver, batch_msg)
                 self.done_waiting()
                 if self.stop_flag:
                     break
@@ -619,6 +635,7 @@ class TranslationWorker(threading.Thread):
 
                 if response:
                     lines, missing = parse_response(response, batch)
+                    lines = unmask_placeholders(lines, ph_map)
                     if missing:
                         self.log(f"⚠️ 응답 행 ID 누락 {len(missing)}행 (빈 칸 유지): {missing}", "warn")
                         log_failure(missing[0], missing[-1],
@@ -631,13 +648,15 @@ class TranslationWorker(threading.Thread):
                     korean_idxs = [] if is_review else filter_korean_lines(lines)
                     if korean_idxs:
                         self.log(f"⚠️ 한글 감지 ({len(korean_idxs)}행) — 재번역 시도...", "warn")
-                        retry_batch = [batch[i] for i in korean_idxs if i < len(batch)]
+                        retry_batch = [masked_batch[i] for i in korean_idxs if i < len(masked_batch)]
                         retry_msg = (
                             "아래 항목에 한글이 포함되어 있습니다.\n"
                             "한글 없이 목표 언어로만 재번역하여 코드블록으로 출력하세요.\n"
                             "각 줄 맨 앞의 R숫자 ID는 그대로 두세요.\n\n"
                             + format_batch(retry_batch)
                         )
+                        if ph_map:
+                            retry_msg = placeholder_legend(ph_map) + "\n\n" + retry_msg
                         self.waiting("한글 포함 행 재번역 중")
                         send_message(driver, retry_msg)
                         wait_for_response(driver, should_stop=lambda: self.stop_flag)
@@ -645,6 +664,7 @@ class TranslationWorker(threading.Thread):
                         retry_resp = extract_last_response(driver)
                         if retry_resp:
                             retry_lines, _ = parse_response(retry_resp, retry_batch)
+                            retry_lines = unmask_placeholders(retry_lines, ph_map)
                             for j, idx in enumerate(korean_idxs):
                                 if j < len(retry_lines) and idx < len(lines):
                                     if retry_lines[j]:
@@ -662,15 +682,19 @@ class TranslationWorker(threading.Thread):
                                 self.log(f"⚠️ 플레이스홀더 불일치 감지 ({len(ph_idxs)}행) — 재번역 시도...", "warn")
 
                                 # 어떤 행에 어떤 플레이스홀더가 필요한지 명시
+                                # (마스킹 모드에서는 모델이 본 «T:번호» 토큰 기준으로 안내)
                                 hint_lines = []
                                 for idx in ph_idxs:
                                     if idx < len(ph_sources):
-                                        phs = extract_placeholders(ph_sources[idx])
+                                        if mask_ph and idx < len(masked_batch):
+                                            phs = extract_placeholders(masked_batch[idx][3])
+                                        else:
+                                            phs = extract_placeholders(ph_sources[idx])
                                         if phs:
                                             phs_str = " ".join(phs)
                                             hint_lines.append(f"  · 행 {s_row + idx}: {phs_str}")
 
-                                retry_batch = [batch[i] for i in ph_idxs if i < len(batch)]
+                                retry_batch = [masked_batch[i] for i in ph_idxs if i < len(masked_batch)]
                                 retry_msg = (
                                     "아래 항목의 플레이스홀더가 원본과 다릅니다.\n"
                                     "«T:...» 형식의 플레이스홀더는 절대 번역·변형·삭제하지 말고,\n"
@@ -682,6 +706,8 @@ class TranslationWorker(threading.Thread):
                                        if hint_lines else "")
                                     + format_batch(retry_batch)
                                 )
+                                if ph_map:
+                                    retry_msg = placeholder_legend(ph_map) + "\n\n" + retry_msg
                                 self.waiting("플레이스홀더 불일치 행 재번역 중")
                                 send_message(driver, retry_msg)
                                 wait_for_response(driver, should_stop=lambda: self.stop_flag)
@@ -689,6 +715,7 @@ class TranslationWorker(threading.Thread):
                                 retry_resp = extract_last_response(driver)
                                 if retry_resp:
                                     retry_lines, _ = parse_response(retry_resp, retry_batch)
+                                    retry_lines = unmask_placeholders(retry_lines, ph_map)
                                     for j, idx in enumerate(ph_idxs):
                                         if j < len(retry_lines) and idx < len(lines):
                                             if retry_lines[j]:
@@ -1159,6 +1186,23 @@ class SettingsDialog(ctk.CTkToplevel):
             text_color="#888",
             font=ctk.CTkFont(size=11)
         ).pack(anchor="w", padx=24, pady=(2, 0))
+        self.v_mask_ph = tk.BooleanVar(
+            value=getattr(config, "MASK_PLACEHOLDERS", True)
+        )
+        ctk.CTkCheckBox(
+            ph_frame,
+            text="플레이스홀더 마스킹 전송 (훼손 원천 차단, 권장)",
+            variable=self.v_mask_ph
+        ).pack(anchor="w", padx=4, pady=(8, 0))
+        ctk.CTkLabel(
+            ph_frame,
+            text="  · 번역 대상 열의 «T:긴 이름» 을 «T:1» 번호 토큰으로 바꿔 보내고, 응답에서 원문으로 자동 복원\n"
+                 "  · 실제 내용은 참고표로 함께 전달해 번역 품질(성수 일치·어순)은 유지하면서,\n"
+                 "    AI가 플레이스홀더 내부를 번역하거나 잘라먹는 사고를 원천 차단합니다 (번역 모드 전용)",
+            text_color="#888",
+            font=ctk.CTkFont(size=11),
+            justify="left"
+        ).pack(anchor="w", padx=24, pady=(2, 0))
 
         ctk.CTkFrame(scroll, height=1, fg_color="#3a3a4a").pack(
             fill="x", pady=10)
@@ -1374,6 +1418,7 @@ class SettingsDialog(ctk.CTkToplevel):
         config.RESPONSE_POLL_INTERVAL     = float(self.v_poll.get())
         config.RESPONSE_DONE_DELAY        = float(self.v_done.get())
         config.PRESERVE_PLACEHOLDERS      = bool(self.v_preserve_ph.get())
+        config.MASK_PLACEHOLDERS          = bool(self.v_mask_ph.get())
         # 열 설정 저장
         for attr, var in self.col_vars.items():
             val = var.get()
@@ -1588,6 +1633,7 @@ def save_settings():
         "RESPONSE_POLL_INTERVAL":     config.RESPONSE_POLL_INTERVAL,
         "RESPONSE_DONE_DELAY":        config.RESPONSE_DONE_DELAY,
         "PRESERVE_PLACEHOLDERS":      getattr(config, "PRESERVE_PLACEHOLDERS", True),
+        "MASK_PLACEHOLDERS":          getattr(config, "MASK_PLACEHOLDERS", True),
         "AI_MODE":                    getattr(config, "AI_MODE", "chatgpt"),
         "PROMPT_LANG":                getattr(config, "PROMPT_LANG", ""),
         "CHROME_BINARY_PATH":         getattr(config, "CHROME_BINARY_PATH", ""),
@@ -1627,6 +1673,8 @@ def load_settings():
         config.RESPONSE_POLL_INTERVAL     = data.get("RESPONSE_POLL_INTERVAL",     config.RESPONSE_POLL_INTERVAL)
         config.RESPONSE_DONE_DELAY        = data.get("RESPONSE_DONE_DELAY",        config.RESPONSE_DONE_DELAY)
         config.PRESERVE_PLACEHOLDERS      = data.get("PRESERVE_PLACEHOLDERS",      True)
+        config.MASK_PLACEHOLDERS          = bool(data.get("MASK_PLACEHOLDERS",
+                                                          getattr(config, "MASK_PLACEHOLDERS", True)))
         config.CHROME_BINARY_PATH         = data.get("CHROME_BINARY_PATH",         getattr(config, "CHROME_BINARY_PATH", ""))
         ai_mode = (data.get("AI_MODE", "chatgpt") or "chatgpt").lower()
         config.AI_MODE = ai_mode if ai_mode in ("chatgpt", "claude") else "chatgpt"
