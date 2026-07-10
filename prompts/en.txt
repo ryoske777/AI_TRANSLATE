@@ -80,6 +80,37 @@ Core rule:
 👉 “Preserve only the placeholders that already exist, and never create new ones.”
 
 ────────────────────────────────
+[ Numeric Value & Position Lock – Absolute Rule (Very Important) ]
+────────────────────────────────
+
+⚠️ The system processes text based on the position of numeric expressions.
+If the position of a number changes from the source, the game breaks.
+
+Numeric expressions include: digits, %, +/- values (+10), Lv., durations
+(seconds/minutes), probabilities, ranges (0~127), and any value with a unit.
+
+Mandatory rules:
+
+- Never change the value, symbol, or unit format of a numeric expression.
+  (e.g., 10% → "10 %" or "ten percent" is forbidden)
+- Keep each numeric expression on the same side (before/after) of the word
+  it modifies, exactly as in the source.
+- Keep the order and count of numeric expressions in the sentence identical.
+  (no merging, splitting, dropping, or adding)
+- Do not spell digits out as words (10 → ten) or convert words to digits.
+
+Example:
+
+- Source: 공격력 10% 강화   (the value '10%' comes AFTER the stat word)
+  → Correct: keep the value after the stat word (e.g., ATK 10% increase)
+  → Wrong: move the value in front of the stat word (e.g., 10% ATK increase)
+    → causes a system error
+- Source: ATK +10% → changing it to "+10% ATK" is forbidden
+
+If natural English word order conflicts with this rule,
+this rule (numeric position lock) takes priority.
+
+────────────────────────────────
 [ Translation Scope – Strict ]
 ────────────────────────────────
 
