@@ -26,7 +26,10 @@ COL_C_ROLE = None           # C열: 미사용
 RESULT_COL = "D"            # 번역 결과 기입 열
 
 # ── 배치/속도 ────────────────────────────────────────────────────────────────
-BATCH_SIZE                 = 30    # 한 번에 보낼 줄 수
+BATCH_SIZE                 = 30    # 한 번에 보낼 줄 수 (자동 분량 꺼짐일 때 사용)
+AUTO_BATCH_SIZE            = False # True면 BATCH_SIZE 무시, 글자 수 기준으로 행 수 자동 결정
+AUTO_BATCH_CHAR_BUDGET     = 2500  # 자동 분량: 메시지 1건당 목표 최대 글자 수
+AUTO_BATCH_MAX_ROWS        = 30    # 자동 분량: 짧은 행이어도 1회에 이 행 수를 넘지 않음
 MAX_SENDS_PER_CONVERSATION = 10    # 대화 1개당 최대 전송 횟수 (넘으면 새 대화)
 DELAY_MIN                  = 3.0   # 배치 간 최소 대기(초)
 DELAY_MAX                  = 15.0  # 배치 간 최대 대기(초)

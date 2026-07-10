@@ -955,6 +955,33 @@ def format_review_batch(batch_rows):
     return "\n".join(lines)
 
 
+def auto_batch_count(group, start, formatter=None):
+    """자동 분량 모드: 글자 수 예산에 맞춰 이번 배치에 담을 행 수를 결정한다.
+
+    formatter 로 실제 전송 포맷(행 ID·활성 열 포함) 기준 길이를 재서,
+    메시지 1건이 AUTO_BATCH_CHAR_BUDGET 글자를 넘지 않는 최대 행 수를 반환한다.
+    - 짧은 행이어도 AUTO_BATCH_MAX_ROWS 를 넘지 않는다.
+    - 첫 행이 혼자 예산을 초과해도 최소 1행은 보낸다 (더 쪼갤 수 없으므로).
+    """
+    fmt = formatter or format_batch
+    try:
+        budget = max(200, int(getattr(config, "AUTO_BATCH_CHAR_BUDGET", 2500)))
+    except (TypeError, ValueError):
+        budget = 2500
+    try:
+        cap = max(1, int(getattr(config, "AUTO_BATCH_MAX_ROWS", 30)))
+    except (TypeError, ValueError):
+        cap = 30
+    n, used = 0, 0
+    for row in group[start:start + cap]:
+        line_len = len(fmt([row])) + 1  # 행 구분 줄바꿈 포함
+        if n > 0 and used + line_len > budget:
+            break
+        n += 1
+        used += line_len
+    return max(1, n)
+
+
 def _strip_id(line):
     """응답 한 줄에서 선행 행 ID를 분리. 반환: (행번호 or None, 나머지 텍스트)"""
     m = _ID_PREFIX_RE.match(line)
@@ -1094,11 +1121,17 @@ def main():
                 print("  → 고정 프롬프트 전송 완료\n")
 
             # ── 배치 구성: 그룹 크기에 맞게 ──────────────────
-            batch = group[bi : bi + config.BATCH_SIZE]
+            if getattr(config, "AUTO_BATCH_SIZE", False):
+                n_rows = auto_batch_count(group, bi)
+            else:
+                n_rows = config.BATCH_SIZE
+            batch = group[bi : bi + n_rows]
             start_row_num = batch[0][0]
             end_row_num = batch[-1][0]
 
-            if len(group) < config.BATCH_SIZE:
+            if getattr(config, "AUTO_BATCH_SIZE", False):
+                print(f"  배치 전송: {start_row_num}~{end_row_num}행 ({len(batch)}행, 자동 분량)")
+            elif len(group) < config.BATCH_SIZE:
                 print(f"  배치 전송: {start_row_num}~{end_row_num}행 ({len(batch)}행, 구멍 그룹)")
             else:
                 print(f"  배치 전송: {start_row_num}~{end_row_num}행 ({len(batch)}행)")
