@@ -25,6 +25,9 @@ from main import (
     group_consecutive_rows, format_batch, format_review_batch, parse_response,
     auto_batch_count, mask_placeholders_in_batch, unmask_placeholders,
     placeholder_legend,
+    extract_placeholders, check_placeholder_match, filter_placeholder_mismatch,
+    batch_placeholder_sources,
+    PH_MISMATCH_MARK, KOREAN_MARK, MANAGED_MARKS,
     is_empty, col_to_idx,
     list_prompt_langs, load_prompt, load_review_prompt, ensure_external_prompts,
     parse_review_verdict, write_review_notes, next_col_letter,
@@ -122,40 +125,8 @@ SETTINGS_FILE = paths.app_path("settings.json")
 
 
 # ── 플레이스홀더 검증 유틸 ───────────────────────────────────────────────────
-# RO 로컬라이제이션 플레이스홀더 형식: «T:내용»
-#   - «, »는 길리메(U+00AB, U+00BB)
-#   - T: 가 표시자
-#   - 한 문장에 여러 번 등장 가능, 중첩은 없음
-PLACEHOLDER_PATTERN = re.compile(r'«T:[^«»]*»')
-
-
-def extract_placeholders(text):
-    """텍스트에서 플레이스홀더를 모두 추출 (출현 순서 유지)"""
-    if not text:
-        return []
-    return PLACEHOLDER_PATTERN.findall(text)
-
-
-def check_placeholder_match(source, translated):
-    """원본과 번역의 플레이스홀더 다중집합이 일치하는지 검사.
-    원본에 플레이스홀더가 없으면 True (검증 대상 아님)."""
-    if not source:
-        return True
-    src = extract_placeholders(source)
-    if not src:
-        return True
-    tgt = extract_placeholders(translated or "")
-    return sorted(src) == sorted(tgt)
-
-
-def filter_placeholder_mismatch(sources, translations):
-    """플레이스홀더가 불일치한 행의 인덱스 리스트"""
-    out = []
-    for i, src in enumerate(sources):
-        tgt = translations[i] if i < len(translations) else ""
-        if not check_placeholder_match(src, tgt):
-            out.append(i)
-    return out
+# 검증 함수(extract_placeholders/check_placeholder_match/filter_placeholder_mismatch)와
+# E열 상태 문구(PH_MISMATCH_MARK 등)는 main.py 에서 import — UI·CLI 단일 소스.
 
 
 def get_placeholder_col_letter():
@@ -166,30 +137,6 @@ def get_placeholder_col_letter():
         if getattr(config, role_attr, None) == "placeholder":
             return col_letter
     return None
-
-
-def get_placeholder_sources(sheet, start_row, count, col_letter):
-    """시트에서 플레이스홀더 컬럼 값을 직접 읽어옴 (한 번에 범위 가져오기)"""
-    if not col_letter:
-        return [""] * count
-    range_addr = f"{col_letter}{start_row}:{col_letter}{start_row + count - 1}"
-    try:
-        result = sheet.get(range_addr)
-        values = []
-        for row in result:
-            values.append(row[0] if row and len(row) > 0 else "")
-        while len(values) < count:
-            values.append("")
-        return values[:count]
-    except Exception:
-        return [""] * count
-
-
-# E열 상태 문구
-PH_MISMATCH_MARK = "플레이스홀더 불일치"
-KOREAN_MARK = "한글 포함"
-# 자동으로 관리하는 표시들(아래 목록에 있는 값만 자동 정리/제거 대상. 사용자가 직접 적은 메모는 보존)
-MANAGED_MARKS = (PH_MISMATCH_MARK, KOREAN_MARK)
 
 
 def _clear_cells(sheet, ranges):
@@ -215,6 +162,7 @@ def reconcile_status(sheet, start_row, lines, sources=None):
       - 둘 다 정상     → 자동 표시(MANAGED_MARKS)가 남아있으면 셀을 완전히 비움
     사용자가 직접 적은 다른 메모는 건드리지 않는다.
     sources(플레이스홀더 컬럼 값)가 None이면 플레이스홀더 검사는 건너뛰고 한글만 본다.
+    이때 기존 '플레이스홀더 불일치' 표시는 검증하지 않았으므로 지우지도 덮지도 않는다.
 
     현재 E열을 1회 읽고, 기입이 필요한 셀은 batch_update로, 비울 셀은 batch_clear로 처리한다.
     반환: (mismatch_rows, korean_rows, cleared_rows) — 각각 행 번호 리스트
@@ -236,8 +184,9 @@ def reconcile_status(sheet, start_row, lines, sources=None):
             return (cur[i][0] or "").strip()
         return ""
 
+    ph_verified = sources is not None
     ph_mismatch = set()
-    if sources:
+    if ph_verified:
         ph_mismatch = set(filter_placeholder_mismatch(sources[:count], lines[:count]))
 
     updates, clears = [], []
@@ -246,6 +195,11 @@ def reconcile_status(sheet, start_row, lines, sources=None):
     for i in range(count):
         row_num = start_row + i
         e_val = e_at(i)
+
+        # 플레이스홀더를 검증하지 못한 실행에서는 기존 불일치 표시를 건드리지 않는다
+        # (검증 없이 지우면 훼손된 행이 '정상'으로 위장됨)
+        if not ph_verified and e_val == PH_MISMATCH_MARK:
+            continue
 
         if i in ph_mismatch:
             mismatch_rows.append(row_num)
@@ -425,6 +379,16 @@ class TranslationWorker(threading.Thread):
                 "info")
         else:
             self.log("작업 모드: 번역", "info")
+            # 플레이스홀더 검증 가능 여부를 실행 시작 시점에 명확히 알린다
+            # (조건이 안 맞아 검증이 조용히 생략되는 일이 없도록)
+            if get_placeholder_col_letter() is None:
+                self.log(
+                    "⚠️ 열 역할에 '플레이스홀더'가 지정돼 있지 않아 "
+                    "플레이스홀더 검증(E열 불일치 표시)을 할 수 없습니다.", "warn")
+            elif not getattr(config, "PRESERVE_PLACEHOLDERS", True):
+                self.log(
+                    "플레이스홀더 검증: 켜짐 (불일치 시 E열 표시) · "
+                    "자동 재번역: 꺼짐", "info")
 
         processed = 0
         total = 0
@@ -671,55 +635,62 @@ class TranslationWorker(threading.Thread):
                                         lines[idx] = retry_lines[j]
                         # (E열 '한글 포함' 표시/정리는 아래 reconcile_status에서 일괄 처리)
 
-                    # ── 플레이스홀더 검증 → 1회 즉시 재시도 (번역 모드 전용) ──
+                    # ── 플레이스홀더 검증 (번역 모드 전용) ─────────────────
                     # 검수 모드의 결과는 번역문이 아니라 판정 텍스트라 검증 대상이 아니다.
-                    if not is_review and getattr(config, "PRESERVE_PLACEHOLDERS", True):
-                        ph_col = get_placeholder_col_letter()
-                        if ph_col:
-                            ph_sources = get_placeholder_sources(sheet, s_row, len(batch), ph_col)
-                            ph_idxs = filter_placeholder_mismatch(ph_sources, lines)
-                            if ph_idxs:
-                                self.log(f"⚠️ 플레이스홀더 불일치 감지 ({len(ph_idxs)}행) — 재번역 시도...", "warn")
+                    # 원본은 시트를 다시 읽지 않고 배치가 이미 들고 있는
+                    # placeholder 역할 열 값을 쓴다 — 시트 재읽기가 실패하면
+                    # 빈 값과 비교돼 훼손이 '일치'로 조용히 통과하던 문제 제거.
+                    # 검증과 E열 표시는 항상 수행하고, PRESERVE_PLACEHOLDERS 는
+                    # '불일치 시 자동 재번역'만 켜고 끈다.
+                    if not is_review and get_placeholder_col_letter():
+                        ph_sources = batch_placeholder_sources(batch)
+                        ph_idxs = filter_placeholder_mismatch(ph_sources, lines)
+                        if ph_idxs and not getattr(config, "PRESERVE_PLACEHOLDERS", True):
+                            self.log(
+                                f"⚠️ 플레이스홀더 불일치 감지 ({len(ph_idxs)}행) — "
+                                "자동 재번역이 꺼져 있어 E열 표시만 합니다.", "warn")
+                        elif ph_idxs:
+                            self.log(f"⚠️ 플레이스홀더 불일치 감지 ({len(ph_idxs)}행) — 재번역 시도...", "warn")
 
-                                # 어떤 행에 어떤 플레이스홀더가 필요한지 명시
-                                # (마스킹 모드에서는 모델이 본 «T:번호» 토큰 기준으로 안내)
-                                hint_lines = []
-                                for idx in ph_idxs:
-                                    if idx < len(ph_sources):
-                                        if mask_ph and idx < len(masked_batch):
-                                            phs = extract_placeholders(masked_batch[idx][3])
-                                        else:
-                                            phs = extract_placeholders(ph_sources[idx])
-                                        if phs:
-                                            phs_str = " ".join(phs)
-                                            hint_lines.append(f"  · 행 {s_row + idx}: {phs_str}")
+                            # 어떤 행에 어떤 플레이스홀더가 필요한지 명시
+                            # (마스킹 모드에서는 모델이 본 «T:번호» 토큰 기준으로 안내)
+                            hint_lines = []
+                            for idx in ph_idxs:
+                                if idx < len(ph_sources):
+                                    if mask_ph and idx < len(masked_batch):
+                                        phs = extract_placeholders(masked_batch[idx][3])
+                                    else:
+                                        phs = extract_placeholders(ph_sources[idx])
+                                    if phs:
+                                        phs_str = " ".join(phs)
+                                        hint_lines.append(f"  · 행 {s_row + idx}: {phs_str}")
 
-                                retry_batch = [masked_batch[i] for i in ph_idxs if i < len(masked_batch)]
-                                retry_msg = (
-                                    "아래 항목의 플레이스홀더가 원본과 다릅니다.\n"
-                                    "«T:...» 형식의 플레이스홀더는 절대 번역·변형·삭제하지 말고,\n"
-                                    "원본과 동일한 형태·동일한 개수 그대로 유지하세요.\n"
-                                    "꺽쇠(« ») 안의 내용(T: 다음의 본문)도 원본과 완전히 같아야 합니다.\n"
-                                    "위치만 자연스럽게 옮기는 것은 허용됩니다.\n"
-                                    "각 줄 맨 앞의 R숫자 ID는 그대로 두세요.\n\n"
-                                    + ("필수 유지 토큰:\n" + "\n".join(hint_lines) + "\n\n"
-                                       if hint_lines else "")
-                                    + format_batch(retry_batch)
-                                )
-                                if ph_map:
-                                    retry_msg = placeholder_legend(ph_map) + "\n\n" + retry_msg
-                                self.waiting("플레이스홀더 불일치 행 재번역 중")
-                                send_message(driver, retry_msg)
-                                wait_for_response(driver, should_stop=lambda: self.stop_flag)
-                                self.done_waiting()
-                                retry_resp = extract_last_response(driver)
-                                if retry_resp:
-                                    retry_lines, _ = parse_response(retry_resp, retry_batch)
-                                    retry_lines = unmask_placeholders(retry_lines, ph_map)
-                                    for j, idx in enumerate(ph_idxs):
-                                        if j < len(retry_lines) and idx < len(lines):
-                                            if retry_lines[j]:
-                                                lines[idx] = retry_lines[j]
+                            retry_batch = [masked_batch[i] for i in ph_idxs if i < len(masked_batch)]
+                            retry_msg = (
+                                "아래 항목의 플레이스홀더가 원본과 다릅니다.\n"
+                                "«T:...» 형식의 플레이스홀더는 절대 번역·변형·삭제하지 말고,\n"
+                                "원본과 동일한 형태·동일한 개수 그대로 유지하세요.\n"
+                                "꺽쇠(« ») 안의 내용(T: 다음의 본문)도 원본과 완전히 같아야 합니다.\n"
+                                "위치만 자연스럽게 옮기는 것은 허용됩니다.\n"
+                                "각 줄 맨 앞의 R숫자 ID는 그대로 두세요.\n\n"
+                                + ("필수 유지 토큰:\n" + "\n".join(hint_lines) + "\n\n"
+                                   if hint_lines else "")
+                                + format_batch(retry_batch)
+                            )
+                            if ph_map:
+                                retry_msg = placeholder_legend(ph_map) + "\n\n" + retry_msg
+                            self.waiting("플레이스홀더 불일치 행 재번역 중")
+                            send_message(driver, retry_msg)
+                            wait_for_response(driver, should_stop=lambda: self.stop_flag)
+                            self.done_waiting()
+                            retry_resp = extract_last_response(driver)
+                            if retry_resp:
+                                retry_lines, _ = parse_response(retry_resp, retry_batch)
+                                retry_lines = unmask_placeholders(retry_lines, ph_map)
+                                for j, idx in enumerate(ph_idxs):
+                                    if j < len(retry_lines) and idx < len(lines):
+                                        if retry_lines[j]:
+                                            lines[idx] = retry_lines[j]
 
                     # ── E열 상태 최종 정리 (번역 모드 전용) ───────────
                     # 최종 결과(lines)를 다시 검사해 불일치/한글은 표시하고,
@@ -1177,12 +1148,13 @@ class SettingsDialog(ctk.CTkToplevel):
         )
         ctk.CTkCheckBox(
             ph_frame,
-            text="플레이스홀더 유지 검증 (불일치 시 자동 재번역)",
+            text="플레이스홀더 불일치 시 자동 재번역",
             variable=self.v_preserve_ph
         ).pack(anchor="w", padx=4)
         ctk.CTkLabel(
             ph_frame,
-            text="  · «T:내용» 형식 토큰이 원본과 동일한 개수·내용으로 유지됐는지 검사",
+            text="  · «T:내용» 토큰이 원본과 동일한지 검사해 불일치 행을 E열에 표시하는 것은 항상 수행\n"
+                 "  · 이 옵션은 불일치 발견 시 같은 대화에서 1회 자동 재번역을 시도할지만 결정",
             text_color="#888",
             font=ctk.CTkFont(size=11)
         ).pack(anchor="w", padx=24, pady=(2, 0))

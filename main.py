@@ -955,12 +955,61 @@ def format_review_batch(batch_rows):
     return "\n".join(lines)
 
 
-# RO 로컬라이제이션 플레이스홀더 형식 (main_ui.PLACEHOLDER_PATTERN 과 동일 규칙)
+# RO 로컬라이제이션 플레이스홀더 형식: «T:내용»
+#   - «, »는 길리메(U+00AB, U+00BB)
+#   - T: 가 표시자, 한 문장에 여러 번 등장 가능, 중첩은 없음
 PLACEHOLDER_RE = re.compile(r'«T:[^«»]*»')
 
 
 # get_pending_rows 행 튜플에서 번역 대상(placeholder 역할) 열의 인덱스
 _PH_CELL_IDX = 3
+
+
+# E열 상태 문구 (UI·CLI 공용 — main_ui 가 import 해서 사용)
+PH_MISMATCH_MARK = "플레이스홀더 불일치"
+KOREAN_MARK = "한글 포함"
+# 자동으로 관리하는 표시들 (이 목록에 있는 값만 자동 정리/제거 대상. 사용자 메모는 보존)
+MANAGED_MARKS = (PH_MISMATCH_MARK, KOREAN_MARK)
+
+
+def extract_placeholders(text):
+    """텍스트에서 플레이스홀더를 모두 추출 (출현 순서 유지)"""
+    if not text:
+        return []
+    return PLACEHOLDER_RE.findall(text)
+
+
+def check_placeholder_match(source, translated):
+    """원본과 번역의 플레이스홀더 다중집합이 일치하는지 검사.
+    원본에 플레이스홀더가 없으면 True (검증 대상 아님)."""
+    if not source:
+        return True
+    src = extract_placeholders(source)
+    if not src:
+        return True
+    tgt = extract_placeholders(translated or "")
+    return sorted(src) == sorted(tgt)
+
+
+def filter_placeholder_mismatch(sources, translations):
+    """플레이스홀더가 불일치한 행의 인덱스 리스트"""
+    out = []
+    for i, src in enumerate(sources):
+        tgt = translations[i] if i < len(translations) else ""
+        if not check_placeholder_match(src, tgt):
+            out.append(i)
+    return out
+
+
+def batch_placeholder_sources(batch_rows):
+    """배치 행 튜플에서 플레이스홀더 원본(placeholder 역할 열) 값 리스트를 꺼낸다.
+
+    검증 원본은 시트를 다시 읽지 않고 배치가 이미 들고 있는 값을 쓴다.
+    (시트 재읽기가 실패하면 빈 값과 비교하게 되어 훼손된 번역이
+    '일치'로 조용히 통과하던 문제를 원천 제거)
+    """
+    return [row[_PH_CELL_IDX] if len(row) > _PH_CELL_IDX else ""
+            for row in batch_rows]
 
 
 def mask_placeholders_in_batch(batch_rows):
@@ -1270,6 +1319,16 @@ def main():
                                 else:
                                     print(f"  ❌ {start_row_num+idx}행 재번역 후에도 한글 포함 — 원본 유지")
                         print(f"  → 재번역 완료")
+
+                # ── 플레이스홀더 검증 → 불일치 행 E열 표시 ──────
+                # 원본은 배치가 이미 들고 있는 placeholder 역할 열 값 사용
+                ph_idxs = filter_placeholder_mismatch(
+                    batch_placeholder_sources(batch), lines)
+                if ph_idxs:
+                    rows_txt = ", ".join(str(start_row_num + i) for i in ph_idxs)
+                    print(f"  ⚠️ 플레이스홀더 불일치 ({len(ph_idxs)}행): {rows_txt} — E열에 표시")
+                    for i in ph_idxs:
+                        write_status(sheet, start_row_num + i, PH_MISMATCH_MARK)
 
                 count = len(lines)  # batch와 항상 같은 길이 (누락 행은 빈 칸)
                 write_results(sheet, start_row_num, lines)
