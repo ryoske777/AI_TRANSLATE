@@ -26,7 +26,7 @@ from main import (
     auto_batch_count, mask_placeholders_in_batch, unmask_placeholders,
     placeholder_legend,
     extract_placeholders, check_placeholder_match, filter_placeholder_mismatch,
-    batch_placeholder_sources,
+    batch_placeholder_sources, repair_masked_tokens, repair_placeholder_lines,
     PH_MISMATCH_MARK, KOREAN_MARK, MANAGED_MARKS,
     is_empty, col_to_idx,
     list_prompt_langs, load_prompt, load_review_prompt, ensure_external_prompts,
@@ -472,16 +472,20 @@ class TranslationWorker(threading.Thread):
             batch_no = 0
             gi = 0
             bi = 0
+            e_sweep_done = False  # E열 재검증 스윕은 실행당 1회면 충분
 
             while gi < len(groups) and not self.stop_flag:
                 group = groups[gi]
 
                 if self.send_count == 0 or self.send_count >= config.MAX_SENDS_PER_CONVERSATION or self.force_new_conv:
-                    # ── E열 특이사항 재검증 스윕 (번역 모드 전용) ─────
+                    # ── E열 특이사항 재검증 스윕 (번역 모드 전용, 실행당 1회) ─────
                     # 한글 포함/플레이스홀더 불일치 표시를 현재 C/D 기준으로 다시 보고,
                     # 실제로 정상이면 표시만 지운다. (무엇을 발견/검증했는지 로그로 노출)
+                    # 실행 중 기입되는 표시는 reconcile_status 가 즉시 관리하므로
+                    # 매 새 대화마다 시트 전체를 다시 읽을 필요는 없다.
                     # 검수 모드는 E열 자동 표시를 쓰지 않으므로 건너뛴다.
-                    if not is_review:
+                    if not is_review and not e_sweep_done:
+                        e_sweep_done = True
                         self.waiting("E열 특이사항 재검증 중")
                         cc = cross_check_flagged_rows(sheet)
                         self.done_waiting()
@@ -599,6 +603,7 @@ class TranslationWorker(threading.Thread):
 
                 if response:
                     lines, missing = parse_response(response, batch)
+                    lines = repair_masked_tokens(lines, ph_map)  # 깨진 «T:번호» 정규화
                     lines = unmask_placeholders(lines, ph_map)
                     if missing:
                         self.log(f"⚠️ 응답 행 ID 누락 {len(missing)}행 (빈 칸 유지): {missing}", "warn")
@@ -628,6 +633,7 @@ class TranslationWorker(threading.Thread):
                         retry_resp = extract_last_response(driver)
                         if retry_resp:
                             retry_lines, _ = parse_response(retry_resp, retry_batch)
+                            retry_lines = repair_masked_tokens(retry_lines, ph_map)
                             retry_lines = unmask_placeholders(retry_lines, ph_map)
                             for j, idx in enumerate(korean_idxs):
                                 if j < len(retry_lines) and idx < len(lines):
@@ -645,6 +651,19 @@ class TranslationWorker(threading.Thread):
                     if not is_review and get_placeholder_col_letter():
                         ph_sources = batch_placeholder_sources(batch)
                         ph_idxs = filter_placeholder_mismatch(ph_sources, lines)
+
+                        # ── 로컬 자동 복구: ChatGPT 왕복 없이 훼손 토큰을 원본으로 복원 ──
+                        # 복구 결과가 다중집합 검증을 통과한 행만 채택되므로
+                        # 판정 기준은 그대로. 복구된 행은 재번역이 필요 없어진다.
+                        if ph_idxs:
+                            lines, fixed = repair_placeholder_lines(ph_sources, lines, ph_idxs)
+                            if fixed:
+                                rows_txt = ", ".join(str(s_row + i) for i in fixed)
+                                self.log(
+                                    f"🔧 플레이스홀더 로컬 복구 {len(fixed)}행 "
+                                    f"(재번역 불필요): {rows_txt}", "success")
+                            ph_idxs = filter_placeholder_mismatch(ph_sources, lines)
+
                         if ph_idxs and not getattr(config, "PRESERVE_PLACEHOLDERS", True):
                             self.log(
                                 f"⚠️ 플레이스홀더 불일치 감지 ({len(ph_idxs)}행) — "
@@ -686,11 +705,19 @@ class TranslationWorker(threading.Thread):
                             retry_resp = extract_last_response(driver)
                             if retry_resp:
                                 retry_lines, _ = parse_response(retry_resp, retry_batch)
+                                retry_lines = repair_masked_tokens(retry_lines, ph_map)
                                 retry_lines = unmask_placeholders(retry_lines, ph_map)
                                 for j, idx in enumerate(ph_idxs):
                                     if j < len(retry_lines) and idx < len(lines):
                                         if retry_lines[j]:
                                             lines[idx] = retry_lines[j]
+                                # 재번역 결과가 또 훼손됐으면 한 번 더 로컬 복구
+                                lines, fixed2 = repair_placeholder_lines(ph_sources, lines)
+                                if fixed2:
+                                    rows_txt = ", ".join(str(s_row + i) for i in fixed2)
+                                    self.log(
+                                        f"🔧 재번역 결과 로컬 복구 {len(fixed2)}행: {rows_txt}",
+                                        "success")
 
                     # ── E열 상태 최종 정리 (번역 모드 전용) ───────────
                     # 최종 결과(lines)를 다시 검사해 불일치/한글은 표시하고,
