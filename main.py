@@ -955,12 +955,199 @@ def format_review_batch(batch_rows):
     return "\n".join(lines)
 
 
-# RO 로컬라이제이션 플레이스홀더 형식 (main_ui.PLACEHOLDER_PATTERN 과 동일 규칙)
+# RO 로컬라이제이션 플레이스홀더 형식: «T:내용»
+#   - «, »는 길리메(U+00AB, U+00BB)
+#   - T: 가 표시자, 한 문장에 여러 번 등장 가능, 중첩은 없음
 PLACEHOLDER_RE = re.compile(r'«T:[^«»]*»')
 
 
 # get_pending_rows 행 튜플에서 번역 대상(placeholder 역할) 열의 인덱스
 _PH_CELL_IDX = 3
+
+
+# E열 상태 문구 (UI·CLI 공용 — main_ui 가 import 해서 사용)
+PH_MISMATCH_MARK = "플레이스홀더 불일치"
+KOREAN_MARK = "한글 포함"
+# 자동으로 관리하는 표시들 (이 목록에 있는 값만 자동 정리/제거 대상. 사용자 메모는 보존)
+MANAGED_MARKS = (PH_MISMATCH_MARK, KOREAN_MARK)
+
+
+def extract_placeholders(text):
+    """텍스트에서 플레이스홀더를 모두 추출 (출현 순서 유지)"""
+    if not text:
+        return []
+    return PLACEHOLDER_RE.findall(text)
+
+
+def check_placeholder_match(source, translated):
+    """원본과 번역의 플레이스홀더 다중집합이 일치하는지 검사.
+    원본에 플레이스홀더가 없으면 True (검증 대상 아님)."""
+    if not source:
+        return True
+    src = extract_placeholders(source)
+    if not src:
+        return True
+    tgt = extract_placeholders(translated or "")
+    return sorted(src) == sorted(tgt)
+
+
+def filter_placeholder_mismatch(sources, translations):
+    """플레이스홀더가 불일치한 행의 인덱스 리스트"""
+    out = []
+    for i, src in enumerate(sources):
+        tgt = translations[i] if i < len(translations) else ""
+        if not check_placeholder_match(src, tgt):
+            out.append(i)
+    return out
+
+
+def batch_placeholder_sources(batch_rows):
+    """배치 행 튜플에서 플레이스홀더 원본(placeholder 역할 열) 값 리스트를 꺼낸다.
+
+    검증 원본은 시트를 다시 읽지 않고 배치가 이미 들고 있는 값을 쓴다.
+    (시트 재읽기가 실패하면 빈 값과 비교하게 되어 훼손된 번역이
+    '일치'로 조용히 통과하던 문제를 원천 제거)
+    """
+    return [row[_PH_CELL_IDX] if len(row) > _PH_CELL_IDX else ""
+            for row in batch_rows]
+
+
+# ── 플레이스홀더 로컬 자동 복구 ──────────────────────────────────────────────
+# 모델이 훼손한 플레이스홀더를 ChatGPT 재번역 왕복 없이 코드가 즉시 되돌린다.
+# 복구 결과는 반드시 check_placeholder_match 를 통과해야만 채택하므로
+# 검증 기준 자체는 전혀 완화되지 않는다. 복구 못 하면 기존처럼 재번역/E열 표시.
+
+# 형식만 살짝 깨진 마스킹 번호 토큰: «T1», «T : 1», «T:1 », «T.1» 등
+_BROKEN_NUM_TOKEN_RE = re.compile(r'«\s*T\s*[:.,;]?\s*(\d+)\s*»')
+
+# 길리메 묶음 전체 (유효/훼손 구분 전 단계)
+_GUILLEMET_SPAN_RE = re.compile(r'«[^«»]*»')
+
+
+def repair_masked_tokens(lines, mapping):
+    """형식이 살짝 깨진 «T:번호» 토큰을 원형으로 정규화한다.
+
+    «T1», «T : 1», «T:1 » → «T:1». 그 번호가 mapping 에 실제로 존재할 때만
+    복구하므로 오탐이 없다. unmask_placeholders() 직전에 호출한다.
+    """
+    if not mapping:
+        return lines
+
+    def repl(m):
+        token = f"«T:{m.group(1)}»"
+        return token if token in mapping else m.group(0)
+
+    return [_BROKEN_NUM_TOKEN_RE.sub(repl, ln) if ln else ln for ln in lines]
+
+
+def _candidate_fragment(span):
+    """훼손 후보 «T...» 스팬에서 원문 대조용 조각을 뽑는다.
+
+    «Tón:» → 'ón:', «T Máx.:» → 'Máx.:', «T» → '', «T:Descripción» → 'Descripción'
+    T 마커가 없는 일반 길리메 인용(«cita» 등)은 후보가 아니므로 None.
+    """
+    inner = span[1:-1]
+    if not inner.startswith("T"):
+        return None
+    return inner[1:].lstrip(":").strip()
+
+
+def repair_placeholder_line(source, translated):
+    """훼손된 플레이스홀더를 원본 기준으로 로컬 복구한 줄을 반환. 복구 불가면 None.
+
+    1) 원본 토큰과 완전히 일치하는 스팬은 정상으로 소진
+    2) «T 로 시작하지만 형식이 깨진 스팬을, '빠진 토큰' 중 내용 조각이
+       유일하게 들어맞는 것과 매칭 (예: «Tón:» ↔ «T:Descripción:»)
+    3) 남은 후보와 남은 빠진 토큰의 개수가 같으면 등장 순서대로 배정
+    복구 결과가 다중집합 검증을 통과할 때만 반환한다. 애매하면 손대지 않는다.
+    """
+    if not source or not translated:
+        return None
+    src_tokens = extract_placeholders(source)
+    if not src_tokens:
+        return None
+
+    from collections import Counter
+    remaining = Counter(src_tokens)
+
+    # 출력의 길리메 스팬을 순회: 정상 토큰은 소진, 나머지 «T… 는 복구 후보
+    spans = list(_GUILLEMET_SPAN_RE.finditer(translated))
+    consumed = Counter()
+    candidates = []  # [스팬 인덱스, 대조 조각, 배정된 원본 토큰|None]
+    for si, m in enumerate(spans):
+        span = m.group(0)
+        if consumed[span] < remaining.get(span, 0):
+            consumed[span] += 1
+            continue
+        frag = _candidate_fragment(span)
+        if frag is None:
+            continue  # 일반 인용부 등 — 건드리지 않음
+        candidates.append([si, frag, None])
+
+    if not candidates:
+        return None
+
+    # 빠진 토큰 목록 (원본 등장 순서, 중복 포함)
+    missing = []
+    used = Counter()
+    for t in src_tokens:
+        if used[t] < consumed.get(t, 0):
+            used[t] += 1
+        else:
+            missing.append(t)
+    if not missing:
+        return None
+
+    # 1차: 내용 조각이 유일하게 들어맞는 빠진 토큰과 매칭
+    unassigned = list(range(len(missing)))
+    for cand in candidates:
+        frag = cand[1]
+        if not frag:
+            continue
+        f = frag.casefold()
+        hits = [k for k in unassigned if f in missing[k][3:-1].casefold()]
+        # 들어맞는 대상이 전부 같은 토큰이면 사실상 유일 매칭
+        if hits and len({missing[k] for k in hits}) == 1:
+            cand[2] = missing[hits[0]]
+            unassigned.remove(hits[0])
+
+    # 2차: 남은 후보 수 == 남은 빠진 토큰 수 → 등장 순서대로 배정
+    left = [c for c in candidates if c[2] is None]
+    if left:
+        if len(left) != len(unassigned):
+            return None
+        for c, k in zip(left, unassigned):
+            c[2] = missing[k]
+
+    # 치환 적용 (스팬 위치 기준 — 같은 모양의 훼손 스팬도 각자 제 토큰으로)
+    repl_by_span = {c[0]: c[2] for c in candidates}
+    out, last = [], 0
+    for si, m in enumerate(spans):
+        if si in repl_by_span:
+            out.append(translated[last:m.start()])
+            out.append(repl_by_span[si])
+            last = m.end()
+    out.append(translated[last:])
+    repaired = "".join(out)
+
+    # 최종 안전망: 엄격한 다중집합 검증을 통과할 때만 채택
+    return repaired if check_placeholder_match(source, repaired) else None
+
+
+def repair_placeholder_lines(sources, lines, idxs=None):
+    """불일치 행들을 로컬 복구한다. 반환: (새 lines, 복구 성공한 인덱스 리스트)"""
+    if idxs is None:
+        idxs = filter_placeholder_mismatch(sources, lines)
+    new_lines = list(lines)
+    repaired = []
+    for i in idxs:
+        src = sources[i] if i < len(sources) else ""
+        cur = new_lines[i] if i < len(new_lines) else ""
+        fixed = repair_placeholder_line(src, cur)
+        if fixed is not None:
+            new_lines[i] = fixed
+            repaired.append(i)
+    return new_lines, repaired
 
 
 def mask_placeholders_in_batch(batch_rows):
@@ -1237,6 +1424,7 @@ def main():
 
             if response:
                 lines, missing = parse_response(response, batch)
+                lines = repair_masked_tokens(lines, ph_map)  # 깨진 «T:번호» 정규화
                 lines = unmask_placeholders(lines, ph_map)
                 if missing:
                     log_failure(missing[0], missing[-1],
@@ -1262,6 +1450,7 @@ def main():
                     if retry_response:
                         # 재시도도 ID 기반 — retry_batch 순서대로 정렬된 결과를 받음
                         retry_lines, _ = parse_response(retry_response, retry_batch)
+                        retry_lines = repair_masked_tokens(retry_lines, ph_map)
                         retry_lines = unmask_placeholders(retry_lines, ph_map)
                         for j, idx in enumerate(korean_idxs):
                             if j < len(retry_lines) and idx < len(lines):
@@ -1270,6 +1459,22 @@ def main():
                                 else:
                                     print(f"  ❌ {start_row_num+idx}행 재번역 후에도 한글 포함 — 원본 유지")
                         print(f"  → 재번역 완료")
+
+                # ── 플레이스홀더 검증 → 로컬 복구 → 불일치 행 E열 표시 ──
+                # 원본은 배치가 이미 들고 있는 placeholder 역할 열 값 사용
+                ph_sources = batch_placeholder_sources(batch)
+                ph_idxs = filter_placeholder_mismatch(ph_sources, lines)
+                if ph_idxs:
+                    lines, fixed = repair_placeholder_lines(ph_sources, lines, ph_idxs)
+                    if fixed:
+                        rows_txt = ", ".join(str(start_row_num + i) for i in fixed)
+                        print(f"  🔧 플레이스홀더 로컬 복구 ({len(fixed)}행): {rows_txt}")
+                    ph_idxs = filter_placeholder_mismatch(ph_sources, lines)
+                if ph_idxs:
+                    rows_txt = ", ".join(str(start_row_num + i) for i in ph_idxs)
+                    print(f"  ⚠️ 플레이스홀더 불일치 ({len(ph_idxs)}행): {rows_txt} — E열에 표시")
+                    for i in ph_idxs:
+                        write_status(sheet, start_row_num + i, PH_MISMATCH_MARK)
 
                 count = len(lines)  # batch와 항상 같은 길이 (누락 행은 빈 칸)
                 write_results(sheet, start_row_num, lines)
