@@ -27,6 +27,7 @@ from main import (
     placeholder_legend,
     extract_placeholders, check_placeholder_match, filter_placeholder_mismatch,
     batch_placeholder_sources, repair_masked_tokens, repair_placeholder_lines,
+    repair_placeholder_line,
     PH_MISMATCH_MARK, KOREAN_MARK, MANAGED_MARKS,
     is_empty, col_to_idx,
     list_prompt_langs, load_prompt, load_review_prompt, ensure_external_prompts,
@@ -230,31 +231,33 @@ def reconcile_status(sheet, start_row, lines, sources=None):
     return mismatch_rows, korean_rows, cleared_rows
 
 
-def cross_check_flagged_rows(sheet):
-    """시트 전체에서 E열에 자동 표시(한글 포함 / 플레이스홀더 불일치)가 있는 행을
-    현재 C/D열 내용으로 다시 검증한다. 실제로 정상인 경우에만 그 표시를 지운다.
-    (새 대화 시작 시 1회 스윕 — 이전 세션의 묵은 표시나 수동 수정분을 정리)
+def audit_completed_rows(sheet, do_repair=True):
+    """결과열이 채워진 모든 행을 전수 검증한다. (실행 시작 시 1회)
 
-    - '한글 포함'        : D(결과)열에 한글이 없으면 표시 제거
-    - '플레이스홀더 불일치' : 플레이스홀더 원본열과 D열의 «T:...» 가 일치하면 표시 제거
-                           (플레이스홀더 원본열을 알 수 없으면 검증 불가 → 그대로 둠)
-    사용자가 직접 적은 다른 메모는 건드리지 않는다.
+    이미 기입된 과거 실행분(검증이 뚫려 있던 버전 산출물 포함)까지 소급 검사:
+      - 플레이스홀더 불일치 → 가능하면 로컬 복구해 결과열을 바로 고쳐 쓰고,
+        복구 불가면 E열에 '플레이스홀더 불일치' 표시
+      - (플레이스홀더 정상) 한글 포함 → E열 '한글 포함'
+      - 정상인데 자동 표시가 남아 있으면 표시 제거
+    사용자가 직접 적은 E열 메모는 건드리지 않는다.
+    플레이스홀더 원본열이 미설정이면 관련 표시는 지우지도 덮지도 않는다.
 
     반환(dict): {
-        "ok": bool,                # 시트 읽기 성공 여부
-        "error": str|None,         # 실패 사유
-        "ph_col": 'A'/'B'/'C'|None,# 사용한 플레이스홀더 원본열
-        "cleared": [행번호...],     # 재검증 결과 정상 → 표시 지운 행
-        "kept_ph": [행번호...],     # 여전히 플레이스홀더 불일치라 유지한 행
-        "kept_ko": [행번호...],     # 여전히 한글 포함이라 유지한 행
-        "kept_unverifiable": [행번호...],  # 원본열을 몰라 검증 못 한 행
+        "ok": bool, "error": str|None, "ph_col": 'A'/'B'/'C'|None,
+        "checked": int,             # 검사한 완료 행 수
+        "repaired": [행번호...],     # 로컬 복구로 결과열을 고쳐 쓴 행
+        "flagged_ph": [행번호...],   # 복구 불가 → 불일치 표시(또는 유지)된 행
+        "flagged_ko": [행번호...],   # 한글 포함 표시(또는 유지)된 행
+        "cleared": [행번호...],      # 정상 확인 → 표시 지운 행
+        "unverifiable": [행번호...], # 원본열 미설정으로 검증 못 한 불일치 표시 행
     }
     """
     from main import has_korean
 
     result = {
-        "ok": True, "error": None, "ph_col": None,
-        "cleared": [], "kept_ph": [], "kept_ko": [], "kept_unverifiable": [],
+        "ok": True, "error": None, "ph_col": None, "checked": 0,
+        "repaired": [], "flagged_ph": [], "flagged_ko": [],
+        "cleared": [], "unverifiable": [],
     }
 
     try:
@@ -264,39 +267,61 @@ def cross_check_flagged_rows(sheet):
         result["error"] = str(e)
         return result
 
-    result_idx = col_to_idx(getattr(config, "RESULT_COL", "D"))
+    result_col = getattr(config, "RESULT_COL", "D")
+    result_idx = col_to_idx(result_col)
     e_idx = col_to_idx("E")
     ph_col = get_placeholder_col_letter()                 # 'A'/'B'/'C' 또는 None
     ph_idx = col_to_idx(ph_col) if ph_col else None
     start = getattr(config, "START_ROW", 1)
     result["ph_col"] = ph_col
 
-    clears = []
+    d_updates, e_updates, clears = [], [], []
     for i, row in enumerate(all_values[start - 1:], start=start):
-        e_val = row[e_idx].strip() if len(row) > e_idx else ""
-        if e_val not in MANAGED_MARKS:
-            continue
         d_val = row[result_idx] if len(row) > result_idx else ""
+        if is_empty(d_val):
+            continue  # 미완료 행은 이번 실행에서 번역될 때 배치 검증을 거친다
+        e_val = row[e_idx].strip() if len(row) > e_idx else ""
+        result["checked"] += 1
 
-        if e_val == KOREAN_MARK:
-            if not has_korean(d_val):
-                clears.append(f"E{i}")
-                result["cleared"].append(i)
-            else:
-                result["kept_ko"].append(i)
-        elif e_val == PH_MISMATCH_MARK:
-            if ph_idx is None:
-                result["kept_unverifiable"].append(i)  # 원본열을 모름 → 검증 불가
-                continue
+        # 원본열을 모르면 기존 불일치 표시는 검증 불가 → 그대로 둔다
+        if ph_idx is None and e_val == PH_MISMATCH_MARK:
+            result["unverifiable"].append(i)
+            continue
+
+        desired = ""
+        if ph_idx is not None:
             src_val = row[ph_idx] if len(row) > ph_idx else ""
-            if check_placeholder_match(src_val, d_val):
-                clears.append(f"E{i}")
-                result["cleared"].append(i)
-            else:
-                result["kept_ph"].append(i)
+            if not check_placeholder_match(src_val, d_val):
+                fixed = repair_placeholder_line(src_val, d_val) if do_repair else None
+                if fixed is not None:
+                    d_updates.append({"range": f"{result_col}{i}", "values": [[fixed]]})
+                    result["repaired"].append(i)
+                    d_val = fixed  # 이후 한글/표시 판정은 복구본 기준
+                else:
+                    desired = PH_MISMATCH_MARK
+                    result["flagged_ph"].append(i)
+        if not desired and has_korean(d_val):
+            desired = KOREAN_MARK
+            result["flagged_ko"].append(i)
 
-    if clears:
-        _clear_cells(sheet, clears)
+        if desired:
+            # 빈칸이거나 우리가 관리하는 표시일 때만 갱신 (사용자 메모 보존)
+            if e_val != desired and (e_val == "" or e_val in MANAGED_MARKS):
+                e_updates.append({"range": f"E{i}", "values": [[desired]]})
+        elif e_val in MANAGED_MARKS:
+            clears.append(f"E{i}")
+            result["cleared"].append(i)
+
+    # 셀 단위가 아니라 500셀 묶음으로 일괄 기입 (API 호출 수 최소화)
+    try:
+        for k in range(0, len(d_updates), 500):
+            sheet.batch_update(d_updates[k:k + 500])
+        for k in range(0, len(e_updates), 500):
+            sheet.batch_update(e_updates[k:k + 500])
+    except Exception as e:
+        result["ok"] = False
+        result["error"] = f"기입 실패: {e}"
+    _clear_cells(sheet, clears)
 
     return result
 
@@ -472,59 +497,57 @@ class TranslationWorker(threading.Thread):
             batch_no = 0
             gi = 0
             bi = 0
-            e_sweep_done = False  # E열 재검증 스윕은 실행당 1회면 충분
+            e_sweep_done = False  # 완료 행 전수 검증은 실행당 1회면 충분
 
             while gi < len(groups) and not self.stop_flag:
                 group = groups[gi]
 
                 if self.send_count == 0 or self.send_count >= config.MAX_SENDS_PER_CONVERSATION or self.force_new_conv:
-                    # ── E열 특이사항 재검증 스윕 (번역 모드 전용, 실행당 1회) ─────
-                    # 한글 포함/플레이스홀더 불일치 표시를 현재 C/D 기준으로 다시 보고,
-                    # 실제로 정상이면 표시만 지운다. (무엇을 발견/검증했는지 로그로 노출)
-                    # 실행 중 기입되는 표시는 reconcile_status 가 즉시 관리하므로
-                    # 매 새 대화마다 시트 전체를 다시 읽을 필요는 없다.
+                    # ── 완료 행 전수 검증 (번역 모드 전용, 실행당 1회) ─────
+                    # 결과열이 이미 채워진 모든 행을 검사한다. 과거 실행분(예전
+                    # 버전에서 검증 없이 기입된 행)의 훼손도 여기서 발견되어,
+                    # 가능하면 로컬 복구로 결과열을 바로 고치고 아니면 E열에 표시.
+                    # 실행 중 새로 기입되는 행은 reconcile_status 가 즉시 관리한다.
                     # 검수 모드는 E열 자동 표시를 쓰지 않으므로 건너뛴다.
                     if not is_review and not e_sweep_done:
                         e_sweep_done = True
-                        self.waiting("E열 특이사항 재검증 중")
-                        cc = cross_check_flagged_rows(sheet)
+                        self.waiting("기존 완료 행 전수 검증 중")
+                        au = audit_completed_rows(sheet)
                         self.done_waiting()
 
-                        if not cc["ok"]:
-                            self.log(f"⚠️ E열 재검증 실패 — 시트 읽기 오류로 건너뜀: {cc['error']}", "error")
+                        def _preview(rows, limit=40):
+                            head = ", ".join(str(r) for r in rows[:limit])
+                            return head + ("" if len(rows) <= limit else f" 외 {len(rows) - limit}행")
+
+                        if not au["ok"] and au["checked"] == 0:
+                            self.log(f"⚠️ 전수 검증 실패 — 건너뜀: {au['error']}", "error")
                         else:
-                            cleared = cc["cleared"]
-                            kept_ph = cc["kept_ph"]
-                            kept_ko = cc["kept_ko"]
-                            kept_unv = cc["kept_unverifiable"]
-                            found = len(cleared) + len(kept_ph) + len(kept_ko) + len(kept_unv)
-
-                            if found == 0:
-                                self.log("E열 재검증: 특이사항 행을 찾지 못함 (검사 대상 0건)", "info")
-                            else:
+                            issues = (len(au["repaired"]) + len(au["flagged_ph"])
+                                      + len(au["flagged_ko"]) + len(au["unverifiable"]))
+                            self.log(
+                                f"전수 검증: 완료 행 {au['checked']}개 검사 → "
+                                f"특이사항 {issues}건 / 표시 정리 {len(au['cleared'])}건",
+                                "info")
+                            if au["repaired"]:
                                 self.log(
-                                    f"E열 재검증: 특이사항 {found}행 발견 "
-                                    f"→ 정리 {len(cleared)} / 유지 {len(kept_ph) + len(kept_ko) + len(kept_unv)}",
-                                    "info"
-                                )
-
-                                def _preview(rows, limit=40):
-                                    head = ", ".join(str(r) for r in rows[:limit])
-                                    return head + ("" if len(rows) <= limit else f" 외 {len(rows) - limit}행")
-
-                                if cleared:
-                                    self.log(f"  🧹 정리(이제 정상): {_preview(cleared)}행", "success")
-                                if kept_ph:
-                                    self.log(f"  📌 유지(여전히 플레이스홀더 불일치): {_preview(kept_ph)}행", "warn")
-                                if kept_ko:
-                                    self.log(f"  📌 유지(여전히 한글 포함): {_preview(kept_ko)}행", "warn")
-                                if kept_unv:
-                                    self.log(
-                                        f"  ⚠️ 검증 불가(플레이스홀더 원본열 미설정): {_preview(kept_unv)}행",
-                                        "warn"
-                                    )
-                            if cc["ph_col"] is None:
-                                self.log("  ↳ 참고: 플레이스홀더 원본열이 설정돼 있지 않아 불일치 행은 검증하지 못했습니다.", "warn")
+                                    f"  🔧 플레이스홀더 자동 복구(결과열 정정): "
+                                    f"{_preview(au['repaired'])}행", "success")
+                            if au["flagged_ph"]:
+                                self.log(
+                                    f"  📌 플레이스홀더 불일치(복구 불가, E열 표시): "
+                                    f"{_preview(au['flagged_ph'])}행", "warn")
+                            if au["flagged_ko"]:
+                                self.log(f"  📌 한글 포함(E열 표시): {_preview(au['flagged_ko'])}행", "warn")
+                            if au["cleared"]:
+                                self.log(f"  🧹 정리(이제 정상): {_preview(au['cleared'])}행", "success")
+                            if au["unverifiable"]:
+                                self.log(
+                                    f"  ⚠️ 검증 불가(플레이스홀더 원본열 미설정): "
+                                    f"{_preview(au['unverifiable'])}행", "warn")
+                            if au["ph_col"] is None:
+                                self.log("  ↳ 참고: 플레이스홀더 원본열이 설정돼 있지 않아 플레이스홀더 검사는 못 했습니다.", "warn")
+                            if not au["ok"]:
+                                self.log(f"  ⚠️ 일부 기입 실패: {au['error']}", "error")
 
                     if self.send_count > 0:
                         self.log("시트 재스캔 중 (실패 구멍 수거)...")
