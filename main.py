@@ -153,6 +153,30 @@ REVIEW_LANG_DESC = {
 # 더 이상 쓰지 않는(통합/삭제된) 프롬프트 — 외부 폴더에 남아 있으면 정리한다.
 DEPRECATED_PROMPTS = {"es_general"}
 
+# 코드가 모든 번역 프롬프트 끝에 자동으로 붙이는 플레이스홀더 보존 규칙.
+# 프롬프트 파일은 사용자가 언어별로 자유 편집하므로, 시스템이 반드시 보장해야
+# 하는 토큰 보존 규칙은 파일이 아니라 코드가 단일 지점에서 주입한다.
+# (PLACEHOLDER_RE / _CURLY_CODE_RE 검증 로직과 짝을 이루는 규칙)
+PLACEHOLDER_RULE_BLOCK = """
+
+────────────────────────────────
+[ 플레이스홀더·코드 보존 규칙 — 시스템 필수 (번역 규칙보다 우선) ]
+────────────────────────────────
+
+- «T:...» 형태(길리메 « » 포함)와 {...} 형태(중괄호, 예: {CL:3}, {CL:0})는
+  게임 엔진이 문자 그대로 읽는 코드입니다. 번역 대상이 아닙니다.
+- 이 토큰들은 문자 하나 다르지 않게 통째로 복사하여 출력에 유지하십시오.
+  내부 텍스트의 번역·요약·생략·재작성, 콜론(:) 제거, 첫 단어 삭제 등
+  어떤 부분 수정도 금지입니다.
+  (잘못된 예: «T:Paquete maestro E» → «T maestro E» / «T:Ubicación:» → «Tón:»)
+- 입력에 «T:숫자» 형태(예: «T:7»)의 토큰이 있으면 그것은 마스킹된 코드입니다.
+  출력에도 정확히 같은 «T:숫자» 를 쓰십시오. 숫자를 바꾸거나, 참고표의 내용으로
+  풀어 쓰거나, « » 안에 다른 텍스트를 적지 마십시오.
+- 원본에 없는 토큰을 새로 만들지 마십시오. 원본 토큰의 종류·개수와 출력
+  토큰의 종류·개수는 정확히 일치해야 합니다. (위치만 문장에 맞게 이동 가능)
+- 이 규칙 위반은 게임 오류로 직결됩니다. 문장의 자연스러움보다 이 규칙이 우선합니다.
+"""
+
 # 코드가 모든 프롬프트 끝에 자동으로 붙이는 행 ID 규칙.
 # 프롬프트 파일 자체에는 ID 규칙을 두지 않는다 → 파일은 순수 번역 규칙만 유지하고,
 # ID 정합성은 코드가 단일 지점에서 보장한다. (format_batch / parse_response와 짝)
@@ -199,7 +223,7 @@ def load_prompt(lang):
         return ""
     with open(path, "r", encoding="utf-8") as f:
         body = f.read().strip()
-    return body + ID_RULE_BLOCK
+    return body + PLACEHOLDER_RULE_BLOCK + ID_RULE_BLOCK
 
 
 # 검수 모드용 행 ID 규칙 — 출력이 '번역'이 아니라 '검수 결과'라는 점만 다르다.
@@ -960,6 +984,13 @@ def format_review_batch(batch_rows):
 #   - T: 가 표시자, 한 문장에 여러 번 등장 가능, 중첩은 없음
 PLACEHOLDER_RE = re.compile(r'«T:[^«»]*»')
 
+# 게임 엔진 제어 코드 형식: {내용}  (예: {CL:3}, {CL:0}, {CL:4})
+# 번역에서 그대로 보존돼야 하는 두 번째 토큰 부류 — 검증 다중집합에 포함한다.
+_CURLY_CODE_RE = re.compile(r'\{[^{}]*\}')
+
+# 보존 대상 토큰 전체(«T:...» + {...})를 등장 순서대로 뽑는 패턴
+_PRESERVE_TOKEN_RE = re.compile(r'«T:[^«»]*»|\{[^{}]*\}')
+
 
 # get_pending_rows 행 튜플에서 번역 대상(placeholder 역할) 열의 인덱스
 _PH_CELL_IDX = 3
@@ -979,15 +1010,25 @@ def extract_placeholders(text):
     return PLACEHOLDER_RE.findall(text)
 
 
+def extract_preserve_tokens(text):
+    """보존 대상 토큰(«T:...» + {...})을 모두 추출 (출현 순서 유지)"""
+    if not text:
+        return []
+    return _PRESERVE_TOKEN_RE.findall(text)
+
+
 def check_placeholder_match(source, translated):
-    """원본과 번역의 플레이스홀더 다중집합이 일치하는지 검사.
-    원본에 플레이스홀더가 없으면 True (검증 대상 아님)."""
+    """원본과 번역의 보존 토큰(«T:...», {...}) 다중집합이 일치하는지 검사.
+    원본에 토큰이 없으면 True (검증 대상 아님).
+
+    두 부류는 형식이 겹치지 않으므로 합집합 다중집합 비교 한 번이면
+    «T:...» 와 {...} 각각의 다중집합 일치와 동치다."""
     if not source:
         return True
-    src = extract_placeholders(source)
+    src = extract_preserve_tokens(source)
     if not src:
         return True
-    tgt = extract_placeholders(translated or "")
+    tgt = extract_preserve_tokens(translated or "")
     return sorted(src) == sorted(tgt)
 
 
@@ -1193,9 +1234,12 @@ def placeholder_legend(mapping):
         return ""
     lines = [
         "[플레이스홀더 참고표 — 아래 «T:번호» 토큰의 실제 내용입니다.",
-        " 의미·성수 일치·관사/전치사·어순 판단에만 참고하고,",
-        " 출력에는 반드시 «T:번호» 토큰을 원형 그대로 유지하십시오.",
-        " 토큰을 실제 내용으로 풀어 쓰거나 내용을 번역해 넣지 마십시오.]",
+        " 의미·성수 일치·관사/전치사·어순 판단에만 참고하십시오.",
+        " 출력 절대 규칙:",
+        " 1) 출력에는 «T:번호» 토큰을 문자 하나 다르지 않게 원형 그대로 유지 (번호 변경 금지)",
+        " 2) 토큰을 아래 내용으로 풀어 쓰거나, 내용의 일부를 « » 안에 다시 적는 것 금지",
+        " 3) 출력에서 « » 기호는 입력에 있던 «T:번호» 토큰을 복사할 때만 사용 가능",
+        " 4) {CL:3} 같은 {...} 코드도 원형 그대로 유지]",
     ]
     for token, original in mapping.items():
         inner = original[3:-1]  # «T:내용» → 내용

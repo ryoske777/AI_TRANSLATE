@@ -25,7 +25,8 @@ from main import (
     group_consecutive_rows, format_batch, format_review_batch, parse_response,
     auto_batch_count, mask_placeholders_in_batch, unmask_placeholders,
     placeholder_legend,
-    extract_placeholders, check_placeholder_match, filter_placeholder_mismatch,
+    extract_placeholders, extract_preserve_tokens,
+    check_placeholder_match, filter_placeholder_mismatch,
     batch_placeholder_sources, repair_masked_tokens, repair_placeholder_lines,
     repair_placeholder_line,
     PH_MISMATCH_MARK, KOREAN_MARK, MANAGED_MARKS,
@@ -371,6 +372,51 @@ class TranslationWorker(threading.Thread):
         self._pause_event.set()
         self.log("재시작됨 — 새 대화부터 시작합니다.", "success")
 
+    def audit_completed(self, sheet):
+        """결과열이 채워진 행 전수 검증·자동 복구를 실행하고 결과를 로그로 보고한다.
+
+        번역 시작 시 1회 호출되며, 번역 대기 행이 0개(전부 완료된 시트)여도
+        호출된다 — 과거 실행분의 훼손 플레이스홀더를 일괄 소급 복구하는 경로.
+        """
+        self.waiting("기존 완료 행 전수 검증 중")
+        au = audit_completed_rows(sheet)
+        self.done_waiting()
+
+        def _preview(rows, limit=40):
+            head = ", ".join(str(r) for r in rows[:limit])
+            return head + ("" if len(rows) <= limit else f" 외 {len(rows) - limit}행")
+
+        if not au["ok"] and au["checked"] == 0:
+            self.log(f"⚠️ 전수 검증 실패 — 건너뜀: {au['error']}", "error")
+            return
+
+        issues = (len(au["repaired"]) + len(au["flagged_ph"])
+                  + len(au["flagged_ko"]) + len(au["unverifiable"]))
+        self.log(
+            f"전수 검증: 완료 행 {au['checked']}개 검사 → "
+            f"특이사항 {issues}건 / 표시 정리 {len(au['cleared'])}건",
+            "info")
+        if au["repaired"]:
+            self.log(
+                f"  🔧 플레이스홀더 자동 복구(결과열 정정): "
+                f"{_preview(au['repaired'])}행", "success")
+        if au["flagged_ph"]:
+            self.log(
+                f"  📌 플레이스홀더 불일치(복구 불가, E열 표시): "
+                f"{_preview(au['flagged_ph'])}행", "warn")
+        if au["flagged_ko"]:
+            self.log(f"  📌 한글 포함(E열 표시): {_preview(au['flagged_ko'])}행", "warn")
+        if au["cleared"]:
+            self.log(f"  🧹 정리(이제 정상): {_preview(au['cleared'])}행", "success")
+        if au["unverifiable"]:
+            self.log(
+                f"  ⚠️ 검증 불가(플레이스홀더 원본열 미설정): "
+                f"{_preview(au['unverifiable'])}행", "warn")
+        if au["ph_col"] is None:
+            self.log("  ↳ 참고: 플레이스홀더 원본열이 설정돼 있지 않아 플레이스홀더 검사는 못 했습니다.", "warn")
+        if not au["ok"]:
+            self.log(f"  ⚠️ 일부 기입 실패: {au['error']}", "error")
+
     def run(self):
         # ── AI 모드별 드라이버 함수 선택 ─────────────────────────────
         # config.AI_MODE에 따라 ChatGPT(main.py) 또는 Claude(claude_driver.py)
@@ -431,6 +477,12 @@ class TranslationWorker(threading.Thread):
 
             pending_rows = get_pending_rows(sheet)
             if not pending_rows:
+                # 번역할 행이 없어도(전부 완료된 시트) 기존 완료 행 전수 검증·복구는
+                # 수행한다 — 과거 실행분의 훼손 플레이스홀더를 일괄 복구하는 유일한
+                # 경로. (이전에는 여기서 즉시 종료돼 전수 검증이 영영 실행되지 않았음)
+                if not is_review:
+                    self.log("번역 대기 행 없음 — 기존 완료 행 검증·복구만 수행합니다.", "info")
+                    self.audit_completed(sheet)
                 self.log(f"{work_word} 대상 행이 없습니다.", "warn")
                 self.log_q.put(("empty", None))
                 self.done_callback(0, 0, [])
@@ -511,43 +563,7 @@ class TranslationWorker(threading.Thread):
                     # 검수 모드는 E열 자동 표시를 쓰지 않으므로 건너뛴다.
                     if not is_review and not e_sweep_done:
                         e_sweep_done = True
-                        self.waiting("기존 완료 행 전수 검증 중")
-                        au = audit_completed_rows(sheet)
-                        self.done_waiting()
-
-                        def _preview(rows, limit=40):
-                            head = ", ".join(str(r) for r in rows[:limit])
-                            return head + ("" if len(rows) <= limit else f" 외 {len(rows) - limit}행")
-
-                        if not au["ok"] and au["checked"] == 0:
-                            self.log(f"⚠️ 전수 검증 실패 — 건너뜀: {au['error']}", "error")
-                        else:
-                            issues = (len(au["repaired"]) + len(au["flagged_ph"])
-                                      + len(au["flagged_ko"]) + len(au["unverifiable"]))
-                            self.log(
-                                f"전수 검증: 완료 행 {au['checked']}개 검사 → "
-                                f"특이사항 {issues}건 / 표시 정리 {len(au['cleared'])}건",
-                                "info")
-                            if au["repaired"]:
-                                self.log(
-                                    f"  🔧 플레이스홀더 자동 복구(결과열 정정): "
-                                    f"{_preview(au['repaired'])}행", "success")
-                            if au["flagged_ph"]:
-                                self.log(
-                                    f"  📌 플레이스홀더 불일치(복구 불가, E열 표시): "
-                                    f"{_preview(au['flagged_ph'])}행", "warn")
-                            if au["flagged_ko"]:
-                                self.log(f"  📌 한글 포함(E열 표시): {_preview(au['flagged_ko'])}행", "warn")
-                            if au["cleared"]:
-                                self.log(f"  🧹 정리(이제 정상): {_preview(au['cleared'])}행", "success")
-                            if au["unverifiable"]:
-                                self.log(
-                                    f"  ⚠️ 검증 불가(플레이스홀더 원본열 미설정): "
-                                    f"{_preview(au['unverifiable'])}행", "warn")
-                            if au["ph_col"] is None:
-                                self.log("  ↳ 참고: 플레이스홀더 원본열이 설정돼 있지 않아 플레이스홀더 검사는 못 했습니다.", "warn")
-                            if not au["ok"]:
-                                self.log(f"  ⚠️ 일부 기입 실패: {au['error']}", "error")
+                        self.audit_completed(sheet)
 
                     if self.send_count > 0:
                         self.log("시트 재스캔 중 (실패 구멍 수거)...")
@@ -700,18 +716,19 @@ class TranslationWorker(threading.Thread):
                             for idx in ph_idxs:
                                 if idx < len(ph_sources):
                                     if mask_ph and idx < len(masked_batch):
-                                        phs = extract_placeholders(masked_batch[idx][3])
+                                        phs = extract_preserve_tokens(masked_batch[idx][3])
                                     else:
-                                        phs = extract_placeholders(ph_sources[idx])
+                                        phs = extract_preserve_tokens(ph_sources[idx])
                                     if phs:
                                         phs_str = " ".join(phs)
                                         hint_lines.append(f"  · 행 {s_row + idx}: {phs_str}")
 
                             retry_batch = [masked_batch[i] for i in ph_idxs if i < len(masked_batch)]
                             retry_msg = (
-                                "아래 항목의 플레이스홀더가 원본과 다릅니다.\n"
-                                "«T:...» 형식의 플레이스홀더는 절대 번역·변형·삭제하지 말고,\n"
-                                "원본과 동일한 형태·동일한 개수 그대로 유지하세요.\n"
+                                "아래 항목의 플레이스홀더/코드가 원본과 다릅니다.\n"
+                                "«T:...» 플레이스홀더와 {...} 코드(예: {CL:3})는 절대\n"
+                                "번역·변형·삭제하지 말고, 원본과 동일한 형태·동일한 개수\n"
+                                "그대로 유지하세요.\n"
                                 "꺽쇠(« ») 안의 내용(T: 다음의 본문)도 원본과 완전히 같아야 합니다.\n"
                                 "위치만 자연스럽게 옮기는 것은 허용됩니다.\n"
                                 "각 줄 맨 앞의 R숫자 ID는 그대로 두세요.\n\n"
