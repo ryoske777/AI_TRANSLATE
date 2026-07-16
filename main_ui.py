@@ -1732,6 +1732,10 @@ def load_settings():
         config.WORK_MODE = wm if wm in DEFAULT_MODE_COLS else "translate"
         src = data.get("REVIEW_SRC_LANG", getattr(config, "REVIEW_SRC_LANG", "ko"))
         tgt = data.get("REVIEW_TGT_LANG", getattr(config, "REVIEW_TGT_LANG", "es"))
+        # pt 코드가 pt-BR 기준이 되면서 구 검수 코드 pt_br 은 pt 로 흡수됨
+        _legacy_langs = {"pt_br": "pt"}
+        src = _legacy_langs.get(src, src)
+        tgt = _legacy_langs.get(tgt, tgt)
         config.REVIEW_SRC_LANG = src if src in REVIEW_LANGS else "ko"
         config.REVIEW_TGT_LANG = tgt if tgt in REVIEW_LANGS else "es"
         config.REVIEW_CROSS_CHECK = bool(data.get("REVIEW_CROSS_CHECK", True))
