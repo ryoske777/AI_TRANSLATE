@@ -266,57 +266,68 @@ def wait_for_response(driver, timeout=300, should_stop=None, on_tick=None):
     if _stopped():
         return "STOPPED"
 
-    # Claude.ai의 로딩 지시자들
+    # Claude.ai 의 '생성 중' 신호들
     stop_selectors = [
         "button[aria-label*='Stop']",
         "button[data-testid='stop-button']",
     ]
 
-    # 1단계: Stop 버튼이 나타날 때까지 대기 (최대 30초)
-    appeared = False
-    start = time.time()
-    stage1_start = time.time()
-    while time.time() - start < 30:
-        if _stopped():
-            return "STOPPED"
+    def _busy():
+        """생성 중이면 True, 끝났으면 False, 신호를 못 읽으면 None."""
+        # 1순위: 스트리밍 속성 (claude.ai 의 가장 확실한 신호)
+        try:
+            s = driver.execute_script("""
+                const els = document.querySelectorAll('[data-is-streaming]');
+                if (els.length === 0) return null;
+                return els[els.length - 1].getAttribute('data-is-streaming') === 'true';
+            """)
+            if s is not None:
+                return bool(s)
+        except Exception:
+            pass
+        # 2순위: Stop 버튼
         for sel in stop_selectors:
             try:
                 elems = driver.find_elements(By.CSS_SELECTOR, sel)
                 if elems and elems[0].is_displayed():
-                    appeared = True
-                    break
+                    return True
             except Exception:
                 pass
-        if appeared:
-            print(f"  [DEBUG] 1단계 완료: Stop 버튼 감지 ({time.time() - stage1_start:.1f}초)")
-            break
-        _tick(time.time() - start)
-        time.sleep(poll_interval)
+        return None
 
-    if not appeared:
-        print(f"  [DEBUG] Stop 버튼 미감지, 5초 추가 대기")
-        time.sleep(5)
-
-    # 2단계: Stop 버튼이 사라질 때까지 대기
+    # 단일 루프: '생성 시작'을 본 뒤 '생성 종료'를 감지한다.
+    # 신호를 전혀 못 읽는 경우엔 본문 길이가 멈추는 것으로 완료를 판정한다.
+    # (예전 구현은 Stop 버튼이 안 잡히면 무조건 30초 + 5초를 버려서,
+    #  설정값과 무관하게 매 배치가 35초씩 느려졌다)
     start = time.time()
-    stage2_start = time.time()
+    seen_busy = False
+    last_len, stable = -1, 0
+
     while time.time() - start < timeout:
         if _stopped():
             return "STOPPED"
-        try:
-            found = False
-            for sel in stop_selectors:
-                elems = driver.find_elements(By.CSS_SELECTOR, sel)
-                if elems and elems[0].is_displayed():
-                    found = True
-                    break
-            if not found:
-                time.sleep(done_delay)
-                elapsed = time.time() - overall_start
-                print(f"  → 응답 완료 (총 {elapsed:.1f}초, 2단계 {time.time() - stage2_start:.1f}초)")
+
+        busy = _busy()
+        if busy:
+            seen_busy = True
+        elif seen_busy:
+            time.sleep(done_delay)
+            print(f"  → 응답 완료 (총 {time.time() - overall_start:.1f}초)")
+            return
+        else:
+            # 시작 신호를 못 봤다 → 본문이 자라다 멈추면 완료로 본다
+            cur = _assistant_text_len(driver)
+            if cur > 0:
+                stable = stable + 1 if cur == last_len else 0
+                last_len = cur
+                if stable >= 3:
+                    time.sleep(done_delay)
+                    print(f"  → 응답 완료 (텍스트 안정, 총 {time.time() - overall_start:.1f}초)")
+                    return
+            elif time.time() - start > 60:
+                print("  ⚠️ 60초간 응답 신호도 본문도 없음 — 추출 단계로 넘어감")
                 return
-        except Exception:
-            pass
+
         _tick(time.time() - start)
         time.sleep(poll_interval)
 
@@ -344,44 +355,63 @@ def check_logged_in(driver, timeout=10):
     return False
 
 
-def extract_last_response(driver):
-    """마지막 assistant 메시지에서 코드블록 내용 추출 — 다중 폴백"""
+def _assistant_elements(driver):
+    """assistant 메시지 요소만 DOM 순서대로 반환한다.
+
+    claude.ai 는 '사용자' 말풍선에 data-testid="user-message" 를 달지만
+    assistant 말풍선에는 data-testid 가 없다. 따라서
+    div[data-testid*='message'] 같은 부분일치 셀렉터는 방금 내가 보낸 원문을
+    집어오게 되므로 절대 쓰면 안 된다. (원문이 그대로 시트에 기입된다)
+    여기서는 사용자 말풍선을 명시적으로 배제하고 assistant 본문만 고른다.
+    """
     try:
-        # 시도 1: Claude.ai 메시지 컨테이너
-        messages = driver.find_elements(
-            By.CSS_SELECTOR, "div[data-testid*='message'], div[data-testid*='response']"
-        )
+        return driver.execute_script("""
+            const out = [], seen = new Set();
+            const push = (el) => {
+                if (!el || seen.has(el)) return;
+                if (el.closest('[data-testid="user-message"]')) return;  // 사용자 말풍선 배제
+                seen.add(el); out.push(el);
+            };
+            document.querySelectorAll('div.font-claude-message').forEach(push);
+            if (out.length === 0)
+                document.querySelectorAll('[data-testid="assistant-message"]').forEach(push);
+            if (out.length === 0)
+                document.querySelectorAll(
+                    '[data-is-streaming] .prose, [data-is-streaming] [class*="prose"]'
+                ).forEach(push);
+            return out;
+        """) or []
+    except Exception:
+        return []
 
-        if not messages:
-            messages = driver.find_elements(
-                By.CSS_SELECTOR, "div[role='article']"
-            )
 
-        if not messages:
-            messages = driver.find_elements(
-                By.CSS_SELECTOR, ".prose, div.prose, [class*='prose']"
-            )
+def _assistant_text_len(driver):
+    """마지막 assistant 메시지의 글자 수. 없으면 0."""
+    try:
+        return driver.execute_script("""
+            const els = document.querySelectorAll('div.font-claude-message');
+            if (els.length === 0) return 0;
+            return (els[els.length - 1].innerText || '').length;
+        """) or 0
+    except Exception:
+        return 0
 
-        # 시도 4: JavaScript로 직접 추출
-        if not messages:
-            result = driver.execute_script("""
-                const msgs = document.querySelectorAll('[data-testid*="message"], [data-testid*="response"], div[role="article"]');
-                if (msgs.length === 0) return null;
-                const last = msgs[msgs.length - 1];
-                const code = last.querySelector('code');
-                if (code) return code.innerText;
-                return last.innerText;
-            """)
-            if result:
-                return result.strip()
-            return None
 
+def extract_last_response(driver):
+    """마지막 assistant 메시지에서 코드블록 내용 추출.
+
+    assistant 메시지를 못 찾으면 None 을 반환한다. 애매할 때 사용자 메시지를
+    대신 돌려주면 원문이 조용히 시트에 기입되므로, 그럴 바엔 실패로 처리한다.
+    """
+    try:
+        messages = _assistant_elements(driver)
         if not messages:
+            print("  ⚠️ assistant 메시지를 찾지 못했습니다 (claude.ai DOM 변경 가능성)")
             return None
 
         last = messages[-1]
 
-        # 코드블록 우선
+        # 코드블록 우선 (프롬프트가 코드블록 출력을 요구한다)
         try:
             code_blocks = last.find_elements(By.TAG_NAME, "code")
             if code_blocks:
@@ -399,16 +429,7 @@ def extract_last_response(driver):
         except Exception:
             pass
 
-        # 최후: JS fallback
-        result = driver.execute_script("""
-            const msgs = document.querySelectorAll('[data-testid*="message"], [data-testid*="response"], div[role="article"]');
-            if (msgs.length === 0) return null;
-            const last = msgs[msgs.length - 1];
-            const code = last.querySelector('code');
-            if (code) return code.innerText;
-            return last.innerText;
-        """)
-        return result.strip() if result else None
+        return None
 
     except Exception as e:
         print(f"  ⚠️ 응답 추출 오류: {e}")

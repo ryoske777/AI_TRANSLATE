@@ -862,7 +862,7 @@ class TranslationWorker(threading.Thread):
                 import random as _r
                 # STOP 즉시 반응: 긴 딜레이를 0.2초 단위로 쪼개 중지 플래그를 자주 확인
                 delay = _r.uniform(config.DELAY_MIN, config.DELAY_MAX)
-                self.log(f"  [DEBUG] 배치 간 딜레이 {delay:.1f}초 대기 중... (설정: {config.DELAY_MIN}~{config.DELAY_MAX}초)", "info")
+                self.log(f"⏱ 배치 간 딜레이 {delay:.1f}초 (설정 {config.DELAY_MIN}~{config.DELAY_MAX}초)", "info")
                 waited = 0.0
                 while waited < delay and not self.stop_flag:
                     _t.sleep(min(0.2, delay - waited))
