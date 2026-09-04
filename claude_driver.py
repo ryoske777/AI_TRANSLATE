@@ -238,8 +238,9 @@ def send_message(driver, text):
     _click_send_button(driver, textarea)
 
     # 전송 후 랜덤 딜레이
-    time.sleep(random.uniform(1.5, 3.5))
-    print("  → 메시지 전송 완료, 응답 대기 중...")
+    post_send_delay = random.uniform(1.5, 3.5)
+    time.sleep(post_send_delay)
+    print(f"  → 메시지 전송 완료 (전송후딜레이 {post_send_delay:.1f}초), 응답 대기 중...")
 
 
 def wait_for_response(driver, timeout=300, should_stop=None, on_tick=None):
@@ -247,6 +248,9 @@ def wait_for_response(driver, timeout=300, should_stop=None, on_tick=None):
     init_wait     = getattr(config, 'RESPONSE_INIT_WAIT',     2.0)
     poll_interval = getattr(config, 'RESPONSE_POLL_INTERVAL', 0.5)
     done_delay    = getattr(config, 'RESPONSE_DONE_DELAY',    1.0)
+
+    overall_start = time.time()
+    print(f"  [DEBUG] 응답 대기 시작 - init_wait={init_wait}, poll_interval={poll_interval}, done_delay={done_delay}")
 
     def _stopped():
         return should_stop is not None and should_stop()
@@ -271,6 +275,7 @@ def wait_for_response(driver, timeout=300, should_stop=None, on_tick=None):
     # 1단계: Stop 버튼이 나타날 때까지 대기 (최대 30초)
     appeared = False
     start = time.time()
+    stage1_start = time.time()
     while time.time() - start < 30:
         if _stopped():
             return "STOPPED"
@@ -283,15 +288,18 @@ def wait_for_response(driver, timeout=300, should_stop=None, on_tick=None):
             except Exception:
                 pass
         if appeared:
+            print(f"  [DEBUG] 1단계 완료: Stop 버튼 감지 ({time.time() - stage1_start:.1f}초)")
             break
         _tick(time.time() - start)
         time.sleep(poll_interval)
 
     if not appeared:
+        print(f"  [DEBUG] Stop 버튼 미감지, 5초 추가 대기")
         time.sleep(5)
 
     # 2단계: Stop 버튼이 사라질 때까지 대기
     start = time.time()
+    stage2_start = time.time()
     while time.time() - start < timeout:
         if _stopped():
             return "STOPPED"
@@ -304,7 +312,8 @@ def wait_for_response(driver, timeout=300, should_stop=None, on_tick=None):
                     break
             if not found:
                 time.sleep(done_delay)
-                print("  → 응답 완료")
+                elapsed = time.time() - overall_start
+                print(f"  → 응답 완료 (총 {elapsed:.1f}초, 2단계 {time.time() - stage2_start:.1f}초)")
                 return
         except Exception:
             pass
