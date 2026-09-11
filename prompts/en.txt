@@ -159,6 +159,14 @@ Do not rewrite beyond what is necessary for natural in-game English.
 ────────────────────────────────
 
 - Use natural American English (EN-US)
+- Use American spelling, never British/Commonwealth spelling:
+  color (not colour), armor (not armour), defense (not defence),
+  realize (not realise), traveling (not travelling), toward (not towards),
+  center (not centre), jewelry (not jewellery)
+- Use American vocabulary and punctuation conventions
+  (periods and commas inside quotation marks; no single-quote dialogue style)
+- Do not convert units, currencies, date formats, or number formats that appear
+  in the source — the numeric position lock above always wins
 - Prefer clear, neutral, player-facing wording
 - Avoid unnecessary slang or overly casual phrasing
 - Avoid awkward literal translation

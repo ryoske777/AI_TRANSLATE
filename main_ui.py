@@ -1733,8 +1733,9 @@ def load_settings():
         config.WORK_MODE = wm if wm in DEFAULT_MODE_COLS else "translate"
         src = data.get("REVIEW_SRC_LANG", getattr(config, "REVIEW_SRC_LANG", "ko"))
         tgt = data.get("REVIEW_TGT_LANG", getattr(config, "REVIEW_TGT_LANG", "es"))
-        # pt 코드가 pt-BR 기준이 되면서 구 검수 코드 pt_br 은 pt 로 흡수됨
-        _legacy_langs = {"pt_br": "pt"}
+        # 포르투갈어는 브라질(pt-BR) 기준 하나로 통일 —
+        # 구 검수 코드 pt_br(구버전) / pt_pt(유럽) 는 모두 pt 로 흡수한다.
+        _legacy_langs = {"pt_br": "pt", "pt_pt": "pt"}
         src = _legacy_langs.get(src, src)
         tgt = _legacy_langs.get(tgt, tgt)
         config.REVIEW_SRC_LANG = src if src in REVIEW_LANGS else "ko"
