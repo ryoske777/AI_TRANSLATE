@@ -108,6 +108,49 @@ LANG_LABELS = {
     "tr": "튀르키예어", "id": "인도네시아어", "zh_cn": "중국어(간체)", "th": "태국어",
 }
 
+# 코드 → 로케일 표기 (연속 번역 창/로그에서 'en-US' 처럼 보여주기 위한 표시용)
+# 시트 헤더에 적히는 표기와 맞춰, 어떤 열이 어느 로케일인지 눈으로 바로 확인되게 한다.
+LANG_LOCALES = {
+    "ko": "ko-KR", "en": "en-US", "zh_cn": "zh-CN", "th": "th-TH",
+    "es": "es-ES", "es_la": "es-419", "de": "de-DE", "fr": "fr-FR",
+    "id": "id-ID", "tr": "tr-TR", "pt": "pt-BR",
+}
+
+# 연속 번역 기본 순서 — 실제 운영에서 쓰는 로케일 순서.
+# ko 는 번역 프롬프트가 없고(원본이 한국어) '원본 복사' 단계로만 쓰인다.
+SEQ_DEFAULT_ORDER = ["ko", "en", "zh_cn", "th", "es", "de", "fr", "id", "tr"]
+
+# 연속 번역 단계 방식
+SEQ_MODE_TRANSLATE = "translate"   # 프롬프트를 써서 AI 번역
+SEQ_MODE_COPY      = "copy"        # AI 호출 없이 입력열 값을 결과열로 그대로 복사
+
+
+def lang_display(code):
+    """'영어 (en-US)' 형태의 표시 문자열. 로케일 표기가 없으면 라벨만."""
+    label = LANG_LABELS.get(code, code)
+    loc = LANG_LOCALES.get(code)
+    return f"{label} ({loc})" if loc else label
+
+
+def seq_lang_choices():
+    """연속 번역 창에 나열할 언어 코드 — 기본 순서 + 폴더에 있는 나머지 프롬프트.
+
+    ko 처럼 프롬프트 파일이 없는 코드도 '원본 복사' 단계로 쓰이므로 포함한다.
+    """
+    out = list(SEQ_DEFAULT_ORDER)
+    for lang in list_prompt_langs():
+        if lang not in out:
+            out.append(lang)
+    return out
+
+
+def has_prompt(lang):
+    """해당 언어의 번역 프롬프트 파일이 존재하는가 (AI 번역 가능 여부)."""
+    if not lang:
+        return False
+    return os.path.exists(os.path.join(PROMPTS_DIR, f"{lang}.txt"))
+
+
 # ── 작업 모드 (번역 / 검수) ──────────────────────────────────────────────────
 
 WORK_MODE_LABELS = {
@@ -374,6 +417,30 @@ def next_col_letter(col):
     return idx_to_col(col_to_idx(col) + 1)
 
 
+def get_note_col():
+    """특이사항(비고) 열 문자를 반환한다.
+
+    config.NOTE_COL 이 지정돼 있으면 그 열, 비어 있으면 '결과열 바로 다음 열'.
+    기본 배치(결과 D → 특이사항 E)가 그대로 유지되며, 연속 번역처럼 결과열이
+    언어마다 다를 때도 각 결과열에 붙은 특이사항 열을 자동으로 따라간다.
+    """
+    col = (getattr(config, "NOTE_COL", "") or "").strip().upper()
+    if col:
+        return col
+    return next_col_letter(getattr(config, "RESULT_COL", "D"))
+
+
+def is_korean_target():
+    """지금 번역 대상 언어가 한국어인가.
+
+    한국어로 번역하는 단계에서는 결과에 한글이 있는 것이 정상이므로,
+    '한글 포함' 감지·재번역·표시를 모두 끈다. (검수 모드는 해당 없음)
+    """
+    if getattr(config, "WORK_MODE", "translate") in REVIEW_MODES:
+        return False
+    return (getattr(config, "PROMPT_LANG", "") or "").lower().startswith("ko")
+
+
 def get_col_roles():
     """config에서 열 역할 설정 반환 [(col_idx, role), ...] 순서 보장"""
     roles = []
@@ -461,9 +528,10 @@ def write_results(sheet, start_row, results):
 
 
 def write_status(sheet, row_num, status_text):
-    """E열에 상태 텍스트 기입"""
+    """특이사항 열에 상태 텍스트 기입 (기본: 결과열 바로 다음 열)"""
+    note_col = get_note_col()
     try:
-        sheet.update(f"E{row_num}", [[status_text]])
+        sheet.update(f"{note_col}{row_num}", [[status_text]])
     except Exception as e:
         print(f"  ❌ 상태 기입 실패: {e}")
 
@@ -942,7 +1010,7 @@ def write_review_notes(sheet, start_row, notes):
 
     빈 비고(응답 누락 행)는 건드리지 않는다. 결과열이 D면 비고는 E에 들어간다.
     """
-    note_col = next_col_letter(getattr(config, "RESULT_COL", "D"))
+    note_col = get_note_col()
     updates = [
         {"range": f"{note_col}{start_row + i}", "values": [[n]]}
         for i, n in enumerate(notes) if n
@@ -1478,7 +1546,8 @@ def main():
                                 f"응답 행 ID 누락 ({len(missing)}행)")
 
                 # ── 한글 감지 및 재번역 ────────────────────────
-                korean_idxs = filter_korean_lines(lines)
+                # 한국어로 번역하는 단계에서는 한글이 정상이므로 감지·재번역을 끈다
+                korean_idxs = [] if is_korean_target() else filter_korean_lines(lines)
                 if korean_idxs:
                     print(f"  ⚠️ 한글 감지 ({len(korean_idxs)}행) — 재번역 요청 중...")
                     retry_batch = [masked_batch[i] for i in korean_idxs if i < len(masked_batch)]

@@ -33,10 +33,13 @@ from main import (
     is_empty, col_to_idx,
     list_prompt_langs, load_prompt, load_review_prompt, ensure_external_prompts,
     parse_review_verdict, write_review_notes, next_col_letter,
+    get_note_col, is_korean_target,
     find_chrome,
     extract_spreadsheet_id, get_service_account_email, test_connection,
     check_logged_in, PROMPTS_DIR, LANG_LABELS,
     WORK_MODE_LABELS, REVIEW_MODES, REVIEW_LANGS,
+    LANG_LOCALES, SEQ_DEFAULT_ORDER, SEQ_MODE_TRANSLATE, SEQ_MODE_COPY,
+    lang_display, seq_lang_choices, has_prompt, idx_to_col,
 )
 import config
 
@@ -63,6 +66,16 @@ if not hasattr(config, "REVIEW_SRC_LANG"):
     config.REVIEW_SRC_LANG = "ko"
 if not hasattr(config, "REVIEW_TGT_LANG"):
     config.REVIEW_TGT_LANG = "es"
+
+# 특이사항(비고) 열 — 비우면 '결과열 바로 다음 열'을 자동으로 쓴다 (기본 D→E)
+if not hasattr(config, "NOTE_COL"):
+    config.NOTE_COL = ""
+
+# 연속 번역 계획 (언어 순서 + 언어별 결과열/특이사항열)
+if not hasattr(config, "SEQ_JOBS"):
+    config.SEQ_JOBS = []
+if not hasattr(config, "SEQ_COPY_FROM"):
+    config.SEQ_COPY_FROM = "auto"
 
 
 # ── 모드별 열 역할 프리셋 ────────────────────────────────────────────────────
@@ -128,7 +141,8 @@ SETTINGS_FILE = paths.app_path("settings.json")
 
 # ── 플레이스홀더 검증 유틸 ───────────────────────────────────────────────────
 # 검증 함수(extract_placeholders/check_placeholder_match/filter_placeholder_mismatch)와
-# E열 상태 문구(PH_MISMATCH_MARK 등)는 main.py 에서 import — UI·CLI 단일 소스.
+# 특이사항열 상태 문구(PH_MISMATCH_MARK 등)는 main.py 에서 import — UI·CLI 단일 소스.
+# 특이사항열 자체는 main.get_note_col() 이 결정한다 (기본: 결과열 바로 다음 열).
 
 
 def get_placeholder_col_letter():
@@ -152,21 +166,27 @@ def _clear_cells(sheet, ranges):
         try:
             sheet.batch_update([{"range": r, "values": [[""]]} for r in ranges])
         except Exception as e:
-            print(f"  ❌ E열 정리 실패: {e}")
+            print(f"  ❌ 특이사항열 정리 실패: {e}")
 
 
 def reconcile_status(sheet, start_row, lines, sources=None):
-    """배치 전체의 E열 상태(한글 포함 / 플레이스홀더 불일치)를 최종 결과 기준으로 정리한다.
+    """배치 전체의 특이사항열 상태(한글 포함 / 플레이스홀더 불일치)를 최종 결과 기준으로 정리한다.
+
+    특이사항열은 get_note_col() 이 결정한다 — 기본은 '결과열 바로 다음 열'이므로
+    결과 D → 특이사항 E 이고, 연속 번역처럼 결과열이 언어마다 달라도 각 결과열에
+    붙은 특이사항 열을 따라간다.
 
     각 행의 실제 번역 결과(lines)를 다시 검사해서:
-      - 플레이스홀더 불일치 → E열에 '플레이스홀더 불일치'
-      - (불일치 아님) 한글 포함 → E열에 '한글 포함'
+      - 플레이스홀더 불일치 → 특이사항열에 '플레이스홀더 불일치'
+      - (불일치 아님) 한글 포함 → 특이사항열에 '한글 포함'
       - 둘 다 정상     → 자동 표시(MANAGED_MARKS)가 남아있으면 셀을 완전히 비움
     사용자가 직접 적은 다른 메모는 건드리지 않는다.
     sources(플레이스홀더 컬럼 값)가 None이면 플레이스홀더 검사는 건너뛰고 한글만 본다.
     이때 기존 '플레이스홀더 불일치' 표시는 검증하지 않았으므로 지우지도 덮지도 않는다.
+    한국어로 번역하는 단계(is_korean_target)에서는 한글이 정상이라 한글 검사를 끈다.
 
-    현재 E열을 1회 읽고, 기입이 필요한 셀은 batch_update로, 비울 셀은 batch_clear로 처리한다.
+    현재 특이사항열을 1회 읽고, 기입이 필요한 셀은 batch_update로, 비울 셀은
+    batch_clear로 처리한다.
     반환: (mismatch_rows, korean_rows, cleared_rows) — 각각 행 번호 리스트
     """
     from main import has_korean
@@ -175,9 +195,11 @@ def reconcile_status(sheet, start_row, lines, sources=None):
     if count <= 0:
         return [], [], []
 
+    note_col = get_note_col()
+    check_ko = not is_korean_target()
     end_row = start_row + count - 1
     try:
-        cur = sheet.get(f"E{start_row}:E{end_row}")
+        cur = sheet.get(f"{note_col}{start_row}:{note_col}{end_row}")
     except Exception:
         cur = []
 
@@ -206,7 +228,7 @@ def reconcile_status(sheet, start_row, lines, sources=None):
         if i in ph_mismatch:
             mismatch_rows.append(row_num)
             desired = PH_MISMATCH_MARK
-        elif has_korean(lines[i] if i < len(lines) else ""):
+        elif check_ko and has_korean(lines[i] if i < len(lines) else ""):
             korean_rows.append(row_num)
             desired = KOREAN_MARK
         else:
@@ -215,18 +237,18 @@ def reconcile_status(sheet, start_row, lines, sources=None):
         if desired:
             # 빈칸이거나 우리가 관리하는 표시일 때만 갱신 (사용자 메모 보존)
             if e_val != desired and (e_val == "" or e_val in MANAGED_MARKS):
-                updates.append({"range": f"E{row_num}", "values": [[desired]]})
+                updates.append({"range": f"{note_col}{row_num}", "values": [[desired]]})
         else:
             # 정상 → 자동 표시가 남아있으면 셀을 완전히 비움
             if e_val in MANAGED_MARKS:
-                clears.append(f"E{row_num}")
+                clears.append(f"{note_col}{row_num}")
                 cleared_rows.append(row_num)
 
     if updates:
         try:
             sheet.batch_update(updates)
         except Exception as e:
-            print(f"  ❌ E열 상태 기입 실패: {e}")
+            print(f"  ❌ 특이사항열 상태 기입 실패: {e}")
     _clear_cells(sheet, clears)
 
     return mismatch_rows, korean_rows, cleared_rows
@@ -237,10 +259,11 @@ def audit_completed_rows(sheet, do_repair=True):
 
     이미 기입된 과거 실행분(검증이 뚫려 있던 버전 산출물 포함)까지 소급 검사:
       - 플레이스홀더 불일치 → 가능하면 로컬 복구해 결과열을 바로 고쳐 쓰고,
-        복구 불가면 E열에 '플레이스홀더 불일치' 표시
-      - (플레이스홀더 정상) 한글 포함 → E열 '한글 포함'
+        복구 불가면 특이사항열에 '플레이스홀더 불일치' 표시
+      - (플레이스홀더 정상) 한글 포함 → 특이사항열 '한글 포함'
       - 정상인데 자동 표시가 남아 있으면 표시 제거
-    사용자가 직접 적은 E열 메모는 건드리지 않는다.
+    특이사항열은 get_note_col() 이 결정한다 (기본: 결과열 바로 다음 열).
+    사용자가 직접 적은 특이사항열 메모는 건드리지 않는다.
     플레이스홀더 원본열이 미설정이면 관련 표시는 지우지도 덮지도 않는다.
 
     반환(dict): {
@@ -256,7 +279,7 @@ def audit_completed_rows(sheet, do_repair=True):
     from main import has_korean
 
     result = {
-        "ok": True, "error": None, "ph_col": None, "checked": 0,
+        "ok": True, "error": None, "ph_col": None, "note_col": None, "checked": 0,
         "repaired": [], "flagged_ph": [], "flagged_ko": [],
         "cleared": [], "unverifiable": [],
     }
@@ -270,11 +293,14 @@ def audit_completed_rows(sheet, do_repair=True):
 
     result_col = getattr(config, "RESULT_COL", "D")
     result_idx = col_to_idx(result_col)
-    e_idx = col_to_idx("E")
+    note_col = get_note_col()
+    e_idx = col_to_idx(note_col)
+    check_ko = not is_korean_target()   # 한국어 번역 단계에선 한글이 정상
     ph_col = get_placeholder_col_letter()                 # 'A'/'B'/'C' 또는 None
     ph_idx = col_to_idx(ph_col) if ph_col else None
     start = getattr(config, "START_ROW", 1)
     result["ph_col"] = ph_col
+    result["note_col"] = note_col
 
     d_updates, e_updates, clears = [], [], []
     for i, row in enumerate(all_values[start - 1:], start=start):
@@ -301,16 +327,16 @@ def audit_completed_rows(sheet, do_repair=True):
                 else:
                     desired = PH_MISMATCH_MARK
                     result["flagged_ph"].append(i)
-        if not desired and has_korean(d_val):
+        if not desired and check_ko and has_korean(d_val):
             desired = KOREAN_MARK
             result["flagged_ko"].append(i)
 
         if desired:
             # 빈칸이거나 우리가 관리하는 표시일 때만 갱신 (사용자 메모 보존)
             if e_val != desired and (e_val == "" or e_val in MANAGED_MARKS):
-                e_updates.append({"range": f"E{i}", "values": [[desired]]})
+                e_updates.append({"range": f"{note_col}{i}", "values": [[desired]]})
         elif e_val in MANAGED_MARKS:
-            clears.append(f"E{i}")
+            clears.append(f"{note_col}{i}")
             result["cleared"].append(i)
 
     # 셀 단위가 아니라 500셀 묶음으로 일괄 기입 (API 호출 수 최소화)
@@ -325,6 +351,321 @@ def audit_completed_rows(sheet, do_repair=True):
     _clear_cells(sheet, clears)
 
     return result
+
+
+# ── 연속 번역 계획 (여러 언어를 순서대로 자동 실행) ──────────────────────────
+# 계획은 '단계(job)' 목록이다. 단계마다 언어 / 방식 / 결과열 / 특이사항열을 갖는다.
+#   {"lang": "en", "mode": "translate", "result_col": "F", "note_col": "G", "enabled": True}
+# 실행 순서 = 목록 순서(연속 번역 창에서 드래그로 바꿈).
+#
+# 왜 단계마다 특이사항열까지 갖는가:
+#   단일 언어 작업은 결과 D → 특이사항 E 였다. 여러 언어를 한 시트에 붙이면
+#   D/E(ko), F/G(en), H/I(zh-CN) … 처럼 '결과열+특이사항열'이 한 쌍으로 반복된다.
+#   그래서 결과열만 고르게 두면 다음 언어의 결과열이 앞 언어의 특이사항열을
+#   덮어쓴다. 쌍으로 관리하고, 저장 전에 겹침을 전부 검사한다.
+
+COL_RE = re.compile(r"^[A-Z]{1,3}$")
+
+SEQ_MODE_LABELS = {
+    SEQ_MODE_TRANSLATE: "AI 번역",
+    SEQ_MODE_COPY:      "원본 복사",
+}
+
+# '원본 복사' 단계가 가져올 입력열 역할
+SEQ_COPY_FROM_LABELS = {
+    "auto":        "자동 (번역대상 열 → 없으면 원본 열)",
+    "placeholder": "플레이스홀더(번역대상) 열",
+    "source":      "원본 열",
+    "ref":         "참조 열",
+}
+
+
+def _role_col_letter(role):
+    """COL_A/B/C_ROLE 중 주어진 역할이 지정된 열 문자. 없으면 None."""
+    for col_letter, attr in [("A", "COL_A_ROLE"), ("B", "COL_B_ROLE"), ("C", "COL_C_ROLE")]:
+        if getattr(config, attr, None) == role:
+            return col_letter
+    return None
+
+
+def seq_copy_source_role():
+    """'원본 복사' 단계가 실제로 읽을 입력열 역할을 결정한다.
+
+    설정이 "auto" 면 번역 대상 열(placeholder)을 우선하고, 지정돼 있지 않으면
+    원본(source) 열로 떨어진다. 번역 결과열에 들어가는 것과 같은 텍스트를
+    복사하기 위한 규칙이다. 반환: (role, 열문자) — 쓸 열이 없으면 (None, None)
+    """
+    want = (getattr(config, "SEQ_COPY_FROM", "auto") or "auto").lower()
+    order = [want] if want in ("placeholder", "source", "ref") else ["placeholder", "source"]
+    for role in order:
+        col = _role_col_letter(role)
+        if col:
+            return role, col
+    return None, None
+
+
+def default_seq_jobs():
+    """기본 연속 번역 계획 — 요청 순서(ko-KR → … → tr-TR), 결과열+특이사항열 쌍 자동 배치.
+
+    시작 열은 현재 번역 모드의 결과열(기본 D) → ko D/E, en F/G, zh-CN H/I …
+    ko 는 번역 프롬프트가 없으므로(원본이 한국어) '원본 복사' 단계로 둔다.
+    기본 순서에 없지만 프롬프트가 있는 언어(pt 등)도 목록엔 넣고 '꺼진 상태'로
+    뒤에 붙인다 — 창에서 체크만 하면 바로 쓸 수 있게.
+    """
+    start = getattr(config, "RESULT_COL", "D") or "D"
+    extras = [l for l in seq_lang_choices() if l not in SEQ_DEFAULT_ORDER]
+    jobs = []
+    idx = col_to_idx(start)
+    for lang in list(SEQ_DEFAULT_ORDER) + extras:
+        jobs.append({
+            "lang": lang,
+            "mode": SEQ_MODE_TRANSLATE if has_prompt(lang) else SEQ_MODE_COPY,
+            "result_col": idx_to_col(idx),
+            "note_col": idx_to_col(idx + 1),
+            "enabled": lang in SEQ_DEFAULT_ORDER,
+        })
+        idx += 2
+    return jobs
+
+
+def normalize_seq_jobs(raw):
+    """저장값(settings.json)을 화면에서 쓸 수 있는 계획으로 정리한다.
+
+    - 알 수 없는 언어 코드는 버린다
+    - 프롬프트가 없는 언어는 방식을 '원본 복사'로 강제한다 (AI 번역 불가)
+    - 빠진 열은 결과열/그 다음 열로 채운다
+    - 목록에 없는 선택 가능 언어는 '꺼진 상태'로 뒤에 덧붙인다 (나중에 켤 수 있게)
+    """
+    choices = seq_lang_choices()
+    out, seen = [], set()
+    for j in (raw or []):
+        if not isinstance(j, dict):
+            continue
+        lang = j.get("lang")
+        if lang not in choices or lang in seen:
+            continue
+        seen.add(lang)
+        res = str(j.get("result_col") or "").strip().upper()
+        if not COL_RE.match(res):
+            res = getattr(config, "RESULT_COL", "D") or "D"
+        note = str(j.get("note_col") or "").strip().upper()
+        if not COL_RE.match(note):
+            note = next_col_letter(res)
+        mode = j.get("mode") or SEQ_MODE_TRANSLATE
+        if mode not in (SEQ_MODE_TRANSLATE, SEQ_MODE_COPY) or not has_prompt(lang):
+            mode = SEQ_MODE_TRANSLATE if has_prompt(lang) else SEQ_MODE_COPY
+        out.append({
+            "lang": lang, "mode": mode, "result_col": res, "note_col": note,
+            "enabled": bool(j.get("enabled", True)),
+        })
+    if not out:
+        return default_seq_jobs()
+    # 저장 당시엔 없던 언어(프롬프트 추가 등)를 꺼진 상태로 뒤에 붙인다
+    used = {c for j in out for c in (j["result_col"], j["note_col"])}
+    idx = max(col_to_idx(c) for c in used) + 1
+    for lang in choices:
+        if lang in seen:
+            continue
+        out.append({
+            "lang": lang,
+            "mode": SEQ_MODE_TRANSLATE if has_prompt(lang) else SEQ_MODE_COPY,
+            "result_col": idx_to_col(idx),
+            "note_col": idx_to_col(idx + 1),
+            "enabled": False,
+        })
+        idx += 2
+    return out
+
+
+def get_seq_jobs():
+    """현재 연속 번역 계획 (settings.json 저장분 → 없으면 기본값)."""
+    return normalize_seq_jobs(getattr(config, "SEQ_JOBS", None))
+
+
+def validate_seq_jobs(jobs):
+    """계획을 검사해 문제 문구를 반환한다. 문제가 없으면 None.
+
+    막아야 하는 사고:
+      - 열 문자가 아닌 값
+      - 결과열과 특이사항열이 같음 → 번역 결과를 특이사항이 덮어씀
+      - 서로 다른 단계가 같은 열을 씀 → 앞 언어 결과/특이사항이 날아감
+      - 입력열(원본/참조/플레이스홀더)을 결과열·특이사항열로 씀 → 원문 파괴
+    """
+    on = [j for j in jobs if j.get("enabled")]
+    if not on:
+        return "연속 번역할 언어를 하나 이상 선택해주세요."
+
+    input_cols = {}
+    for col_letter, attr in [("A", "COL_A_ROLE"), ("B", "COL_B_ROLE"), ("C", "COL_C_ROLE")]:
+        role = getattr(config, attr, None)
+        if role:
+            input_cols[col_letter] = role
+    role_labels = {"source": "원본", "ref": "참조", "placeholder": "플레이스홀더",
+                   "category": "카테고리", "review": "검수대상"}
+
+    owner = {}
+    for j in on:
+        name = lang_display(j["lang"])
+        res = (j.get("result_col") or "").strip().upper()
+        note = (j.get("note_col") or "").strip().upper()
+        for label, col in (("결과열", res), ("특이사항열", note)):
+            if not COL_RE.match(col):
+                return f"{name}의 {label} 값이 올바르지 않습니다: '{col}'\n열 문자(A, B, ... AA)로 입력해주세요."
+            if col in input_cols:
+                return (f"{name}의 {label}이 입력열 {col}"
+                        f"({role_labels.get(input_cols[col], input_cols[col])})과 겹칩니다.\n"
+                        f"원문이 지워지므로 다른 열을 지정해주세요.")
+        if res == note:
+            return f"{name}의 결과열과 특이사항열이 같습니다 ({res}).\n서로 다른 열을 지정해주세요."
+        for label, col in (("결과열", res), ("특이사항열", note)):
+            if col in owner:
+                prev_name, prev_label = owner[col]
+                return (f"{col}열이 두 번 쓰였습니다.\n"
+                        f"· {prev_name} {prev_label}\n· {name} {label}\n"
+                        f"앞 언어의 결과가 덮어써지므로 겹치지 않게 지정해주세요.")
+            owner[col] = (name, label)
+
+    if getattr(config, "SEQ_COPY_FROM", "auto"):
+        if any(j["mode"] == SEQ_MODE_COPY for j in on) and seq_copy_source_role()[0] is None:
+            return ("'원본 복사' 단계가 있는데 복사할 입력열이 없습니다.\n"
+                    "설정(⚙) → 열 설정에서 원본 또는 플레이스홀더 열을 지정해주세요.")
+    return None
+
+
+# ── 원본 복사 단계 (AI 호출 없음) ────────────────────────────────────────────
+
+
+class CopyWorker(threading.Thread):
+    """입력열 값을 결과열로 그대로 복사하는 단계 — ko-KR 같은 '원본 유지' 열에 쓴다.
+
+    TranslationWorker 와 같은 인터페이스(log_q / done_callback / stop_flag /
+    pause_flag / _pause_event)를 갖춰, App 의 연속 번역 진행 로직이 두 워커를
+    구분 없이 다룰 수 있게 한다. AI 를 거치지 않으므로 플레이스홀더 검증·한글
+    감지·특이사항 표시는 모두 하지 않는다 (원문과 100% 동일하므로 검사 대상이 아님).
+    """
+
+    CHUNK = 500   # Sheets batch_update 1회당 셀 수
+
+    def __init__(self, log_q, done_callback):
+        super().__init__(daemon=True)
+        self.log_q = log_q
+        self.done_callback = done_callback
+        self.stop_flag = False
+        self.pause_flag = False
+        self.force_new_conv = False
+        self._pause_event = threading.Event()
+        self._pause_event.set()
+
+    # TranslationWorker 와 동일한 로그/진행 인터페이스
+    def log(self, msg, tag="info"):
+        now = datetime.now().strftime("%H:%M:%S")
+        self.log_q.put(("log", f"[{now}] {msg}", tag))
+
+    def progress(self, cur, total):
+        self.log_q.put(("progress", (cur, total)))
+
+    def status(self, text, color="#9ece6a"):
+        self.log_q.put(("status", (text, color)))
+
+    def waiting(self, msg):
+        self.log_q.put(("waiting", msg))
+
+    def done_waiting(self):
+        self.log_q.put(("done_waiting", None))
+
+    def pause(self):
+        self.pause_flag = True
+        self._pause_event.clear()
+
+    def resume(self):
+        self.pause_flag = False
+        self._pause_event.set()
+
+    def run(self):
+        processed = 0
+        total = 0
+        try:
+            # 이번 단계의 결과만 요약에 보이도록 이전 실패 기록을 초기화한다
+            try:
+                if os.path.exists(FAIL_LOG):
+                    os.remove(FAIL_LOG)
+            except Exception:
+                pass
+            role, src_col = seq_copy_source_role()
+            result_col = getattr(config, "RESULT_COL", "D")
+            if not src_col:
+                self.log("❌ 복사할 입력열이 없습니다 — 설정에서 원본/플레이스홀더 열을 지정해주세요.",
+                         "error")
+                self.status("오류", "#f7768e")
+                return
+            role_label = {"source": "원본", "placeholder": "플레이스홀더(번역대상)",
+                          "ref": "참조"}.get(role, role)
+            self.log(f"원본 복사: {src_col}열({role_label}) → {result_col}열 "
+                     f"(AI 호출 없음)", "info")
+
+            self.status("Google Sheets 연결 중...", "#e0af68")
+            sheet = get_sheet()
+
+            self.waiting("복사 대상 행 확인 중")
+            pending = get_pending_rows(sheet)
+            self.done_waiting()
+            if not pending:
+                self.log("복사 대상 행이 없습니다 (결과열이 이미 채워져 있음).", "warn")
+                self.log_q.put(("empty", None))
+                return
+
+            # get_pending_rows 반환 튜플: (행, source, ref, placeholder, category, review)
+            slot = {"source": 1, "ref": 2, "placeholder": 3}[role]
+            total = len(pending)
+            self.progress(0, total)
+            self.log(f"총 {total}행 복사 예정", "success")
+
+            updates = []
+            for row in pending:
+                val = row[slot] or ""
+                if not val:
+                    continue   # 빈 원본은 건드리지 않는다 (재실행 시 다시 대상이 됨)
+                updates.append({"range": f"{result_col}{row[0]}", "values": [[val]]})
+
+            if not updates:
+                self.log(f"⚠️ {src_col}열이 비어 있어 복사할 내용이 없습니다.", "warn")
+                return
+
+            self.status("복사 중...", "#9ece6a")
+            for k in range(0, len(updates), self.CHUNK):
+                if self.stop_flag:
+                    break
+                chunk = updates[k:k + self.CHUNK]
+                self.waiting(f"{result_col}열 기입 중 · {k + len(chunk)}/{len(updates)}행")
+                sheet.batch_update(chunk)
+                self.done_waiting()
+                processed += len(chunk)
+                self.progress(processed, total)
+                self._pause_event.wait()
+
+            if self.stop_flag:
+                self.log(f"⏹ 중지 — {processed}행 복사됨", "warn")
+                self.status("중지됨", "#e0af68")
+            else:
+                self.log(f"🎉 복사 완료! {processed}행 ({src_col}열 → {result_col}열)", "success")
+                self.status("완료", "#9ece6a")
+
+        except Exception as e:
+            msg = str(e).split("\n")[0][:120]
+            self.log(f"❌ 복사 실패: {msg}", "error")
+            self.status("오류", "#f7768e")
+            try:
+                with open(FAIL_LOG, "a", encoding="utf-8") as f:
+                    f.write(f"원본 복사 실패 — {msg}\n")
+            except Exception:
+                pass
+        finally:
+            self.done_waiting()
+            fail_lines = []
+            if os.path.exists(FAIL_LOG):
+                with open(FAIL_LOG, "r", encoding="utf-8") as f:
+                    fail_lines = [l.strip() for l in f if l.strip()]
+            self.done_callback(processed, total, fail_lines)
 
 
 # ── 번역 엔진 (스레드) ────────────────────────────────────────────────────────
@@ -402,10 +743,10 @@ class TranslationWorker(threading.Thread):
                 f"{_preview(au['repaired'])}행", "success")
         if au["flagged_ph"]:
             self.log(
-                f"  📌 플레이스홀더 불일치(복구 불가, E열 표시): "
+                f"  📌 플레이스홀더 불일치(복구 불가, {au['note_col']}열 표시): "
                 f"{_preview(au['flagged_ph'])}행", "warn")
         if au["flagged_ko"]:
-            self.log(f"  📌 한글 포함(E열 표시): {_preview(au['flagged_ko'])}행", "warn")
+            self.log(f"  📌 한글 포함({au['note_col']}열 표시): {_preview(au['flagged_ko'])}행", "warn")
         if au["cleared"]:
             self.log(f"  🧹 정리(이제 정상): {_preview(au['cleared'])}행", "success")
         if au["unverifiable"]:
@@ -449,16 +790,22 @@ class TranslationWorker(threading.Thread):
                 f"({LANG_LABELS.get(src, src)} → {LANG_LABELS.get(tgt, tgt)})",
                 "info")
         else:
-            self.log("작업 모드: 번역", "info")
+            _lang = getattr(config, "PROMPT_LANG", "")
+            self.log(f"작업 모드: 번역 · {lang_display(_lang)}", "info")
+            self.log(
+                f"기입 열: 번역 결과 {getattr(config, 'RESULT_COL', 'D')}열 · "
+                f"특이사항 {get_note_col()}열", "info")
+            if is_korean_target():
+                self.log("대상 언어가 한국어 — '한글 포함' 감지·재번역·표시를 끕니다.", "info")
             # 플레이스홀더 검증 가능 여부를 실행 시작 시점에 명확히 알린다
             # (조건이 안 맞아 검증이 조용히 생략되는 일이 없도록)
             if get_placeholder_col_letter() is None:
                 self.log(
                     "⚠️ 열 역할에 '플레이스홀더'가 지정돼 있지 않아 "
-                    "플레이스홀더 검증(E열 불일치 표시)을 할 수 없습니다.", "warn")
+                    f"플레이스홀더 검증({get_note_col()}열 불일치 표시)을 할 수 없습니다.", "warn")
             elif not getattr(config, "PRESERVE_PLACEHOLDERS", True):
                 self.log(
-                    "플레이스홀더 검증: 켜짐 (불일치 시 E열 표시) · "
+                    f"플레이스홀더 검증: 켜짐 (불일치 시 {get_note_col()}열 표시) · "
                     "자동 재번역: 꺼짐", "info")
 
         processed = 0
@@ -558,9 +905,9 @@ class TranslationWorker(threading.Thread):
                     # ── 완료 행 전수 검증 (번역 모드 전용, 실행당 1회) ─────
                     # 결과열이 이미 채워진 모든 행을 검사한다. 과거 실행분(예전
                     # 버전에서 검증 없이 기입된 행)의 훼손도 여기서 발견되어,
-                    # 가능하면 로컬 복구로 결과열을 바로 고치고 아니면 E열에 표시.
+                    # 가능하면 로컬 복구로 결과열을 바로 고치고 아니면 특이사항열에 표시.
                     # 실행 중 새로 기입되는 행은 reconcile_status 가 즉시 관리한다.
-                    # 검수 모드는 E열 자동 표시를 쓰지 않으므로 건너뛴다.
+                    # 검수 모드는 특이사항열 자동 표시를 쓰지 않으므로 건너뛴다.
                     if not is_review and not e_sweep_done:
                         e_sweep_done = True
                         self.audit_completed(sheet)
@@ -653,7 +1000,9 @@ class TranslationWorker(threading.Thread):
                     # ── 한글 감지 → 1회 즉시 재시도 (번역 모드 전용) ──
                     # 검수 모드는 결과에 한국어 사유가 포함되는 것이 정상이므로 검사하지 않는다.
                     from main import has_korean, filter_korean_lines
-                    korean_idxs = [] if is_review else filter_korean_lines(lines)
+                    # 한국어로 번역하는 단계에선 한글이 정상 → 감지·재번역을 끈다
+                    korean_idxs = ([] if (is_review or is_korean_target())
+                                   else filter_korean_lines(lines))
                     if korean_idxs:
                         self.log(f"⚠️ 한글 감지 ({len(korean_idxs)}행) — 재번역 시도...", "warn")
                         retry_batch = [masked_batch[i] for i in korean_idxs if i < len(masked_batch)]
@@ -678,14 +1027,14 @@ class TranslationWorker(threading.Thread):
                                 if j < len(retry_lines) and idx < len(lines):
                                     if retry_lines[j]:
                                         lines[idx] = retry_lines[j]
-                        # (E열 '한글 포함' 표시/정리는 아래 reconcile_status에서 일괄 처리)
+                        # (특이사항열 '한글 포함' 표시/정리는 아래 reconcile_status에서 일괄 처리)
 
                     # ── 플레이스홀더 검증 (번역 모드 전용) ─────────────────
                     # 검수 모드의 결과는 번역문이 아니라 판정 텍스트라 검증 대상이 아니다.
                     # 원본은 시트를 다시 읽지 않고 배치가 이미 들고 있는
                     # placeholder 역할 열 값을 쓴다 — 시트 재읽기가 실패하면
                     # 빈 값과 비교돼 훼손이 '일치'로 조용히 통과하던 문제 제거.
-                    # 검증과 E열 표시는 항상 수행하고, PRESERVE_PLACEHOLDERS 는
+                    # 검증과 특이사항열 표시는 항상 수행하고, PRESERVE_PLACEHOLDERS 는
                     # '불일치 시 자동 재번역'만 켜고 끈다.
                     if not is_review and get_placeholder_col_letter():
                         ph_sources = batch_placeholder_sources(batch)
@@ -706,7 +1055,7 @@ class TranslationWorker(threading.Thread):
                         if ph_idxs and not getattr(config, "PRESERVE_PLACEHOLDERS", True):
                             self.log(
                                 f"⚠️ 플레이스홀더 불일치 감지 ({len(ph_idxs)}행) — "
-                                "자동 재번역이 꺼져 있어 E열 표시만 합니다.", "warn")
+                                f"자동 재번역이 꺼져 있어 {get_note_col()}열 표시만 합니다.", "warn")
                         elif ph_idxs:
                             self.log(f"⚠️ 플레이스홀더 불일치 감지 ({len(ph_idxs)}행) — 재번역 시도...", "warn")
 
@@ -759,20 +1108,21 @@ class TranslationWorker(threading.Thread):
                                         f"🔧 재번역 결과 로컬 복구 {len(fixed2)}행: {rows_txt}",
                                         "success")
 
-                    # ── E열 상태 최종 정리 (번역 모드 전용) ───────────
+                    # ── 특이사항열 상태 최종 정리 (번역 모드 전용) ───────────
                     # 최종 결과(lines)를 다시 검사해 불일치/한글은 표시하고,
                     # 정상이 된 행에 남아있던 자동 표시는 셀을 완전히 비운다.
                     # 검수 모드 결과(OK/수정 제안)에는 해당 없음.
                     if not is_review:
+                        _note_col = get_note_col()
                         mismatch_rows, korean_rows, cleared_rows = reconcile_status(
                             sheet, s_row, lines, ph_sources
                         )
                         for r in mismatch_rows:
-                            self.log(f"📝 {r}행 → 플레이스홀더 불일치, E열: 플레이스홀더 불일치", "warn")
+                            self.log(f"📝 {r}행 → 플레이스홀더 불일치, {_note_col}열: 플레이스홀더 불일치", "warn")
                         for r in korean_rows:
-                            self.log(f"📝 {r}행 → 한글 포함, E열: 한글 포함", "warn")
+                            self.log(f"📝 {r}행 → 한글 포함, {_note_col}열: 한글 포함", "warn")
                         for r in cleared_rows:
-                            self.log(f"🧹 {r}행 → 정상, E열 표시 제거", "success")
+                            self.log(f"🧹 {r}행 → 정상, {_note_col}열 표시 제거", "success")
 
                     # ── 검수 모드: 판정 파싱 → 결과열엔 최종 단어, 비고열엔 판정 ──
                     # OK        → 결과열: 기존 번역 그대로 / 비고열: OK
@@ -1026,6 +1376,15 @@ def validate_config_values(d):
         if not re.fullmatch(r"[A-Za-z]+", rc):
             return "'번역 결과 기입'은 열 문자만 입력하세요. (예: A, B, C, D, AA)"
 
+    # 특이사항열은 비워둘 수 있다 (= 결과열 바로 다음 열 자동)
+    if "NOTE_COL" in d:
+        nc = str(d["NOTE_COL"]).strip()
+        if nc:
+            if not re.fullmatch(r"[A-Za-z]+", nc):
+                return "'특이사항 기입'은 열 문자만 입력하세요. (비우면 결과열 다음 열)"
+            if "RESULT_COL" in d and nc.upper() == str(d["RESULT_COL"]).strip().upper():
+                return "'특이사항 기입' 열이 '번역 결과 기입' 열과 같습니다. 다른 열을 지정하세요."
+
     return None
 
 
@@ -1221,7 +1580,7 @@ class SettingsDialog(ctk.CTkToplevel):
         ).pack(anchor="w", padx=4)
         ctk.CTkLabel(
             ph_frame,
-            text="  · «T:내용» 토큰이 원본과 동일한지 검사해 불일치 행을 E열에 표시하는 것은 항상 수행\n"
+            text="  · «T:내용» 토큰이 원본과 동일한지 검사해 불일치 행을 특이사항열에 표시하는 것은 항상 수행\n"
                  "  · 이 옵션은 불일치 발견 시 같은 대화에서 1회 자동 재번역을 시도할지만 결정",
             text_color="#888",
             font=ctk.CTkFont(size=11)
@@ -1305,6 +1664,17 @@ class SettingsDialog(ctk.CTkToplevel):
         self.v_result_col = tk.StringVar(value=getattr(config, "RESULT_COL", "D"))
         ctk.CTkEntry(res_f, textvariable=self.v_result_col, width=60).pack(side="left", padx=4)
         ctk.CTkLabel(res_f, text="(결과를 적을 열 문자: A, B, C, D ...)",
+                     text_color="#888", font=ctk.CTkFont(size=11)).pack(side="left", padx=4)
+
+        # 특이사항열 — 비우면 결과열 바로 다음 열 (기본 배치 D → E)
+        note_f = ctk.CTkFrame(col_frame, fg_color="transparent")
+        note_f.pack(fill="x", pady=(4, 0))
+        ctk.CTkLabel(note_f, text="특이사항 기입", width=90, anchor="w").pack(side="left")
+        self.v_note_col = tk.StringVar(value=getattr(config, "NOTE_COL", ""))
+        ctk.CTkEntry(note_f, textvariable=self.v_note_col, width=60,
+                     placeholder_text="자동").pack(side="left", padx=4)
+        ctk.CTkLabel(note_f,
+                     text=f"(비우면 결과열 바로 다음 열 = 현재 {get_note_col()}열)",
                      text_color="#888", font=ctk.CTkFont(size=11)).pack(side="left", padx=4)
         if is_review_mode:
             _rc = getattr(config, "RESULT_COL", "D")
@@ -1437,6 +1807,7 @@ class SettingsDialog(ctk.CTkToplevel):
             "RESPONSE_POLL_INTERVAL": self.v_poll.get(),
             "RESPONSE_DONE_DELAY": self.v_done.get(),
             "RESULT_COL": self.v_result_col.get().strip(),
+            "NOTE_COL": self.v_note_col.get().strip(),
         }
 
     def _save(self):
@@ -1464,6 +1835,7 @@ class SettingsDialog(ctk.CTkToplevel):
             val = var.get()
             setattr(config, attr, None if val == "None" else val)
         config.RESULT_COL = self.v_result_col.get().strip().upper() or "D"
+        config.NOTE_COL = self.v_note_col.get().strip().upper()   # 빈 값 = 자동(결과열+1)
         ai_mode = (self.v_ai_mode.get() or "chatgpt").lower()
         config.AI_MODE = ai_mode if ai_mode in ("chatgpt", "claude") else "chatgpt"
         config.PROMPT_LANG = self.v_prompt_lang.get()
@@ -1548,6 +1920,380 @@ class LangDialog(ctk.CTkToplevel):
         config.PROMPT_LANG = lang
         save_settings()
         self.status.configure(text=f"현재: {LANG_LABELS.get(lang, lang)} — 저장됨 ✓")
+
+
+# ── 연속 번역 다이얼로그 ─────────────────────────────────────────────────────
+
+
+class SeqDialog(ctk.CTkToplevel):
+    """메인 화면 🗂 버튼 — 여러 언어를 어떤 순서로, 어느 열에 번역할지 정하는 창.
+
+    한 줄이 한 언어(=한 단계)다. 왼쪽 손잡이(⠿)를 잡고 위아래로 끌면 실행 순서가
+    바뀌고, 줄마다 '결과열'과 '특이사항열'을 따로 지정한다.
+
+    드래그 구현 노트:
+      끄는 동안에는 위젯을 절대 파괴/재생성하지 않는다 (마우스 이벤트가 끊기므로).
+      place() 로 y 좌표만 옮겨 미리보기를 주고, 버튼을 놓는 순간에 한 번만
+      데이터 순서를 확정하고 전체를 다시 배치한다.
+    """
+
+    ROW_H = 42          # 한 줄 높이 (드래그 인덱스 계산의 기준)
+    PAD = 3
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("연속 번역 설정")
+        self.geometry("880x740")
+        self.minsize(800, 560)
+        self.grab_set()
+        self.after(50, self.lift)
+        self.configure(fg_color="#f0f7ff")
+
+        self.run_requested = False      # '연속 번역 시작' 으로 닫혔는가
+        self.jobs_to_run = []           # 실행할 단계 목록 (켜진 것만, 순서대로)
+
+        self.items = []                 # 화면 순서 = 실행 순서
+        for j in get_seq_jobs():
+            self.items.append({
+                "lang":    j["lang"],
+                "enabled": tk.BooleanVar(value=j["enabled"]),
+                "mode":    tk.StringVar(value=SEQ_MODE_LABELS[j["mode"]]),
+                "result":  tk.StringVar(value=j["result_col"]),
+                "note":    tk.StringVar(value=j["note_col"]),
+                "row": None, "num": None,
+            })
+
+        self._drag_idx = None
+        self._drag_y0 = 0
+        self._drag_row_y0 = 0
+        self._build()
+
+    # ── 화면 구성 ────────────────────────────────────────────────────────────
+
+    def _build(self):
+        ctk.CTkLabel(self, text="🗂  연속 번역 — 순서와 기입 열",
+                     font=ctk.CTkFont(size=16, weight="bold"),
+                     text_color="#2d3748").pack(anchor="w", padx=24, pady=(18, 2))
+        ctk.CTkLabel(
+            self,
+            text="왼쪽 ⠿ 손잡이를 잡고 위아래로 끌어 실행 순서를 바꾸세요. "
+                 "체크한 언어만 위에서부터 차례로 실행됩니다.",
+            font=ctk.CTkFont(size=12), text_color="#718096",
+            justify="left").pack(anchor="w", padx=24, pady=(0, 10))
+
+        # 머리글 — 아래 줄 위젯의 실제 x 위치에 맞춰 폭을 잡았다
+        head = ctk.CTkFrame(self, fg_color="transparent", height=22)
+        head.pack(fill="x", padx=24)
+        head.pack_propagate(False)
+        for text, w, padx in [("순서", 70, (48, 0)), ("언어", 190, 0),
+                              ("방식", 128, 0), ("번역 결과 열", 112, 0),
+                              ("특이사항 열", 110, 0)]:
+            ctk.CTkLabel(head, text=text, width=w, anchor="w",
+                         font=ctk.CTkFont(size=11, weight="bold"),
+                         text_color="#a0aec0").pack(side="left", padx=padx)
+
+        # 목록 (place 로 배치하므로 높이를 직접 준다)
+        self.scroll = ctk.CTkScrollableFrame(self, fg_color="#ffffff",
+                                             corner_radius=16)
+        self.scroll.pack(fill="both", expand=True, padx=20, pady=(4, 8))
+        self.list_frame = ctk.CTkFrame(self.scroll, fg_color="transparent",
+                                       height=len(self.items) * self.ROW_H)
+        self.list_frame.pack(fill="x", expand=True)
+        self.list_frame.pack_propagate(False)
+
+        for item in self.items:
+            self._make_row(item)
+        self._relayout()
+
+        # 자동 배치 줄
+        auto = ctk.CTkFrame(self, fg_color="transparent")
+        auto.pack(fill="x", padx=24, pady=(0, 4))
+        ctk.CTkLabel(auto, text="자동 배치 시작 열",
+                     font=ctk.CTkFont(size=12),
+                     text_color="#4a5568").pack(side="left")
+        self.v_auto_start = tk.StringVar(
+            value=(self.items[0]["result"].get() if self.items else "D"))
+        ctk.CTkEntry(auto, textvariable=self.v_auto_start, width=56).pack(
+            side="left", padx=6)
+        ctk.CTkButton(auto, text="결과열/특이사항열 두 칸씩 자동 배치", width=230, height=28,
+                      fg_color="#e2e8f0", hover_color="#cbd5e0",
+                      text_color="#2d3748",
+                      command=self._auto_assign).pack(side="left", padx=4)
+        ctk.CTkLabel(auto, text="예: D → ko(D/E) en(F/G) zh-CN(H/I) …",
+                     font=ctk.CTkFont(size=11),
+                     text_color="#a0aec0").pack(side="left", padx=6)
+
+        # 복사 원본 선택
+        cp = ctk.CTkFrame(self, fg_color="transparent")
+        cp.pack(fill="x", padx=24, pady=(2, 4))
+        ctk.CTkLabel(cp, text="'원본 복사' 단계가 가져올 열",
+                     font=ctk.CTkFont(size=12),
+                     text_color="#4a5568").pack(side="left")
+        cur_cp = (getattr(config, "SEQ_COPY_FROM", "auto") or "auto").lower()
+        if cur_cp not in SEQ_COPY_FROM_LABELS:
+            cur_cp = "auto"
+        self._cp_label_to_code = {v: k for k, v in SEQ_COPY_FROM_LABELS.items()}
+        self.v_copy_from = tk.StringVar(value=SEQ_COPY_FROM_LABELS[cur_cp])
+        ctk.CTkOptionMenu(
+            cp, variable=self.v_copy_from,
+            values=list(SEQ_COPY_FROM_LABELS.values()),
+            width=300, height=28, corner_radius=8,
+            font=ctk.CTkFont(size=12),
+            fg_color="#eef2f7", button_color="#e2e8f0",
+            button_hover_color="#cbd5e0", text_color="#2d3748",
+            dropdown_fg_color="#ffffff", dropdown_hover_color="#eef2f7",
+            dropdown_text_color="#2d3748").pack(side="left", padx=8)
+
+        self.hint = ctk.CTkLabel(self, text="", font=ctk.CTkFont(size=12),
+                                 text_color="#718096", justify="left")
+        self.hint.pack(anchor="w", padx=24, pady=(2, 0))
+
+        btns = ctk.CTkFrame(self, fg_color="transparent")
+        btns.pack(fill="x", padx=20, pady=(6, 16))
+        ctk.CTkButton(btns, text="연속 번역 시작", width=150, height=40,
+                      corner_radius=14,
+                      font=ctk.CTkFont(size=13, weight="bold"),
+                      fg_color="#4fd1c5", hover_color="#38b2ac",
+                      text_color="white",
+                      command=self._start).pack(side="right", padx=(8, 0))
+        ctk.CTkButton(btns, text="저장만 하고 닫기", width=130, height=40,
+                      corner_radius=14, font=ctk.CTkFont(size=12),
+                      fg_color="#e2e8f0", hover_color="#cbd5e0",
+                      text_color="#2d3748",
+                      command=self._save_only).pack(side="right")
+        ctk.CTkButton(btns, text="기본값으로", width=100, height=40,
+                      corner_radius=14, font=ctk.CTkFont(size=12),
+                      fg_color="transparent", hover_color="#e2e8f0",
+                      text_color="#718096",
+                      command=self._reset).pack(side="left")
+        self._refresh_hint()
+
+    def _make_row(self, item):
+        """한 언어(한 단계)의 줄 위젯을 만든다. 드래그 중에도 파괴되지 않는다."""
+        lang = item["lang"]
+        # 높이는 생성자에서 못 박는다 — CTk 위젯은 place(height=…) 를 허용하지 않고,
+        # 드래그 중에는 y 좌표만 바꿔 옮기기 때문에 줄 높이가 고정이어야 한다.
+        row = ctk.CTkFrame(self.list_frame, fg_color="#f7fafc", corner_radius=10,
+                           height=self.ROW_H - self.PAD * 2)
+        row.pack_propagate(False)
+        item["row"] = row
+
+        handle = ctk.CTkLabel(row, text="⠿", width=26,
+                              font=ctk.CTkFont(size=16), text_color="#a0aec0",
+                              cursor="hand2")
+        handle.pack(side="left", padx=(8, 2))
+        # 손잡이뿐 아니라 줄 배경/순서 라벨을 잡아도 끌 수 있게 한다
+        for w in (handle, row):
+            w.bind("<ButtonPress-1>", lambda e, it=item: self._drag_start(e, it))
+            w.bind("<B1-Motion>", self._drag_move)
+            w.bind("<ButtonRelease-1>", self._drag_end)
+
+        num = ctk.CTkLabel(row, text="", width=40, anchor="w",
+                           font=ctk.CTkFont(size=12, weight="bold"),
+                           text_color="#4fd1c5")
+        num.pack(side="left")
+        item["num"] = num
+        num.bind("<ButtonPress-1>", lambda e, it=item: self._drag_start(e, it))
+        num.bind("<B1-Motion>", self._drag_move)
+        num.bind("<ButtonRelease-1>", self._drag_end)
+
+        ctk.CTkCheckBox(row, text=lang_display(lang), width=206,
+                        variable=item["enabled"], onvalue=True, offvalue=False,
+                        font=ctk.CTkFont(size=12),
+                        fg_color="#4fd1c5", hover_color="#38b2ac",
+                        text_color="#2d3748",
+                        command=self._on_toggle).pack(side="left", padx=(2, 4))
+
+        # 방식 — 프롬프트가 없는 언어(ko 등)는 '원본 복사'만 가능
+        modes = ([SEQ_MODE_LABELS[SEQ_MODE_TRANSLATE], SEQ_MODE_LABELS[SEQ_MODE_COPY]]
+                 if has_prompt(lang) else [SEQ_MODE_LABELS[SEQ_MODE_COPY]])
+        if item["mode"].get() not in modes:
+            item["mode"].set(modes[0])
+        ctk.CTkOptionMenu(row, variable=item["mode"], values=modes,
+                          width=116, height=26, corner_radius=8,
+                          font=ctk.CTkFont(size=11),
+                          fg_color="#eef2f7", button_color="#e2e8f0",
+                          button_hover_color="#cbd5e0", text_color="#2d3748",
+                          dropdown_fg_color="#ffffff",
+                          dropdown_hover_color="#eef2f7",
+                          dropdown_text_color="#2d3748",
+                          command=lambda _v: self._refresh_hint()).pack(
+            side="left", padx=(4, 0))
+
+        for var in (item["result"], item["note"]):
+            ent = ctk.CTkEntry(row, textvariable=var, width=104, height=26,
+                               justify="center", font=ctk.CTkFont(size=12))
+            ent.pack(side="left", padx=(10, 0))
+            ent.bind("<KeyRelease>", lambda e: self._refresh_hint())
+        return row
+
+    def _relayout(self):
+        """데이터 순서대로 줄을 다시 배치하고 순서 번호를 갱신한다."""
+        n = 0
+        for i, item in enumerate(self.items):
+            item["row"].place(x=0, y=i * self.ROW_H + self.PAD, relwidth=1.0)
+            if item["enabled"].get():
+                n += 1
+                item["num"].configure(text=f"{n}", text_color="#4fd1c5")
+            else:
+                item["num"].configure(text="–", text_color="#cbd5e0")
+        self.list_frame.configure(height=len(self.items) * self.ROW_H)
+
+    # ── 드래그 앤 드롭 ───────────────────────────────────────────────────────
+
+    def _drag_start(self, event, item):
+        self._drag_idx = self.items.index(item)
+        self._drag_y0 = event.y_root
+        self._drag_row_y0 = self._drag_idx * self.ROW_H + self.PAD
+        item["row"].configure(fg_color="#e6fffa")
+        item["row"].lift()
+
+    def _drag_move(self, event):
+        if self._drag_idx is None:
+            return
+        dy = event.y_root - self._drag_y0
+        row = self.items[self._drag_idx]["row"]
+        row.place_configure(y=self._drag_row_y0 + dy)
+
+        # 끌고 있는 줄이 놓일 자리를 계산해 나머지 줄을 밀어 빈 칸을 보여준다
+        target = self._target_index(dy)
+        for i, item in enumerate(self.items):
+            if i == self._drag_idx:
+                continue
+            slot = i
+            if self._drag_idx < target and self._drag_idx < i <= target:
+                slot = i - 1
+            elif target < self._drag_idx and target <= i < self._drag_idx:
+                slot = i + 1
+            item["row"].place_configure(y=slot * self.ROW_H + self.PAD)
+
+    def _drag_end(self, _event=None):
+        if self._drag_idx is None:
+            return
+        idx = self._drag_idx
+        self._drag_idx = None
+        item = self.items[idx]
+        item["row"].configure(fg_color="#f7fafc")
+        try:
+            dy = _event.y_root - self._drag_y0 if _event is not None else 0
+        except Exception:
+            dy = 0
+        target = self._target_index(dy)
+        if target != idx:
+            self.items.insert(target, self.items.pop(idx))
+        self._relayout()
+        self._refresh_hint()
+
+    def _target_index(self, dy):
+        """현재 끌고 있는 양(dy)으로 놓일 인덱스를 구한다."""
+        moved = (self._drag_row_y0 + dy) / float(self.ROW_H)
+        return max(0, min(len(self.items) - 1, int(round(moved))))
+
+    # ── 동작 ─────────────────────────────────────────────────────────────────
+
+    def _on_toggle(self):
+        self._relayout()
+        self._refresh_hint()
+
+    def _auto_assign(self):
+        """켜진 단계에 결과열/특이사항열을 두 칸씩 순서대로 부여한다."""
+        start = (self.v_auto_start.get() or "D").strip().upper()
+        if not COL_RE.match(start):
+            messagebox.showerror("입력 오류",
+                                 f"시작 열이 올바르지 않습니다: '{start}'\n"
+                                 "열 문자(D, F, AA …)로 입력해주세요.", parent=self)
+            return
+        idx = col_to_idx(start)
+        for item in self.items:
+            if not item["enabled"].get():
+                continue
+            item["result"].set(idx_to_col(idx))
+            item["note"].set(idx_to_col(idx + 1))
+            idx += 2
+        self._refresh_hint()
+
+    def _reset(self):
+        if not messagebox.askyesno("기본값으로",
+                                   "연속 번역 설정을 기본값(ko-KR → … → tr-TR, D열부터)으로\n"
+                                   "되돌릴까요?", parent=self):
+            return
+        base = default_seq_jobs()
+        defaults = {j["lang"]: j for j in base}
+        order = [j["lang"] for j in base]
+        by_lang = {it["lang"]: it for it in self.items}
+        for lang, d in defaults.items():
+            it = by_lang.get(lang)
+            if not it:
+                continue
+            it["enabled"].set(d["enabled"])
+            it["mode"].set(SEQ_MODE_LABELS[d["mode"]])
+            it["result"].set(d["result_col"])
+            it["note"].set(d["note_col"])
+        # 기본 순서대로 재정렬 (기본 목록에 없는 언어는 뒤로, 껐다)
+        rest = [it for it in self.items if it["lang"] not in defaults]
+        for it in rest:
+            it["enabled"].set(False)
+        self.items = [by_lang[l] for l in order if l in by_lang] + rest
+        self._relayout()
+        self._refresh_hint()
+
+    def _collect(self):
+        """화면 상태를 계획(dict 목록)으로 모은다 — 순서는 화면 순서."""
+        label_to_mode = {v: k for k, v in SEQ_MODE_LABELS.items()}
+        jobs = []
+        for item in self.items:
+            jobs.append({
+                "lang": item["lang"],
+                "mode": label_to_mode.get(item["mode"].get(), SEQ_MODE_TRANSLATE),
+                "result_col": (item["result"].get() or "").strip().upper(),
+                "note_col": (item["note"].get() or "").strip().upper(),
+                "enabled": bool(item["enabled"].get()),
+            })
+        return jobs
+
+    def _refresh_hint(self):
+        """켜진 단계를 'ko-KR D/E → en-US F/G …' 형태로 미리 보여준다."""
+        jobs = [j for j in self._collect() if j["enabled"]]
+        if not jobs:
+            self.hint.configure(text="선택된 언어가 없습니다.", text_color="#dd6b20")
+            return
+        parts = []
+        for j in jobs:
+            loc = LANG_LOCALES.get(j["lang"], j["lang"])
+            tail = " (복사)" if j["mode"] == SEQ_MODE_COPY else ""
+            parts.append(f"{loc} {j['result_col']}/{j['note_col']}{tail}")
+        self.hint.configure(
+            text=f"실행 순서 ({len(jobs)}단계):  " + "  →  ".join(parts),
+            text_color="#718096")
+
+    def _apply(self):
+        """검증 → config 반영 + settings.json 저장. 성공하면 계획을 반환."""
+        jobs = self._collect()
+        # 복사 원본 설정을 먼저 반영해야 '복사할 입력열 없음' 검사가 정확해진다
+        cp = self._cp_label_to_code.get(self.v_copy_from.get(), "auto")
+        prev_cp = getattr(config, "SEQ_COPY_FROM", "auto")
+        config.SEQ_COPY_FROM = cp
+        err = validate_seq_jobs(jobs)
+        if err:
+            config.SEQ_COPY_FROM = prev_cp
+            messagebox.showerror("설정 확인", err, parent=self)
+            return None
+        config.SEQ_JOBS = jobs
+        save_settings()
+        return [j for j in jobs if j["enabled"]]
+
+    def _save_only(self):
+        if self._apply() is None:
+            return
+        self.destroy()
+
+    def _start(self):
+        jobs = self._apply()
+        if jobs is None:
+            return
+        self.jobs_to_run = jobs
+        self.run_requested = True
+        self.destroy()
 
 
 # ── 프롬프트 편집 다이얼로그 ─────────────────────────────────────────────────
@@ -1648,6 +2394,101 @@ class DoneDialog(ctk.CTkToplevel):
                       command=self.destroy).pack(pady=(8, 20))
 
 
+class SeqDoneDialog(ctk.CTkToplevel):
+    """연속 번역 결과 요약 — 언어별로 어느 열에 몇 행이 들어갔는지 한 창에 보여준다."""
+
+    def __init__(self, parent, seq):
+        super().__init__(parent)
+        self.title("연속 번역 완료 — 언어별 요약")
+        self.geometry("640x520")
+        self.grab_set()
+        self.after(50, self.lift)
+        self.configure(fg_color="#f0f7ff")
+        self._build(seq)
+
+    def _build(self, seq):
+        results = seq["results"]
+        jobs = seq["jobs"]
+        rows = sum(r["processed"] for r in results)
+        fails = sum(len(r["fails"]) for r in results)
+        stopped = seq["cancel"]
+
+        head = ("⏹  중지됨 — " if stopped else "✅  완료 — ") + \
+               f"{len(results)}/{len(jobs)}개 언어 · 총 {rows:,}행"
+        ctk.CTkLabel(self, text=head,
+                     font=ctk.CTkFont(size=16, weight="bold"),
+                     text_color="#dd6b20" if stopped else "#38a169").pack(
+            pady=(22, 4), padx=20, anchor="w")
+
+        if fails:
+            ctk.CTkLabel(
+                self,
+                text=f"⚠️  실패 {fails}건 — 다시 RUN 하거나 연속 번역을 재실행하면 "
+                     f"빈 칸만 자동으로 채워집니다.",
+                font=ctk.CTkFont(size=12), text_color="#dd6b20",
+                wraplength=580, justify="left").pack(padx=20, anchor="w")
+
+        box = ctk.CTkScrollableFrame(self, fg_color="#ffffff", corner_radius=14)
+        box.pack(fill="both", expand=True, padx=20, pady=12)
+
+        hdr = ctk.CTkFrame(box, fg_color="transparent")
+        hdr.pack(fill="x", pady=(2, 6))
+        for text, w in [("언어", 168), ("방식", 78), ("열", 88), ("행", 96), ("실패", 56)]:
+            ctk.CTkLabel(hdr, text=text, width=w, anchor="w",
+                         font=ctk.CTkFont(size=11, weight="bold"),
+                         text_color="#a0aec0").pack(side="left")
+
+        done_langs = {id(r["job"]) for r in results}
+        for r in results:
+            job = r["job"]
+            line = ctk.CTkFrame(box, fg_color="transparent")
+            line.pack(fill="x", pady=1)
+            ok = not r["fails"]
+            ctk.CTkLabel(line, text=lang_display(job["lang"]), width=168, anchor="w",
+                         font=ctk.CTkFont(size=12),
+                         text_color="#2d3748").pack(side="left")
+            ctk.CTkLabel(line, text=SEQ_MODE_LABELS[job["mode"]], width=78, anchor="w",
+                         font=ctk.CTkFont(size=11),
+                         text_color="#718096").pack(side="left")
+            ctk.CTkLabel(line, text=f"{job['result_col']}/{job['note_col']}",
+                         width=88, anchor="w", font=ctk.CTkFont(size=11),
+                         text_color="#718096").pack(side="left")
+            ctk.CTkLabel(line, text=f"{r['processed']:,} / {r['total']:,}",
+                         width=96, anchor="w", font=ctk.CTkFont(size=12),
+                         text_color="#38a169" if ok else "#dd6b20").pack(side="left")
+            ctk.CTkLabel(line, text="—" if ok else str(len(r["fails"])),
+                         width=56, anchor="w", font=ctk.CTkFont(size=12),
+                         text_color="#a0aec0" if ok else "#e53e3e").pack(side="left")
+
+        # 중지/오류로 실행되지 않은 언어도 남겨, 무엇이 안 돌았는지 보이게 한다
+        skipped = [j for j in jobs if id(j) not in done_langs]
+        if skipped:
+            ctk.CTkLabel(box, text="실행되지 않음", anchor="w",
+                         font=ctk.CTkFont(size=11, weight="bold"),
+                         text_color="#a0aec0").pack(fill="x", pady=(10, 2))
+            for job in skipped:
+                ctk.CTkLabel(
+                    box,
+                    text=f"· {lang_display(job['lang'])}  "
+                         f"({job['result_col']}/{job['note_col']})",
+                    anchor="w", font=ctk.CTkFont(size=12),
+                    text_color="#a0aec0").pack(fill="x")
+
+        detail = [f"[{lang_display(r['job']['lang'])}] {ln}"
+                  for r in results for ln in r["fails"]]
+        if detail:
+            tb = ctk.CTkTextbox(self, font=ctk.CTkFont(family="Consolas", size=10),
+                                height=96, corner_radius=12)
+            tb.pack(fill="x", padx=20, pady=(0, 8))
+            tb.insert("1.0", "\n".join(detail))
+            tb.configure(state="disabled")
+
+        ctk.CTkButton(self, text="닫기", width=100,
+                      fg_color="#4fd1c5", hover_color="#38b2ac",
+                      text_color="white",
+                      command=self.destroy).pack(pady=(4, 18))
+
+
 # ── 설정 저장/불러오기 ──────────────────────────────────────────────────────
 
 def save_settings():
@@ -1669,6 +2510,7 @@ def save_settings():
         "COL_B_ROLE":                 config.COL_B_ROLE,
         "COL_C_ROLE":                 config.COL_C_ROLE,
         "RESULT_COL":                 config.RESULT_COL,
+        "NOTE_COL":                   getattr(config, "NOTE_COL", ""),
         "RESPONSE_INIT_WAIT":         config.RESPONSE_INIT_WAIT,
         "RESPONSE_POLL_INTERVAL":     config.RESPONSE_POLL_INTERVAL,
         "RESPONSE_DONE_DELAY":        config.RESPONSE_DONE_DELAY,
@@ -1682,6 +2524,8 @@ def save_settings():
         "REVIEW_TGT_LANG":            getattr(config, "REVIEW_TGT_LANG", "es"),
         "REVIEW_CROSS_CHECK":         getattr(config, "REVIEW_CROSS_CHECK", True),
         "MODE_COL_ROLES":             _mode_presets(),
+        "SEQ_JOBS":                   getattr(config, "SEQ_JOBS", []) or [],
+        "SEQ_COPY_FROM":              getattr(config, "SEQ_COPY_FROM", "auto"),
     }
     with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -1709,6 +2553,9 @@ def load_settings():
         config.COL_B_ROLE                 = data.get("COL_B_ROLE",                 config.COL_B_ROLE)
         config.COL_C_ROLE                 = data.get("COL_C_ROLE",                 config.COL_C_ROLE)
         config.RESULT_COL                 = data.get("RESULT_COL",                 config.RESULT_COL)
+        # 특이사항열: 빈 문자열이면 '결과열 바로 다음 열' 자동 (기본 D→E)
+        _nc = str(data.get("NOTE_COL", getattr(config, "NOTE_COL", "")) or "").strip().upper()
+        config.NOTE_COL = _nc if re.match(r"^[A-Z]{1,3}$", _nc) else ""
         config.RESPONSE_INIT_WAIT         = data.get("RESPONSE_INIT_WAIT",         config.RESPONSE_INIT_WAIT)
         config.RESPONSE_POLL_INTERVAL     = data.get("RESPONSE_POLL_INTERVAL",     config.RESPONSE_POLL_INTERVAL)
         config.RESPONSE_DONE_DELAY        = data.get("RESPONSE_DONE_DELAY",        config.RESPONSE_DONE_DELAY)
@@ -1757,6 +2604,13 @@ def load_settings():
             }
         # 프리셋 보정 후 현재 모드의 열 역할을 COL_* 에 적용
         apply_mode_columns()
+
+        # ── 연속 번역 계획 ─────────────────────────────────────────
+        # 열 역할이 확정된 뒤에 정리해야 기본 결과열 계산이 맞는다.
+        seq = data.get("SEQ_JOBS")
+        config.SEQ_JOBS = normalize_seq_jobs(seq) if isinstance(seq, list) else []
+        cp = str(data.get("SEQ_COPY_FROM", getattr(config, "SEQ_COPY_FROM", "auto")) or "auto").lower()
+        config.SEQ_COPY_FROM = cp if cp in ("auto", "placeholder", "source", "ref") else "auto"
 
         _clamp_settings()
     except Exception:
@@ -2057,6 +2911,8 @@ class App(ctk.CTk):
 
         self.log_queue = queue.Queue()
         self.worker = None
+        # 연속 번역 진행 상태 — None 이면 단일 언어 실행(기존 동작)
+        self._seq = None
         self._waiting_msg = ""
         self._dot_count = 0
         self._is_waiting = False
@@ -2091,15 +2947,24 @@ class App(ctk.CTk):
                      font=ctk.CTkFont(family="Inter", size=16, weight="bold"),
                      text_color=self.COLORS["text_main"]).pack(side="left")
 
-        for icon, cmd in [("⚙", self._open_settings),
-                          ("📝", self._open_prompt),
-                          ("🌍", self._open_lang),
-                          ("🔄", self._check_update_manual)]:
-            ctk.CTkButton(header, text=icon, width=40, height=35,
-                          font=ctk.CTkFont(size=18),
-                          fg_color="transparent", hover_color="#edf2f7",
-                          text_color=self.COLORS["text_sub"],
-                          command=cmd).pack(side="right", padx=5)
+        # side="right" 로 쌓이므로 목록의 앞쪽이 화면 오른쪽 끝에 온다.
+        # 화면 왼→오: 🔄 🗂 🌍 📝 ⚙
+        # (🔁 는 업데이트 🔄 와 글리프가 너무 비슷해 🗂 로 구분한다)
+        self._hdr_btns = {}
+        for key, icon, cmd, tip in [
+                ("settings", "⚙",  self._open_settings,      "설정"),
+                ("prompt",   "📝", self._open_prompt,         "프롬프트 편집"),
+                ("lang",     "🌍", self._open_lang,           "번역 언어 선택"),
+                ("seq",      "🗂", self._open_seq,            "연속 번역 — 여러 언어를 순서대로 번역"),
+                ("update",   "🔄", self._check_update_manual, "업데이트 확인")]:
+            btn = ctk.CTkButton(header, text=icon, width=40, height=35,
+                                font=ctk.CTkFont(size=18),
+                                fg_color="transparent", hover_color="#edf2f7",
+                                text_color=self.COLORS["text_sub"],
+                                command=cmd)
+            btn.pack(side="right", padx=5)
+            Tooltip(btn, tip)
+            self._hdr_btns[key] = btn
 
         # ── 상태 카드
         card = ctk.CTkFrame(self, corner_radius=25, fg_color=self.COLORS["card_bg"],
@@ -2147,6 +3012,11 @@ class App(ctk.CTk):
         self.lang_area = ctk.CTkFrame(card, fg_color="transparent")
         self.lang_area.pack(fill="x", padx=20, pady=(0, 2))
         self._build_lang_area()
+
+        # 연속 번역 진행 표시 — 연속 실행 중에만 보인다 (평소엔 pack_forget)
+        self.seq_lbl = ctk.CTkLabel(card, text="", anchor="w",
+                                    font=ctk.CTkFont(size=12, weight="bold"),
+                                    text_color="#dd6b20")
 
         self.progress = ctk.CTkProgressBar(card, height=12, corner_radius=6,
                                            fg_color=self.COLORS["progress_bg"],
@@ -2216,7 +3086,8 @@ class App(ctk.CTk):
 
     # ── 액션 ─────────────────────────────────────────────────────────────────
 
-    def _start(self):
+    def _preflight(self):
+        """실행 전 공통 확인 (구글 인증 파일 / 스프레드시트 ID). 통과하면 True."""
         creds = os.path.join(BASE_DIR, "credentials.json")
         if not os.path.exists(creds):
             if messagebox.askyesno(
@@ -2224,9 +3095,14 @@ class App(ctk.CTk):
                     "credentials.json 파일이 없습니다.\n"
                     "지금 설정 마법사에서 지정할까요?"):
                 self._run_setup_wizard()
-            return
+            return False
         if not config.SPREADSHEET_ID:
             messagebox.showerror("오류", "설정에서 스프레드시트 ID를 입력해주세요.")
+            return False
+        return True
+
+    def _start(self):
+        if not self._preflight():
             return
 
         mode = _current_mode()
@@ -2285,6 +3161,9 @@ class App(ctk.CTk):
         self.worker.start()
 
     def _stop(self):
+        if self._seq is not None:
+            self._seq["cancel"] = True
+            self._add_log("중지 요청됨 — 현재 언어를 정리한 뒤 연속 번역을 끝냅니다.", "warn")
         if self.worker:
             self.worker.stop_flag = True
             # 일시정지 중이거나 대기 중이어도 즉시 빠져나오게 이벤트를 깨운다
@@ -2306,6 +3185,182 @@ class App(ctk.CTk):
                                      hover_color=self.COLORS["secondary_hover"],
                                      text_color=self.COLORS["text_main"])
             self._set_status("Infusing...", self.COLORS["accent"])
+
+    # ── 연속 번역 ────────────────────────────────────────────────────────────
+
+    def _open_seq(self):
+        """헤더 🗂 — 연속 번역 설정 창을 열고, '시작'으로 닫히면 바로 실행한다."""
+        if self.worker is not None and self.worker.is_alive():
+            messagebox.showinfo(
+                "실행 중", "작업이 진행 중입니다.\n먼저 중지하거나 완료를 기다려주세요.")
+            return
+        if _current_mode() in REVIEW_MODES:
+            messagebox.showinfo(
+                "연속 번역",
+                "연속 번역은 '번역' 모드에서만 사용할 수 있습니다.\n"
+                "상단 모드 선택에서 '번역'으로 바꿔주세요.")
+            return
+        dlg = SeqDialog(self)
+        self.wait_window(dlg)
+        self._refresh_lang_label()
+        if dlg.run_requested and dlg.jobs_to_run:
+            self._start_sequence(dlg.jobs_to_run)
+
+    def _set_seq_controls(self, running):
+        """연속 번역 중에는 설정/언어/프롬프트 창과 모드 전환을 잠근다.
+
+        중간에 열 역할이나 결과열이 바뀌면 남은 언어가 엉뚱한 열에 기입되므로,
+        실행 중에는 설정을 건드릴 수 없게 막는다.
+        """
+        state = "disabled" if running else "normal"
+        for key in ("settings", "prompt", "lang", "seq"):
+            btn = self._hdr_btns.get(key)
+            if btn is not None:
+                btn.configure(state=state)
+        self._set_mode_selector_state(state)
+        self.btn_start.configure(state="disabled" if running else "normal")
+        self.btn_stop.configure(state="normal" if running else "disabled")
+        if running:
+            self.btn_pause.configure(state="normal", text="PAUSE",
+                                     fg_color=self.COLORS["secondary"],
+                                     hover_color=self.COLORS["secondary_hover"],
+                                     text_color=self.COLORS["text_main"])
+            self.seq_lbl.pack(fill="x", padx=20, pady=(0, 4),
+                              before=self.progress)
+        else:
+            self.btn_pause.configure(state="disabled")
+            self.seq_lbl.configure(text="")
+            self.seq_lbl.pack_forget()
+
+    def _start_sequence(self, jobs):
+        """연속 번역 시작 — 언어 단계를 하나씩 순서대로 실행한다.
+
+        단계마다 config.PROMPT_LANG / RESULT_COL / NOTE_COL 을 바꿔 끼우고
+        기존 워커를 그대로 재사용한다. 끝나면 원래 값으로 되돌린다
+        (연속 번역이 단일 언어 설정을 영구히 바꾸지 않도록).
+        """
+        if not self._preflight():
+            return
+        if get_placeholder_col_letter() is None:
+            self._add_log(
+                "⚠️ 열 역할에 '플레이스홀더'가 없어 플레이스홀더 검증을 할 수 없습니다.", "warn")
+
+        self._seq = {
+            "jobs": list(jobs),
+            "i": 0,
+            "results": [],
+            "cancel": False,
+            # 연속 번역이 끝나면 되돌릴 단일 언어 설정
+            "backup": (getattr(config, "PROMPT_LANG", ""),
+                       getattr(config, "RESULT_COL", "D"),
+                       getattr(config, "NOTE_COL", "")),
+        }
+        self._add_log("═" * 44, "info")
+        self._add_log(f"🗂 연속 번역 시작 — {len(jobs)}개 언어", "success")
+        for n, j in enumerate(jobs, 1):
+            self._add_log(
+                f"   {n}. {lang_display(j['lang'])} · {SEQ_MODE_LABELS[j['mode']]} · "
+                f"결과 {j['result_col']}열 / 특이사항 {j['note_col']}열", "info")
+        self._set_seq_controls(True)
+        self._seq_run_step()
+
+    def _seq_run_step(self):
+        """현재 단계를 실행한다 (또는 남은 단계가 없으면 마무리)."""
+        seq = self._seq
+        if seq is None:
+            return
+        jobs, i = seq["jobs"], seq["i"]
+        if seq["cancel"] or i >= len(jobs):
+            self._seq_finish()
+            return
+
+        job = jobs[i]
+        # 이 단계의 언어/기입 열을 config 에 꽂는다 (워커는 config 를 읽는다)
+        config.PROMPT_LANG = job["lang"]
+        config.RESULT_COL  = job["result_col"]
+        config.NOTE_COL    = job["note_col"]
+
+        head = f"[{i + 1}/{len(jobs)}] {lang_display(job['lang'])}"
+        self.seq_lbl.configure(
+            text=f"🗂 연속 번역 {head} · 결과 {job['result_col']}열 / "
+                 f"특이사항 {job['note_col']}열")
+        self._add_log("─" * 44, "info")
+        self._add_log(
+            f"▶ {head} — {SEQ_MODE_LABELS[job['mode']]} · "
+            f"결과 {job['result_col']}열 / 특이사항 {job['note_col']}열", "success")
+        self.progress.set(0)
+        self.prog_lbl.configure(text="0 / 0 Rows  (0%)")
+
+        if job["mode"] == SEQ_MODE_COPY:
+            self.worker = CopyWorker(self.log_queue, self._on_done)
+        else:
+            loaded = load_prompt(job["lang"])
+            if not loaded:
+                # 프롬프트가 없으면 이 언어만 건너뛰고 다음 언어로 진행한다
+                self._add_log(
+                    f"❌ 프롬프트를 불러오지 못해 건너뜁니다 (prompts/{job['lang']}.txt)",
+                    "error")
+                seq["results"].append({
+                    "job": job, "processed": 0, "total": 0,
+                    "fails": [f"프롬프트 파일 없음 — prompts/{job['lang']}.txt"],
+                })
+                seq["i"] += 1
+                self.after(300, self._seq_run_step)
+                return
+            config.FIXED_PROMPT = loaded
+            self.worker = TranslationWorker(self.log_queue, self._on_done)
+        self.worker.start()
+
+    def _seq_step_done(self, processed, total, fail_lines):
+        """한 언어 단계가 끝났을 때 — 결과를 적고 다음 단계로 넘어간다."""
+        seq = self._seq
+        if seq is None:
+            return
+        i = min(seq["i"], len(seq["jobs"]) - 1)
+        job = seq["jobs"][i]
+        seq["results"].append({
+            "job": job, "processed": processed, "total": total,
+            "fails": list(fail_lines or []),
+        })
+        tail = f" · 실패 {len(fail_lines)}건" if fail_lines else ""
+        self._add_log(
+            f"■ {lang_display(job['lang'])} 단계 종료 — {processed:,}/{total:,}행{tail}",
+            "warn" if fail_lines else "success")
+
+        seq["i"] += 1
+        if seq["cancel"] or seq["i"] >= len(seq["jobs"]):
+            self._seq_finish()
+            return
+        # 다음 언어로 — 시트 API 와 브라우저가 숨 돌릴 짧은 간격을 둔다
+        self._set_status("다음 언어 준비 중...", "#e0af68")
+        self.after(1500, self._seq_run_step)
+
+    def _seq_finish(self):
+        """연속 번역 마무리 — 설정 복원, 버튼 복구, 언어별 요약 표시."""
+        seq = self._seq
+        self._seq = None
+        self.worker = None
+        lang0, res0, note0 = seq["backup"]
+        config.PROMPT_LANG = lang0
+        config.RESULT_COL  = res0
+        config.NOTE_COL    = note0
+        config.FIXED_PROMPT = ""
+
+        self._set_seq_controls(False)
+        done_rows = sum(r["processed"] for r in seq["results"])
+        if seq["cancel"]:
+            self._add_log(
+                f"⏹ 연속 번역 중지 — {len(seq['results'])}/{len(seq['jobs'])}개 언어 진행, "
+                f"총 {done_rows:,}행", "warn")
+            self._set_status("중지됨", "#e0af68")
+        else:
+            self._add_log(
+                f"🎉 연속 번역 완료 — {len(seq['jobs'])}개 언어, 총 {done_rows:,}행",
+                "success")
+            self._set_status("완료", "#9ece6a")
+        self._add_log("═" * 44, "info")
+        self._refresh_lang_label()
+        SeqDoneDialog(self, seq)
 
     def _build_lang_area(self):
         """언어 표시 영역 구성 — 번역 모드는 언어 라벨, 검수 모드는 원문→대상 선택."""
@@ -2584,6 +3639,10 @@ class App(ctk.CTk):
                     if self._is_waiting:
                         self._waiting_msg = msg_text
                 elif kind == "empty":
+                    if self._seq is not None:
+                        # 연속 번역 중에는 언어마다 모달이 떠서 진행을 막으므로
+                        # 로그로만 남긴다 (요약 창에서 0행으로 확인 가능)
+                        continue
                     messagebox.showinfo(
                         "대상 없음",
                         "처리할 행을 찾지 못했습니다.\n\n다음을 확인해보세요:\n"
@@ -2599,11 +3658,15 @@ class App(ctk.CTk):
                     _, (processed, total, fail_lines) = msg
                     self._is_waiting = False
                     self._waiting_msg = ""
-                    self.btn_start.configure(state="normal")
-                    self.btn_stop.configure(state="disabled")
-                    self.btn_pause.configure(state="disabled")
-                    self._set_mode_selector_state("normal")
-                    DoneDialog(self, processed, total, fail_lines)
+                    if self._seq is not None:
+                        # 연속 번역 중 — 한 언어가 끝난 것이므로 다음 언어로 넘어간다
+                        self._seq_step_done(processed, total, fail_lines)
+                    else:
+                        self.btn_start.configure(state="normal")
+                        self.btn_stop.configure(state="disabled")
+                        self.btn_pause.configure(state="disabled")
+                        self._set_mode_selector_state("normal")
+                        DoneDialog(self, processed, total, fail_lines)
         except queue.Empty:
             pass
         self.after(100, self._poll)
