@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>번역 JSON → XLSX 변환기</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<style>
+  :root{
+    --bg:#f6f7f9; --panel:#ffffff; --line:#e2e5ea; --text:#1d2129; --muted:#6b7280;
+    --accent:#2f6fed; --accent-ink:#ffffff; --warn:#b45309; --err:#b91c1c; --ok:#15803d;
+    --head:#eef2f8; --zebra:#fafbfc;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --bg:#14171c; --panel:#1b1f26; --line:#2c323b; --text:#e6e9ee; --muted:#9aa3af;
+      --accent:#5b8def; --accent-ink:#0b1220; --warn:#f0b429; --err:#f87171; --ok:#4ade80;
+      --head:#232935; --zebra:#1f242c;
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+       font:14px/1.55 -apple-system,BlinkMacSystemFont,"Malgun Gothic","맑은 고딕",
+       "Apple SD Gothic Neo",Segoe UI,Roboto,sans-serif;}
+  .wrap{max-width:1200px;margin:0 auto;padding-block:24px;padding-left:16px;padding-right:16px}
+  h1{font-size:20px;margin:0 0 4px}
+  .sub{color:var(--muted);margin:0 0 18px;font-size:13px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+        padding:16px;margin-bottom:16px}
+  .card h2{font-size:14px;margin:0 0 10px;letter-spacing:.02em}
+  textarea{width:100%;min-height:220px;resize:vertical;padding:10px;border-radius:8px;
+           border:1px solid var(--line);background:var(--bg);color:var(--text);
+           font:12px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace}
+  .drop{border:2px dashed var(--line);border-radius:8px;padding:14px;text-align:center;
+        color:var(--muted);margin-bottom:10px;cursor:pointer}
+  .drop.over{border-color:var(--accent);color:var(--accent)}
+  .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+  button{font:inherit;padding:8px 14px;border-radius:8px;border:1px solid var(--line);
+         background:var(--panel);color:var(--text);cursor:pointer}
+  button:hover{border-color:var(--accent)}
+  button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  label.opt{display:inline-flex;gap:6px;align-items:center;color:var(--muted);font-size:13px}
+  .msg{margin-top:10px;font-size:13px;white-space:pre-wrap}
+  .msg.err{color:var(--err)} .msg.ok{color:var(--ok)} .msg.warn{color:var(--warn)}
+  .tabs{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px}
+  .tab{padding:6px 10px;border-radius:999px;border:1px solid var(--line);
+       background:var(--panel);color:var(--text);cursor:pointer;font-size:12.5px}
+  .tab.active{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+  .tablewrap{overflow-x:auto;border:1px solid var(--line);border-radius:8px;max-height:70vh}
+  table{border-collapse:collapse;font-size:12px;min-width:100%}
+  th,td{border:1px solid var(--line);padding:5px 7px;vertical-align:top;
+        max-width:340px;white-space:pre-wrap;word-break:break-word}
+  th{background:var(--head);position:sticky;top:0;text-align:left;font-weight:600}
+  tbody tr:nth-child(even){background:var(--zebra)}
+  td.id,td.type{white-space:nowrap;color:var(--muted)}
+  td.id{font-weight:600;color:var(--text)}
+  .hint{color:var(--muted);font-size:12.5px;margin-top:8px}
+  code{background:var(--head);padding:1px 5px;border-radius:4px;font-size:12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>번역 JSON → XLSX 변환기</h1>
+  <p class="sub">JSON을 붙여넣거나 파일을 올리면 <code>파일명 / ID / type / 언어코드</code> 구조의 엑셀로 변환합니다.</p>
+
+  <div class="card">
+    <h2>1. JSON 입력</h2>
+    <div class="drop" id="drop">여기에 <b>.json</b> 파일을 끌어다 놓거나 클릭해서 선택
+      <input type="file" id="file" accept=".json,application/json" hidden>
+    </div>
+    <textarea id="input" spellcheck="false" placeholder='{ "itemInfo.xlsx": { "31400": { "identifiedDisplayName": { "ko-KR": "의상 리본" } } } }'></textarea>
+    <div class="row" style="margin-top:10px">
+      <button class="primary" id="parse">변환 미리보기</button>
+      <button id="sample">샘플 넣기</button>
+      <button id="clear">지우기</button>
+      <label class="opt"><input type="checkbox" id="repeatId"> 모든 행에 ID 반복</label>
+      <label class="opt"><input type="checkbox" id="allLangs"> 표준 언어 열 모두 표시</label>
+    </div>
+    <div class="msg" id="msg"></div>
+  </div>
+
+  <div class="card" id="previewCard" hidden>
+    <h2>2. 미리보기</h2>
+    <div class="tabs" id="tabs"></div>
+    <div class="tablewrap" id="preview"></div>
+    <p class="hint" id="previewHint"></p>
+  </div>
+
+  <div class="card" id="dlCard" hidden>
+    <h2>3. 다운로드</h2>
+    <div class="row">
+      <button class="primary" id="dlOne">통합 파일 1개 (시트 분리)</button>
+      <button id="dlMany">원본 파일명별로 각각 저장</button>
+    </div>
+    <p class="hint">
+      · <b>통합 파일</b>: <code>translations_날짜.xlsx</code> 한 개 안에 <code>itemInfo</code>,
+      <code>Npcdata</code> … 시트로 나뉩니다.<br>
+      · <b>각각 저장</b>: JSON의 키 이름 그대로 <code>itemInfo.xlsx</code>,
+      <code>Npcdata.xlsx</code> … 여러 파일이 받아집니다. (브라우저가 연속 다운로드를 물어보면 허용)
+    </p>
+  </div>
+
+  <div class="card">
+    <h2>변환 규칙</h2>
+    <p class="hint" style="margin-top:0">
+      ① 1행 1열 = <b>.xlsx 파일명</b> (각 파일은 별도 시트)<br>
+      ② 1열 = <b>ID</b> (JSON의 숫자/영문 키). 2행부터 시작하며, 같은 ID의 여러 행은 첫 행에만 표시<br>
+      ③ ID 다음 단계의 키(<code>identifiedDisplayName</code>, <code>descript</code> …)는
+         <b>type</b> 열로. 단계가 더 깊으면 <code>type2</code>, <code>type3</code>… 이 자동 추가<br>
+      ④ <code>ko-KR</code>, <code>en-US</code> … 국가 코드는 1행에 표준 순서대로<br>
+      ⑤ ID 바로 아래가 국가 코드면(<code>Npcdata</code>, <code>mobdef</code> 등) type 열 없이 출력
+    </p>
+  </div>
+</div>
+
+<script id="core">
+/* ===== 순수 변환 로직 (UI와 분리 - node 테스트에서 그대로 사용) ===== */
+var LANG_ORDER = ["ko-KR","en-US","ja-JP","zh-CN","zh-TW","th-TH","pt-BR","es-ES",
+                  "de-DE","fr-FR","id-ID","tr-TR","es-419","ru-RU","vi-VN"];
+var LANG_RE = /^[a-z]{2,3}(-[A-Za-z0-9]{2,8})?$/;
+var VALUE_KEY = "@@value@@";   /* 국가코드가 아닌 단일 값에 쓰는 내부 키 */
+
+function isPlain(o){ return o !== null && typeof o === "object" && !Array.isArray(o); }
+
+/* {ko-KR:"..", en-US:".."} 처럼 키가 모두 국가코드이고 값이 문자열인가 */
+function isLangMap(o){
+  if(!isPlain(o)) return false;
+  var ks = Object.keys(o);
+  if(!ks.length) return false;
+  for(var i=0;i<ks.length;i++){
+    if(!LANG_RE.test(ks[i])) return false;
+    var v = o[ks[i]];
+    if(v !== null && typeof v === "object") return false;
+  }
+  return true;
+}
+
+/* id 아래를 재귀로 훑어 리프(언어맵 또는 단일 값)를 모은다 */
+function collectLeaves(node, path, out){
+  if(isLangMap(node)){ out.push({path:path.slice(), values:node}); return; }
+  if(isPlain(node)){
+    var ks = Object.keys(node);
+    if(!ks.length){ out.push({path:path.slice(), values:{}}); return; }
+    for(var i=0;i<ks.length;i++) collectLeaves(node[ks[i]], path.concat([ks[i]]), out);
+    return;
+  }
+  if(Array.isArray(node)){ out.push({path:path.slice(), values:defVal(node.join(", "))}); return; }
+  out.push({path:path.slice(), values:defVal(node)});
+}
+function defVal(v){ var o = {}; o[VALUE_KEY] = v; return o; }
+
+function sortLangs(set){
+  var known = [], extra = [];
+  LANG_ORDER.forEach(function(l){ if(set[l]) known.push(l); });
+  Object.keys(set).forEach(function(l){
+    if(l === VALUE_KEY) return;
+    if(LANG_ORDER.indexOf(l) === -1) extra.push(l);
+  });
+  extra.sort();
+  return known.concat(extra);
+}
+
+/* 한 개 .xlsx 파일(JSON 최상위 키) -> 시트 데이터 */
+function buildSheet(fileKey, fileData, opts){
+  opts = opts || {};
+  var entries = [];           /* {id, leaves:[]} */
+  var langSet = {}, maxDepth = 0, hasValueCol = false;
+
+  if(!isPlain(fileData)) throw new Error('"' + fileKey + '" 의 값이 객체가 아닙니다.');
+
+  Object.keys(fileData).forEach(function(id){
+    var leaves = [];
+    collectLeaves(fileData[id], [], leaves);
+    leaves.forEach(function(lf){
+      if(lf.path.length > maxDepth) maxDepth = lf.path.length;
+      Object.keys(lf.values).forEach(function(k){
+        if(k === VALUE_KEY) hasValueCol = true; else langSet[k] = true;
+      });
+    });
+    entries.push({id:id, leaves:leaves});
+  });
+
+  var langs;
+  if(opts.allLangs){
+    langs = LANG_ORDER.slice();
+    sortLangs(langSet).forEach(function(l){ if(langs.indexOf(l) === -1) langs.push(l); });
+  } else {
+    langs = sortLangs(langSet);
+  }
+
+  var typeCols = [];
+  for(var d=0; d<maxDepth; d++) typeCols.push(d === 0 ? "type" : "type" + (d+1));
+
+  var header = [fileKey].concat(typeCols, langs);
+  if(hasValueCol) header.push("value");
+
+  var aoa = [header], rowCount = 0;
+  entries.forEach(function(e){
+    var first = true;
+    e.leaves.forEach(function(lf){
+      var row = [(first || opts.repeatId) ? e.id : ""];
+      for(var d=0; d<maxDepth; d++) row.push(lf.path[d] !== undefined ? lf.path[d] : "");
+      langs.forEach(function(l){
+        var v = lf.values[l];
+        row.push(v === undefined || v === null ? "" : String(v));
+      });
+      if(hasValueCol){
+        var pv = lf.values[VALUE_KEY];
+        row.push(pv === undefined || pv === null ? "" : String(pv));
+      }
+      aoa.push(row);
+      rowCount++;
+      first = false;
+    });
+  });
+
+  return {
+    file: fileKey, header: header, aoa: aoa,
+    langs: langs, typeCols: typeCols,
+    idCount: entries.length, rowCount: rowCount
+  };
+}
+
+/* JSON 전체 -> 시트 목록 */
+function buildAll(json, opts){
+  if(!isPlain(json)) throw new Error("최상위가 객체(JSON)가 아닙니다.");
+  var keys = Object.keys(json);
+  if(!keys.length) throw new Error("내용이 비어 있습니다.");
+  return keys.map(function(k){ return buildSheet(k, json[k], opts); });
+}
+
+/* 엑셀 시트명: .xlsx 제거, 금지문자 치환, 31자 제한, 중복 회피 */
+function sheetName(fileKey, used){
+  var n = String(fileKey).replace(/\.xlsx$/i, "").replace(/[\[\]:*?\/\\]/g, "_").trim();
+  if(!n) n = "Sheet";
+  n = n.slice(0, 31);
+  var base = n, i = 2;
+  while(used[n]){ var suffix = "_" + i++; n = base.slice(0, 31 - suffix.length) + suffix; }
+  used[n] = true;
+  return n;
+}
+
+/* 열 너비(문자 수 기준) */
+function colWidths(sheet){
+  return sheet.header.map(function(h, i){
+    var max = String(h).length;
+    for(var r = 1; r < sheet.aoa.length; r++){
+      var c = sheet.aoa[r][i];
+      if(c == null) continue;
+      var lines = String(c).split("\n");
+      for(var j = 0; j < lines.length; j++) if(lines[j].length > max) max = lines[j].length;
+    }
+    return { wch: Math.min(Math.max(max + 2, 8), 60) };
+  });
+}
+
+if(typeof module !== "undefined" && module.exports){
+  module.exports = { LANG_ORDER:LANG_ORDER, isLangMap:isLangMap, collectLeaves:collectLeaves,
+                     buildSheet:buildSheet, buildAll:buildAll, sheetName:sheetName,
+                     colWidths:colWidths, VALUE_KEY:VALUE_KEY };
+}
+</script>
+
+<script id="ui">
+(function(){
+  var $ = function(id){ return document.getElementById(id); };
+  var input = $("input"), msg = $("msg"), tabs = $("tabs"), preview = $("preview");
+  var sheets = [], active = 0;
+
+  function say(text, cls){ msg.textContent = text || ""; msg.className = "msg" + (cls ? " " + cls : ""); }
+  function opts(){ return { repeatId: $("repeatId").checked, allLangs: $("allLangs").checked }; }
+
+  function esc(t){
+    return String(t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+  }
+
+  function render(){
+    tabs.innerHTML = "";
+    sheets.forEach(function(s, i){
+      var b = document.createElement("button");
+      b.className = "tab" + (i === active ? " active" : "");
+      b.textContent = s.file + " (" + s.rowCount + ")";
+      b.onclick = function(){ active = i; render(); };
+      tabs.appendChild(b);
+    });
+
+    var s = sheets[active];
+    if(!s){ preview.innerHTML = ""; return; }
+
+    var LIMIT = 200, shown = Math.min(s.aoa.length - 1, LIMIT);
+    var html = "<table><thead><tr>";
+    s.header.forEach(function(h){ html += "<th>" + esc(h) + "</th>"; });
+    html += "</tr></thead><tbody>";
+    for(var r = 1; r <= shown; r++){
+      html += "<tr>";
+      s.aoa[r].forEach(function(c, ci){
+        var cls = ci === 0 ? "id" : (ci <= s.typeCols.length ? "type" : "");
+        var t = String(c);
+        if(t.length > 220) t = t.slice(0, 220) + " ...";
+        html += '<td class="' + cls + '">' + esc(t) + "</td>";
+      });
+      html += "</tr>";
+    }
+    html += "</tbody></table>";
+    preview.innerHTML = html;
+    $("previewHint").textContent =
+      "ID " + s.idCount + "개 / 행 " + s.rowCount + "개 / 언어 " + s.langs.length + "개" +
+      (s.rowCount > shown ? "  -  미리보기는 " + shown + "행까지만 표시 (다운로드는 전체)" : "");
+  }
+
+  function parse(){
+    var raw = input.value.trim();
+    if(!raw){ say("JSON을 먼저 붙여넣어 주세요.", "warn"); return false; }
+    var json;
+    try{ json = JSON.parse(raw); }
+    catch(e){ say("JSON 형식 오류: " + e.message, "err"); return false; }
+    try{ sheets = buildAll(json, opts()); }
+    catch(e){ say("변환 오류: " + e.message, "err"); return false; }
+
+    active = 0;
+    $("previewCard").hidden = false;
+    $("dlCard").hidden = false;
+    render();
+    var totalRows = sheets.reduce(function(a, s){ return a + s.rowCount; }, 0);
+    say("변환 완료 - 파일(시트) " + sheets.length + "개, 전체 " + totalRows + "행", "ok");
+    return true;
+  }
+
+  function toWorksheet(s){
+    var ws = XLSX.utils.aoa_to_sheet(s.aoa);
+    ws["!cols"] = colWidths(s);
+    return ws;
+  }
+  function stamp(){
+    var d = new Date(), p = function(n){ return (n < 10 ? "0" : "") + n; };
+    return "" + d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate());
+  }
+  function ready(){
+    if(typeof XLSX === "undefined"){
+      say("엑셀 라이브러리(SheetJS)를 불러오지 못했습니다. 인터넷 연결 상태에서 페이지를 새로고침해 주세요.", "err");
+      return false;
+    }
+    return true;
+  }
+
+  $("parse").onclick = parse;
+  $("repeatId").onchange = function(){ if(sheets.length) parse(); };
+  $("allLangs").onchange = function(){ if(sheets.length) parse(); };
+
+  $("dlOne").onclick = function(){
+    if(!ready()) return;
+    if(!sheets.length && !parse()) return;
+    var wb = XLSX.utils.book_new(), used = {};
+    sheets.forEach(function(s){ XLSX.utils.book_append_sheet(wb, toWorksheet(s), sheetName(s.file, used)); });
+    XLSX.writeFile(wb, "translations_" + stamp() + ".xlsx");
+    say("통합 파일을 저장했습니다.", "ok");
+  };
+
+  $("dlMany").onclick = function(){
+    if(!ready()) return;
+    if(!sheets.length && !parse()) return;
+    sheets.forEach(function(s, i){
+      setTimeout(function(){
+        var wb = XLSX.utils.book_new(), used = {};
+        XLSX.utils.book_append_sheet(wb, toWorksheet(s), sheetName(s.file, used));
+        var name = /\.xlsx$/i.test(s.file) ? s.file : s.file + ".xlsx";
+        XLSX.writeFile(wb, name);
+      }, i * 400);
+    });
+    say(sheets.length + "개 파일을 순서대로 저장합니다. 브라우저가 여러 파일 다운로드를 물어보면 허용해 주세요.", "ok");
+  };
+
+  $("clear").onclick = function(){
+    input.value = ""; sheets = []; $("previewCard").hidden = true; $("dlCard").hidden = true; say("");
+  };
+
+  $("sample").onclick = function(){
+    input.value = JSON.stringify(SAMPLE, null, 2);
+    parse();
+  };
+
+  /* 파일 열기 / 드래그 앤 드롭 */
+  var drop = $("drop"), fileInput = $("file");
+  drop.onclick = function(){ fileInput.click(); };
+  fileInput.onchange = function(){ if(fileInput.files[0]) readFile(fileInput.files[0]); };
+  ["dragenter","dragover"].forEach(function(ev){
+    drop.addEventListener(ev, function(e){ e.preventDefault(); drop.classList.add("over"); });
+  });
+  ["dragleave","drop"].forEach(function(ev){
+    drop.addEventListener(ev, function(e){ e.preventDefault(); drop.classList.remove("over"); });
+  });
+  drop.addEventListener("drop", function(e){
+    var f = e.dataTransfer.files[0];
+    if(f) readFile(f);
+  });
+  function readFile(f){
+    var r = new FileReader();
+    r.onload = function(){ input.value = r.result; parse(); };
+    r.onerror = function(){ say("파일을 읽지 못했습니다.", "err"); };
+    r.readAsText(f, "utf-8");
+  }
+
+  var SAMPLE = {
+    "itemInfo.xlsx": {
+      "31400": {
+        "unidentifiedDisplayName": { "ko-KR": "액세서리" },
+        "identifiedDisplayName": { "ko-KR": "의상 리본", "en-US": "Costume Ribbon" },
+        "identifiedDescriptionName": { "ko-KR": "계열 : {CL:3}의상장비{CL:0}\n무게 : {CL:3}0{CL:0}" }
+      },
+      "106885": {
+        "identifiedDisplayName": { "ko-KR": "구마모토산 수박" },
+        "identifiedDescriptionName": { "ko-KR": "크고 잘 익은 구마모토산 수박." }
+      }
+    },
+    "msgstring.xlsx": {
+      "MSI_SKILL_REQUIREMENTS": { "es-ES": "Requisito de aprendizaje:" }
+    },
+    "StateIconInfo.xlsx": {
+      "1524": { "EFST_C_BUFF_16": { "descript": { "ko-KR": "맛있는 버프\n%s" } } }
+    },
+    "Npcdata.xlsx": {
+      "tkjoAQ": { "ko-KR": "초록 토마토" },
+      "hEjoAQ": { "ko-KR": "메로링" }
+    }
+  };
+})();
+</script>
+</body>
+</html>
