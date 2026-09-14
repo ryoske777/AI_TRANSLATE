@@ -76,6 +76,7 @@
       <button id="clear">지우기</button>
       <label class="opt"><input type="checkbox" id="repeatId"> 모든 행에 ID 반복</label>
       <label class="opt"><input type="checkbox" id="allLangs"> 표준 언어 열 모두 표시</label>
+      <label class="opt"><input type="checkbox" id="skipEmpty"> 내용이 빈 행 제외</label>
     </div>
     <div class="msg" id="msg"></div>
   </div>
@@ -108,8 +109,12 @@
       ② 1열 = <b>ID</b> (JSON의 숫자/영문 키). 2행부터 시작하며, 같은 ID의 여러 행은 첫 행에만 표시<br>
       ③ ID 다음 단계의 키(<code>identifiedDisplayName</code>, <code>descript</code> …)는
          <b>type</b> 열로. 단계가 더 깊으면 <code>type2</code>, <code>type3</code>… 이 자동 추가<br>
-      ④ <code>ko-KR</code>, <code>en-US</code> … 국가 코드는 1행에 표준 순서대로<br>
-      ⑤ ID 바로 아래가 국가 코드면(<code>Npcdata</code>, <code>mobdef</code> 등) type 열 없이 출력
+      ④ <code>ko-KR</code>, <code>en-US</code> … 국가 코드는 <b>항상 1행의 열</b>로. JSON에서 몇 단계
+         아래에 있든 언어 단계를 찾아 가로로 펼칩니다<br>
+      ⑤ ID 바로 아래가 국가 코드면(<code>Npcdata</code>, <code>mobdef</code> 등) type 열 없이 출력<br>
+      ⑥ 언어 <b>아래</b>에 또 구조가 있으면(<code>"ko-KR": {"prev":…, "curr":…}</code>)
+         <code>prev</code>/<code>curr</code>가 type 열로 내려가고 언어는 열로 유지 →
+         한 행에 전 언어의 <code>prev</code>, 다음 행에 전 언어의 <code>curr</code>
     </p>
   </div>
 </div>
@@ -118,37 +123,63 @@
 /* ===== 순수 변환 로직 (UI와 분리 - node 테스트에서 그대로 사용) ===== */
 var LANG_ORDER = ["ko-KR","en-US","ja-JP","zh-CN","zh-TW","th-TH","pt-BR","es-ES",
                   "de-DE","fr-FR","id-ID","tr-TR","es-419","ru-RU","vi-VN"];
-var LANG_RE = /^[a-z]{2,3}(-[A-Za-z0-9]{2,8})?$/;
-var VALUE_KEY = "@@value@@";   /* 국가코드가 아닌 단일 값에 쓰는 내부 키 */
+var LANG_RE = /^[a-z]{2,3}-[A-Za-z0-9]{2,8}$/;   /* ko-KR, en-US, es-419 … */
+var VALUE_KEY = "@@value@@";   /* 국가코드 구분이 없는 단일 값에 쓰는 내부 키 */
+var SEP = String.fromCharCode(31);   /* 하위 경로 조합용 구분자 */
 
 function isPlain(o){ return o !== null && typeof o === "object" && !Array.isArray(o); }
 
-/* {ko-KR:"..", en-US:".."} 처럼 키가 모두 국가코드이고 값이 문자열인가 */
-function isLangMap(o){
+/* {ko-KR:…, en-US:…} 처럼 키가 모두 국가 코드인 단계인가.
+   값은 문자열이든 {prev,curr} 같은 객체든 상관없다 — 이 단계가 언어 축이 된다. */
+function isLangLevel(o){
   if(!isPlain(o)) return false;
   var ks = Object.keys(o);
   if(!ks.length) return false;
-  for(var i=0;i<ks.length;i++){
-    if(!LANG_RE.test(ks[i])) return false;
-    var v = o[ks[i]];
-    if(v !== null && typeof v === "object") return false;
-  }
+  for(var i=0;i<ks.length;i++) if(!LANG_RE.test(ks[i])) return false;
   return true;
 }
 
-/* id 아래를 재귀로 훑어 리프(언어맵 또는 단일 값)를 모은다 */
-function collectLeaves(node, path, out){
-  if(isLangMap(node)){ out.push({path:path.slice(), values:node}); return; }
-  if(isPlain(node)){
-    var ks = Object.keys(node);
-    if(!ks.length){ out.push({path:path.slice(), values:{}}); return; }
-    for(var i=0;i<ks.length;i++) collectLeaves(node[ks[i]], path.concat([ks[i]]), out);
+/* 언어 밑에 남은 구조({prev,curr} 등)를 평탄화해 (하위경로, 값) 으로 넘긴다 */
+function flattenValue(v, path, cb){
+  if(isPlain(v)){
+    var ks = Object.keys(v);
+    if(!ks.length){ cb(path, ""); return; }
+    for(var i=0;i<ks.length;i++) flattenValue(v[ks[i]], path.concat([ks[i]]), cb);
     return;
   }
-  if(Array.isArray(node)){ out.push({path:path.slice(), values:defVal(node.join(", "))}); return; }
-  out.push({path:path.slice(), values:defVal(node)});
+  if(Array.isArray(v)){ cb(path, v.join(", ")); return; }
+  cb(path, (v === null || v === undefined) ? "" : v);
 }
-function defVal(v){ var o = {}; o[VALUE_KEY] = v; return o; }
+
+/* id 아래를 재귀로 훑어 행을 만든다.
+   above = 언어 단계보다 위의 키, below = 언어 단계보다 아래의 키(prev/curr 등) */
+function collectRows(node, above, out){
+  if(isLangLevel(node)){
+    var order = [], map = {};
+    Object.keys(node).forEach(function(lang){
+      flattenValue(node[lang], [], function(below, val){
+        var k = below.join(SEP);
+        if(!map[k]){
+          map[k] = { above: above.slice(), below: below.slice(), values: {} };
+          order.push(k);
+        }
+        map[k].values[lang] = val;
+      });
+    });
+    order.forEach(function(k){ out.push(map[k]); });
+    return;
+  }
+  if(isPlain(node)){
+    var ks = Object.keys(node);
+    if(!ks.length){ out.push({above:above.slice(), below:[], values:{}}); return; }
+    for(var i=0;i<ks.length;i++) collectRows(node[ks[i]], above.concat([ks[i]]), out);
+    return;
+  }
+  /* 언어 구분이 아예 없는 단일 값 */
+  var o = {};
+  o[VALUE_KEY] = Array.isArray(node) ? node.join(", ") : ((node === null || node === undefined) ? "" : node);
+  out.push({above:above.slice(), below:[], values:o});
+}
 
 function sortLangs(set){
   var known = [], extra = [];
@@ -164,21 +195,22 @@ function sortLangs(set){
 /* 한 개 .xlsx 파일(JSON 최상위 키) -> 시트 데이터 */
 function buildSheet(fileKey, fileData, opts){
   opts = opts || {};
-  var entries = [];           /* {id, leaves:[]} */
-  var langSet = {}, maxDepth = 0, hasValueCol = false;
+  var entries = [];           /* {id, rows:[]} */
+  var langSet = {}, maxAbove = 0, maxBelow = 0, hasValueCol = false;
 
   if(!isPlain(fileData)) throw new Error('"' + fileKey + '" 의 값이 객체가 아닙니다.');
 
   Object.keys(fileData).forEach(function(id){
-    var leaves = [];
-    collectLeaves(fileData[id], [], leaves);
-    leaves.forEach(function(lf){
-      if(lf.path.length > maxDepth) maxDepth = lf.path.length;
-      Object.keys(lf.values).forEach(function(k){
+    var rows = [];
+    collectRows(fileData[id], [], rows);
+    rows.forEach(function(r){
+      if(r.above.length > maxAbove) maxAbove = r.above.length;
+      if(r.below.length > maxBelow) maxBelow = r.below.length;
+      Object.keys(r.values).forEach(function(k){
         if(k === VALUE_KEY) hasValueCol = true; else langSet[k] = true;
       });
     });
-    entries.push({id:id, leaves:leaves});
+    entries.push({id:id, rows:rows});
   });
 
   var langs;
@@ -189,8 +221,8 @@ function buildSheet(fileKey, fileData, opts){
     langs = sortLangs(langSet);
   }
 
-  var typeCols = [];
-  for(var d=0; d<maxDepth; d++) typeCols.push(d === 0 ? "type" : "type" + (d+1));
+  var typeCols = [], total = maxAbove + maxBelow;
+  for(var d=0; d<total; d++) typeCols.push(d === 0 ? "type" : "type" + (d+1));
 
   var header = [fileKey].concat(typeCols, langs);
   if(hasValueCol) header.push("value");
@@ -198,15 +230,25 @@ function buildSheet(fileKey, fileData, opts){
   var aoa = [header], rowCount = 0;
   entries.forEach(function(e){
     var first = true;
-    e.leaves.forEach(function(lf){
+    var rows = e.rows;
+    if(opts.skipEmpty){
+      rows = rows.filter(function(r){
+        return Object.keys(r.values).some(function(k){
+          var v = r.values[k];
+          return v !== undefined && v !== null && String(v) !== "";
+        });
+      });
+    }
+    rows.forEach(function(r){
       var row = [(first || opts.repeatId) ? e.id : ""];
-      for(var d=0; d<maxDepth; d++) row.push(lf.path[d] !== undefined ? lf.path[d] : "");
+      for(var a=0; a<maxAbove; a++) row.push(r.above[a] !== undefined ? r.above[a] : "");
+      for(var b=0; b<maxBelow; b++) row.push(r.below[b] !== undefined ? r.below[b] : "");
       langs.forEach(function(l){
-        var v = lf.values[l];
+        var v = r.values[l];
         row.push(v === undefined || v === null ? "" : String(v));
       });
       if(hasValueCol){
-        var pv = lf.values[VALUE_KEY];
+        var pv = r.values[VALUE_KEY];
         row.push(pv === undefined || pv === null ? "" : String(pv));
       }
       aoa.push(row);
@@ -256,9 +298,9 @@ function colWidths(sheet){
 }
 
 if(typeof module !== "undefined" && module.exports){
-  module.exports = { LANG_ORDER:LANG_ORDER, isLangMap:isLangMap, collectLeaves:collectLeaves,
-                     buildSheet:buildSheet, buildAll:buildAll, sheetName:sheetName,
-                     colWidths:colWidths, VALUE_KEY:VALUE_KEY };
+  module.exports = { LANG_ORDER:LANG_ORDER, isLangLevel:isLangLevel, collectRows:collectRows,
+                     flattenValue:flattenValue, buildSheet:buildSheet, buildAll:buildAll,
+                     sheetName:sheetName, colWidths:colWidths, VALUE_KEY:VALUE_KEY };
 }
 </script>
 
@@ -269,7 +311,8 @@ if(typeof module !== "undefined" && module.exports){
   var sheets = [], active = 0;
 
   function say(text, cls){ msg.textContent = text || ""; msg.className = "msg" + (cls ? " " + cls : ""); }
-  function opts(){ return { repeatId: $("repeatId").checked, allLangs: $("allLangs").checked }; }
+  function opts(){ return { repeatId: $("repeatId").checked, allLangs: $("allLangs").checked,
+                            skipEmpty: $("skipEmpty").checked }; }
 
   function esc(t){
     return String(t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
@@ -347,6 +390,7 @@ if(typeof module !== "undefined" && module.exports){
   $("parse").onclick = parse;
   $("repeatId").onchange = function(){ if(sheets.length) parse(); };
   $("allLangs").onchange = function(){ if(sheets.length) parse(); };
+  $("skipEmpty").onchange = function(){ if(sheets.length) parse(); };
 
   $("dlOne").onclick = function(){
     if(!ready()) return;
