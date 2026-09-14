@@ -158,16 +158,41 @@ EN과 KR이 충돌할 경우, 항상 KR의 의미를 우선합니다.
 - 명확하고 중립적이며 자연스러운 표현을 우선하세요.
 - 불필요한 구어체를 피하세요.
 - 유럽식 포르투갈어(pt-PT) 고유의 표현·철자를 피하세요:
+  · **철자 부호(악센트) — pt-PT 와 가장 확실하게 갈리는 지점입니다. 반드시 지키세요.**
+    비음(m, n) 앞 모음은 브라질 정서법에서 곡절 부호(ê, ô)를 씁니다.
+    예각 부호(é, ó)를 쓰면 그 즉시 유럽식 표기가 됩니다.
+      económico  → econômico      fenómeno  → fenômeno      bónus     → bônus
+      ténis      → tênis          cómodo    → cômodo        António   → Antônio
+      génio      → gênio          prémio    → prêmio        académico → acadêmico
+      anónimo    → anônimo        sinónimo  → sinônimo      polémica  → polêmica
+      oxigénio   → oxigênio       higiénico → higiênico     cénico    → cênico
+      quilómetro → quilômetro     Amazónia  → Amazônia      ónus      → ônus
+    ▶ 출력 직전에 -ónico / -ónimo / -ómico / -ónomo / -émio / -énio / -ónia / -ómeno
+      형태가 남아 있는지 확인하고, 있으면 반드시
+      -ônico / -ônimo / -ômico / -ônomo / -êmio / -ênio / -ônia / -ômeno 로 고치세요.
+  · 자음군 c/p — 유럽식은 빼지만 브라질식은 살립니다.
+      receção → recepção    deteção → detecção    conceção → concepção
+      infeção → infecção    facto   → fato        contacto → contato
   · 진행형은 'estar + 동명사'(estar usando)를 쓰고, 유럽식 'estar a + 부정사'(estar a usar)는 금지
   · 유럽식 어휘 대신 브라질 어휘 사용
     (예: ecrã → tela, utilizador → usuário, ficheiro → arquivo, rato → mouse,
-     equipa → equipe, telemóvel → celular, autocarro → ônibus)
+     equipa → equipe, telemóvel → celular, autocarro → ônibus,
+     palavra-passe → senha, descarregar → baixar, guardar(저장) → salvar,
+     aplicação → aplicativo, ligar/desligar 맥락의 'carregar em' → 'clicar em',
+     casa de banho → banheiro, comboio → trem, sumo → suco)
   · 대명사는 브라질 규범대로 동사 앞에 두는 형태를 기본으로 하고,
     유럽식 후치(ênclise/mesóclise) 남용은 피하세요. (예: dá-te → te dá)
 - 스페인어 단어·철자 혼입 절대 금지
   (예: Poción → Poção, vendible → vendável, ñ·ll·¿·¡ 등 스페인어 철자·기호 사용 금지)
 - 포르투갈 본토 및 아프리카 포르투갈어권 고유 표현은 사용하지 마세요.
 - 게임 맥락(판타지, 시스템, 전투, 인터페이스, 경고 등)에 맞는 어조를 유지하세요.
+
+▶ 출력 직전 자기 점검 (한 줄이라도 걸리면 고친 뒤 출력):
+  1) -ónico/-ómico/-ónimo/-émio/-énio/-ónia 등 유럽식 예각 부호가 남아 있지 않은가?
+  2) 'estar a + 부정사' 를 쓰지 않았는가?
+  3) receção/deteção/conceção/facto/contacto 같은 유럽식 철자가 없는가?
+  4) ecrã·utilizador·ficheiro·telemóvel 같은 유럽식 어휘가 없는가?
+  5) 스페인어 철자·기호(ñ, ll, ¿, ¡)가 섞이지 않았는가?
 
 ────────────────────────────────
 [ 문장부호 및 스타일 ]

@@ -29,15 +29,42 @@ PROMPTS_DIR = paths.app_path("prompts")
 _BUNDLED_PROMPTS_DIR = paths.resource_path("prompts")
 # 번들 기본값을 외부로 시드한 시점의 해시 기록 (편집 보존 판정용).
 _PROMPT_SEED_FILE = paths.app_path(".prompt_seed.json")
+# 과거에 배포된 모든 기본 프롬프트의 해시 (tools/make_prompt_baseline.py 가 생성).
+_KNOWN_DEFAULTS_FILE = paths.resource_path("prompts", "_known_defaults.json")
+
+# 이번 실행에서 '편집본이라 보존했지만 기본값과 다른' 프롬프트 목록.
+# UI 가 이 값을 보고 사용자에게 알린다 — 조용히 옛 프롬프트를 쓰는 일이 없도록.
+STALE_PROMPTS = []
+
+
+def _load_known_defaults():
+    """과거 배포본 해시표를 읽는다. {파일명: {해시, ...}}"""
+    try:
+        with open(_KNOWN_DEFAULTS_FILE, "r", encoding="utf-8") as f:
+            return {k: set(v) for k, v in json.load(f).items()}
+    except Exception:
+        return {}
 
 
 def ensure_external_prompts():
     """exe 실행 시 번들된 기본 프롬프트를 PROMPTS_DIR 로 시드한다.
 
-    3-way 판정으로 사용자가 편집한 파일은 보존하고, 손대지 않은 파일만
-    새 기본값으로 갱신한다. (updater 의 프롬프트 보존 철학을 로컬에서 재현)
+    사용자가 편집한 파일은 보존하고, 손대지 않은 파일만 새 기본값으로 갱신한다.
+    '손대지 않았다'는 두 가지로 판정한다:
+      1) 직전 시드본 해시와 같다 (.prompt_seed.json 기록)
+      2) **과거에 배포된 어떤 기본값과 같다** (_known_defaults.json)
+
+    2번이 핵심이다. 시드 기록 장치가 생기기 전에 깔린 파일은 1번 기록이 없어서,
+    편집하지 않았는데도 영원히 보존됐다 — 프롬프트를 고쳐 배포해도 그 사용자에겐
+    전달되지 않는 침묵 버그였다. (실제로 pt 프롬프트를 pt-PT → pt-BR 로 바꾼
+    v1.4.10/v1.4.13 이 전달되지 않아, 브라질 번역에 유럽 포르투갈어 프롬프트가
+    계속 쓰였다.)
+
+    어느 과거 기본값과도 다르면 진짜 사용자 편집이므로 보존하되, STALE_PROMPTS 에
+    담아 UI 가 "기본값이 바뀌었는데 편집본을 쓰고 있다"고 알릴 수 있게 한다.
     개발 모드(번들=외부 동일 폴더)에서는 아무 것도 하지 않는다.
     """
+    del STALE_PROMPTS[:]
     src, dst = _BUNDLED_PROMPTS_DIR, PROMPTS_DIR
     if os.path.abspath(src) == os.path.abspath(dst) or not os.path.isdir(src):
         return
@@ -47,6 +74,7 @@ def ensure_external_prompts():
             seed = json.load(f)
     except Exception:
         seed = {}
+    known = _load_known_defaults()
     changed = False
     for name in os.listdir(src):
         if not name.endswith(".txt"):
@@ -64,20 +92,72 @@ def ensure_external_prompts():
         with open(d, "rb") as f:
             chash = hashlib.sha256(f.read()).hexdigest()
         if chash == bhash:
-            continue  # 이미 최신
-        if seed.get(name) == chash:
-            # 직전 시드본 그대로 = 사용자가 안 건드림 → 새 기본값으로 갱신
+            seed[name] = bhash          # 기록이 없던 파일도 여기서 기록해 둔다
+            changed = True
+            continue
+        if seed.get(name) == chash or chash in known.get(name, ()):
+            # 직전 시드본 그대로거나 과거 배포본 그대로 = 편집한 적 없음 → 갱신
             with open(d, "wb") as f:
                 f.write(bundled)
             seed[name] = bhash
             changed = True
-        # else: 사용자가 편집했거나 기록 없음 → 보존
+            continue
+        # 진짜 편집본 → 보존하되, 기본값이 바뀌었다는 사실은 알린다
+        STALE_PROMPTS.append(name[:-4])
     if changed:
         try:
             with open(_PROMPT_SEED_FILE, "w", encoding="utf-8") as f:
                 json.dump(seed, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
+
+
+def restore_default_prompt(lang):
+    """프롬프트 하나를 번들 기본값으로 되돌린다 (프롬프트 편집창의 '기본값 복원').
+
+    편집본이라 자동 갱신에서 보존된 파일을 사용자가 직접 최신 기본값으로
+    돌릴 수 있게 하는 탈출구. 반환: 성공 여부
+    """
+    name = f"{lang}.txt"
+    srcp = os.path.join(_BUNDLED_PROMPTS_DIR, name)
+    dstp = os.path.join(PROMPTS_DIR, name)
+    if not os.path.exists(srcp) or os.path.abspath(srcp) == os.path.abspath(dstp):
+        return False
+    with open(srcp, "rb") as f:
+        bundled = f.read()
+    with open(dstp, "wb") as f:
+        f.write(bundled)
+    try:
+        try:
+            with open(_PROMPT_SEED_FILE, "r", encoding="utf-8") as f:
+                seed = json.load(f)
+        except Exception:
+            seed = {}
+        seed[name] = hashlib.sha256(bundled).hexdigest()
+        with open(_PROMPT_SEED_FILE, "w", encoding="utf-8") as f:
+            json.dump(seed, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+    if lang in STALE_PROMPTS:
+        STALE_PROMPTS.remove(lang)
+    return True
+
+
+def prompt_is_default(lang):
+    """이 프롬프트가 현재 번들 기본값과 같은가. (개발 모드면 항상 True)"""
+    name = f"{lang}.txt"
+    srcp = os.path.join(_BUNDLED_PROMPTS_DIR, name)
+    dstp = os.path.join(PROMPTS_DIR, name)
+    if os.path.abspath(srcp) == os.path.abspath(dstp):
+        return True
+    try:
+        with open(srcp, "rb") as f:
+            a = hashlib.sha256(f.read()).hexdigest()
+        with open(dstp, "rb") as f:
+            b = hashlib.sha256(f.read()).hexdigest()
+        return a == b
+    except Exception:
+        return True
 
     # 통합/삭제된 프롬프트가 외부 폴더에 남아 있으면 정리한다.
     for name in DEPRECATED_PROMPTS:
@@ -548,6 +628,93 @@ def write_results(sheet, start_row, results):
             print(f"  → 스프레드시트 저장 완료 ({rc}{start_row}~{rc}{start_row + len(results) - 1})")
         except Exception as e:
             print(f"  ❌ 스프레드시트 저장 실패: {e}")
+
+
+# ── 결과열 머리글 (어느 언어인지 시트에서 바로 보이게) ──────────────────────
+#
+# 여러 언어를 한 시트에 붙이면 F/H/J/L… 중 어느 열이 무슨 언어인지 알 수 없다.
+# 그래서 데이터 시작 행 바로 위(보통 1행)에 로케일 표기를 적어 둔다.
+# 사용자가 직접 적어 둔 머리글은 덮지 않는다 — 우리가 쓴 것으로 보이는 값이거나
+# 빈 칸일 때만 기입한다.
+
+NOTE_HEADER_SUFFIX = "특이사항"
+
+
+def _managed_headers():
+    """우리가 기입했을 법한 머리글 값의 집합 (덮어써도 되는지 판정용)."""
+    out = set()
+    for code, loc in LANG_LOCALES.items():
+        out.add(loc)
+        out.add(f"{loc} {NOTE_HEADER_SUFFIX}")
+        label = LANG_LABELS.get(code)
+        if label:
+            out.add(label)
+            out.add(f"{label} {NOTE_HEADER_SUFFIX}")
+    out.add(NOTE_HEADER_SUFFIX)
+    return out
+
+
+def header_row_num():
+    """머리글을 적을 행 번호. 데이터가 1행부터면 머리글 자리가 없어 None."""
+    start = int(getattr(config, "START_ROW", 2) or 2)
+    return start - 1 if start > 1 else None
+
+
+def write_column_headers(sheet, lang, result_col=None, note_col=None, with_note=True):
+    """결과열/특이사항열 머리글에 로케일 표기를 적는다.
+
+    예) 결과열 V → V1 = 'pt-BR', 특이사항열 W → W1 = 'pt-BR 특이사항'
+    사용자가 따로 적어 둔 머리글이 있으면 건드리지 않는다.
+    반환: 실제로 기입한 {열: 값} (아무 것도 안 했으면 빈 dict)
+    """
+    if not getattr(config, "WRITE_HEADER", True):
+        return {}
+    row = header_row_num()
+    if row is None:
+        return {}
+    result_col = result_col or getattr(config, "RESULT_COL", "D")
+    note_col = note_col or get_note_col()
+    loc = LANG_LOCALES.get(lang) or LANG_LABELS.get(lang) or lang
+    if not loc:
+        return {}
+
+    want = {result_col: loc}
+    if with_note:
+        want[note_col] = f"{loc} {NOTE_HEADER_SUFFIX}"
+
+    cols = sorted(want, key=col_to_idx)
+    lo, hi = cols[0], cols[-1]
+    try:
+        cur = sheet.get(f"{lo}{row}:{hi}{row}")
+    except Exception:
+        cur = []
+    row_vals = cur[0] if cur else []
+    base = col_to_idx(lo)
+
+    def existing(colletter):
+        i = col_to_idx(colletter) - base
+        if 0 <= i < len(row_vals) and row_vals[i]:
+            return str(row_vals[i]).strip()
+        return ""
+
+    managed = _managed_headers()
+    updates, wrote = [], {}
+    for colletter, val in want.items():
+        have = existing(colletter)
+        if have == val:
+            continue
+        if have and have not in managed:
+            continue    # 사용자가 적어 둔 머리글 → 보존
+        updates.append({"range": f"{colletter}{row}", "values": [[val]]})
+        wrote[colletter] = val
+    if not updates:
+        return {}
+    try:
+        sheet.batch_update(updates)
+    except Exception as e:
+        print(f"  ❌ 머리글 기입 실패: {e}")
+        return {}
+    return wrote
 
 
 def write_status(sheet, row_num, status_text):
