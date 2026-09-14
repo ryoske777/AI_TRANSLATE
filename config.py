@@ -84,6 +84,19 @@ MODE_COL_ROLES = {
     "review_general":  {"COL_A_ROLE": "source", "COL_B_ROLE": "review",      "COL_C_ROLE": None,     "RESULT_COL": "D"},
 }
 
+# ── 용어집 (Glossary) ────────────────────────────────────────────────────────
+#   같은 스프레드시트의 한 탭에 든 용어집을 읽어 두 가지에 쓴다.
+#     ① «T:...» 플레이스홀더 내용을 그 언어의 공식 용어로 확정 치환 (AI 무관)
+#     ② 배치에 등장하는 용어만 뽑아 "이 번역을 쓰라"는 지시문을 프롬프트에 첨부
+#   필요한 열: ko-KR(열쇠), 각 언어 열(en-US/zh-CN/th-TH/es-ES/...),
+#              aliases, match_mode, protect_level, priority, status
+GLOSSARY_ENABLED = False      # 용어집 사용 여부 (탭 이름을 지정하면 켜진다)
+GLOSSARY_TAB     = ""         # 용어집이 든 탭 이름 (예: "glossary_master")
+
+#   프롬프트 지시문에 한 배치당 실을 최대 용어 수 (HARD → SOFT → HINT 순으로 채움)
+GLOSSARY_MAX_TERMS = 60
+
+
 # ── 연속 번역 (여러 언어를 순서대로 자동 실행) ───────────────────────────────
 #   메인 화면 🗂 버튼에서 편집한다. 실제 정본은 settings.json 의 SEQ_JOBS.
 #   각 단계: {"lang": 언어코드, "mode": "translate"|"copy",

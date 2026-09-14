@@ -40,7 +40,9 @@ from main import (
     WORK_MODE_LABELS, REVIEW_MODES, REVIEW_LANGS,
     LANG_LOCALES, SEQ_DEFAULT_ORDER, SEQ_MODE_TRANSLATE, SEQ_MODE_COPY,
     lang_display, seq_lang_choices, has_prompt, idx_to_col,
+    PLACEHOLDER_RE, get_worksheet,
 )
+import glossary as gloss
 import config
 
 # exe 실행 시 번들된 기본 프롬프트를 외부 폴더로 시드 (편집 보존).
@@ -76,6 +78,14 @@ if not hasattr(config, "SEQ_JOBS"):
     config.SEQ_JOBS = []
 if not hasattr(config, "SEQ_COPY_FROM"):
     config.SEQ_COPY_FROM = "auto"
+
+# 용어집 — 탭 이름이 지정돼 있고 켜져 있을 때만 읽는다
+if not hasattr(config, "GLOSSARY_ENABLED"):
+    config.GLOSSARY_ENABLED = False
+if not hasattr(config, "GLOSSARY_TAB"):
+    config.GLOSSARY_TAB = ""
+if not hasattr(config, "GLOSSARY_MAX_TERMS"):
+    config.GLOSSARY_MAX_TERMS = 60
 
 
 # ── 모드별 열 역할 프리셋 ────────────────────────────────────────────────────
@@ -254,7 +264,23 @@ def reconcile_status(sheet, start_row, lines, sources=None):
     return mismatch_rows, korean_rows, cleared_rows
 
 
-def audit_completed_rows(sheet, do_repair=True):
+def localize_ph_cell(cell, lang, gl):
+    """셀 안의 «T:...» 토큰을 대상 언어 용어로 바꾼 문자열을 돌려준다.
+
+    용어집을 켜면 결과열에는 '치환된' 플레이스홀더가 들어간다. 따라서 플레이스홀더
+    검증·복구는 원본(한국어) 그대로가 아니라 **같은 규칙으로 치환한 원본**과 비교해야
+    한다. 그렇지 않으면 정상인 행이 전부 '불일치'로 잡힌다.
+    """
+    if not gl or not cell:
+        return cell
+    tokens = PLACEHOLDER_RE.findall(cell)
+    if not tokens:
+        return cell
+    subst, _ = gloss.placeholder_substitutions(tokens, lang, gl)
+    return gloss.apply_substitutions_one(cell, subst)
+
+
+def audit_completed_rows(sheet, do_repair=True, glossary=None, lang=None):
     """결과열이 채워진 모든 행을 전수 검증한다. (실행 시작 시 1회)
 
     이미 기입된 과거 실행분(검증이 뚫려 있던 버전 산출물 포함)까지 소급 검사:
@@ -298,6 +324,10 @@ def audit_completed_rows(sheet, do_repair=True):
     check_ko = not is_korean_target()   # 한국어 번역 단계에선 한글이 정상
     ph_col = get_placeholder_col_letter()                 # 'A'/'B'/'C' 또는 None
     ph_idx = col_to_idx(ph_col) if ph_col else None
+    # 용어집을 쓰면 결과열의 «T:...» 는 대상 언어 용어로 치환돼 있으므로,
+    # 비교 기준이 되는 원본에도 같은 치환을 적용한다.
+    gl = glossary
+    gl_lang = lang or getattr(config, "PROMPT_LANG", "")
     start = getattr(config, "START_ROW", 1)
     result["ph_col"] = ph_col
     result["note_col"] = note_col
@@ -318,6 +348,7 @@ def audit_completed_rows(sheet, do_repair=True):
         desired = ""
         if ph_idx is not None:
             src_val = row[ph_idx] if len(row) > ph_idx else ""
+            src_val = localize_ph_cell(src_val, gl_lang, gl)
             if not check_placeholder_match(src_val, d_val):
                 fixed = repair_placeholder_line(src_val, d_val) if do_repair else None
                 if fixed is not None:
@@ -671,10 +702,13 @@ class CopyWorker(threading.Thread):
 # ── 번역 엔진 (스레드) ────────────────────────────────────────────────────────
 
 class TranslationWorker(threading.Thread):
-    def __init__(self, log_q, done_callback):
+    def __init__(self, log_q, done_callback, glossary=None):
         super().__init__(daemon=True)
         self.log_q = log_q
         self.done_callback = done_callback
+        self.glossary = glossary            # gloss.Glossary 또는 None
+        self.gl_changed = 0                 # 이번 실행에서 확정 치환한 토큰 수
+        self.gl_unmatched = set()           # 용어집에 없던 «T:» 내용
         self.stop_flag = False
         self.pause_flag = False
         self.force_new_conv = False  # 재시작 시 새 대화 강제
@@ -720,7 +754,9 @@ class TranslationWorker(threading.Thread):
         호출된다 — 과거 실행분의 훼손 플레이스홀더를 일괄 소급 복구하는 경로.
         """
         self.waiting("기존 완료 행 전수 검증 중")
-        au = audit_completed_rows(sheet)
+        au = audit_completed_rows(
+            sheet, glossary=self.glossary,
+            lang=getattr(config, "PROMPT_LANG", ""))
         self.done_waiting()
 
         def _preview(rows, limit=40):
@@ -758,6 +794,41 @@ class TranslationWorker(threading.Thread):
         if not au["ok"]:
             self.log(f"  ⚠️ 일부 기입 실패: {au['error']}", "error")
 
+    def glossary_for_batch(self, batch, lang):
+        """이 배치에 쓸 (플레이스홀더 치환표, 프롬프트 지시문) 을 만든다.
+
+        ① 번역 대상 열의 «T:...» 토큰 중 용어집에 '통째로' 있는 것만 대상 언어
+           용어로 바꾸는 치환표. 응답을 복원할 때 적용하므로 AI 와 무관하게 확정적이다.
+        ② 원본·참조·대상 열에 등장하는 용어를 모아 만든 프롬프트 지시문.
+           문장 속 용어는 기계 치환하면 조사·성수·어순이 깨지므로 지시만 한다.
+        반환: (subst, block, stats)
+        """
+        gl = self.glossary
+        if gl is None:
+            return {}, "", None
+
+        tokens = []
+        for row in batch:
+            cell = row[3] if len(row) > 3 else ""
+            if cell:
+                tokens.extend(PLACEHOLDER_RE.findall(cell))
+        subst, stats = gloss.placeholder_substitutions(tokens, lang, gl)
+
+        terms, seen = [], set()
+        for row in batch:
+            for i in (1, 2, 3):        # source / ref / placeholder
+                cell = row[i] if len(row) > i else ""
+                if not cell:
+                    continue
+                for t in gl.find_in_text(cell, lang):
+                    if t.key not in seen:
+                        seen.add(t.key)
+                        terms.append(t)
+        terms.sort(key=lambda t: (-gloss._LEVEL_ORDER.get(t.level, 0), -t.priority, t.ko))
+        block = gloss.build_glossary_block(
+            terms, lang, max_terms=int(getattr(config, "GLOSSARY_MAX_TERMS", 60) or 60))
+        return subst, block, stats
+
     def run(self):
         # ── AI 모드별 드라이버 함수 선택 ─────────────────────────────
         # config.AI_MODE에 따라 ChatGPT(main.py) 또는 Claude(claude_driver.py)
@@ -782,6 +853,8 @@ class TranslationWorker(threading.Thread):
         is_review = work_mode in REVIEW_MODES
         work_word = "검수" if is_review else "번역"
         fmt_batch = format_review_batch if is_review else format_batch
+        # 용어집 조회에 쓸 대상 언어 (번역 모드는 프롬프트 언어)
+        tgt_lang = getattr(config, "PROMPT_LANG", "")
         if is_review:
             src = getattr(config, "REVIEW_SRC_LANG", "ko")
             tgt = getattr(config, "REVIEW_TGT_LANG", "es")
@@ -797,6 +870,14 @@ class TranslationWorker(threading.Thread):
                 f"특이사항 {get_note_col()}열", "info")
             if is_korean_target():
                 self.log("대상 언어가 한국어 — '한글 포함' 감지·재번역·표시를 끕니다.", "info")
+            if self.glossary is not None:
+                n_lang = sum(1 for t in self.glossary.terms if t.target(tgt_lang))
+                self.log(
+                    f"📖 용어집: {len(self.glossary):,}개 용어 "
+                    f"(이 언어에 번역이 있는 항목 {n_lang:,}개) · 탭 '{self.glossary.tab}'",
+                    "info")
+            else:
+                self.log("📖 용어집: 사용 안 함", "info")
             # 플레이스홀더 검증 가능 여부를 실행 시작 시점에 명확히 알린다
             # (조건이 안 맞아 검증이 조용히 생략되는 일이 없도록)
             if get_placeholder_col_letter() is None:
@@ -958,10 +1039,35 @@ class TranslationWorker(threading.Thread):
                 else:
                     masked_batch, ph_map = batch, {}
 
+                # ── 용어집 ─────────────────────────────────────────
+                # ph_subst: «T:한국어» → «T:대상 언어 용어» 확정 치환표.
+                #   응답을 복원한 뒤 적용하므로 모델이 흔들려도 결과는 확정적이다.
+                # gl_block: 이 배치에 등장하는 용어만 담은 프롬프트 지시문.
+                ph_subst, gl_block, gl_stats = ({}, "", None)
+                if not is_review:
+                    ph_subst, gl_block, gl_stats = self.glossary_for_batch(batch, tgt_lang)
+                    if gl_stats:
+                        self.gl_changed += len(gl_stats["changed"])
+                        self.gl_unmatched.update(gl_stats["unmatched"])
+                        if gl_stats["changed"]:
+                            self.log(
+                                f"📖 용어집 확정 치환 {len(gl_stats['changed'])}건 "
+                                f"(플레이스홀더)", "success")
+                        if gl_stats["unsafe"]:
+                            self.log(
+                                f"⚠️ 용어집 값에 «» 가 있어 치환하지 않은 항목 "
+                                f"{len(gl_stats['unsafe'])}건 — 원문을 유지합니다.", "warn")
+
                 batch_msg = fmt_batch(masked_batch)
                 if ph_map:
-                    # 참고표: 토큰의 실제 내용을 문맥용으로 제공 (출력은 토큰 유지)
-                    batch_msg = placeholder_legend(ph_map) + "\n\n" + batch_msg
+                    # 참고표: 토큰의 실제 내용을 문맥용으로 제공 (출력은 토큰 유지).
+                    # 용어집으로 치환될 토큰은 '치환 후 용어'를 보여준다 — 모델이
+                    # 성·수·관사를 실제 들어갈 단어에 맞춰 판단할 수 있게.
+                    legend_map = {tok: ph_subst.get(orig, orig)
+                                  for tok, orig in ph_map.items()}
+                    batch_msg = placeholder_legend(legend_map) + "\n\n" + batch_msg
+                if gl_block:
+                    batch_msg = gl_block + "\n\n" + batch_msg
 
                 self.waiting(f"{s_row}~{e_row}행 {work_word} 요청 중 · 배치 {batch_no}/{total_batches}")
                 send_message(driver, batch_msg)
@@ -991,6 +1097,9 @@ class TranslationWorker(threading.Thread):
                     lines, missing = parse_response(response, batch)
                     lines = repair_masked_tokens(lines, ph_map)  # 깨진 «T:번호» 정규화
                     lines = unmask_placeholders(lines, ph_map)
+                    # 용어집 확정 치환 — 마스킹을 껐을 때도 동작한다
+                    # (그 경우 모델이 «T:한국어» 를 원형 그대로 돌려주므로 동일)
+                    lines = gloss.apply_substitutions(lines, ph_subst)
                     if missing:
                         self.log(f"⚠️ 응답 행 ID 누락 {len(missing)}행 (빈 칸 유지): {missing}", "warn")
                         log_failure(missing[0], missing[-1],
@@ -1023,6 +1132,7 @@ class TranslationWorker(threading.Thread):
                             retry_lines, _ = parse_response(retry_resp, retry_batch)
                             retry_lines = repair_masked_tokens(retry_lines, ph_map)
                             retry_lines = unmask_placeholders(retry_lines, ph_map)
+                            retry_lines = gloss.apply_substitutions(retry_lines, ph_subst)
                             for j, idx in enumerate(korean_idxs):
                                 if j < len(retry_lines) and idx < len(lines):
                                     if retry_lines[j]:
@@ -1037,7 +1147,11 @@ class TranslationWorker(threading.Thread):
                     # 검증과 특이사항열 표시는 항상 수행하고, PRESERVE_PLACEHOLDERS 는
                     # '불일치 시 자동 재번역'만 켜고 끈다.
                     if not is_review and get_placeholder_col_letter():
-                        ph_sources = batch_placeholder_sources(batch)
+                        # 용어집을 켜면 결과의 «T:...» 는 대상 언어 용어로 바뀌어 있다.
+                        # 따라서 비교 기준인 원본에도 같은 치환을 적용해야 한다.
+                        # (원본 한국어 그대로 비교하면 정상 행이 전부 불일치로 잡힌다)
+                        ph_sources = gloss.apply_substitutions(
+                            batch_placeholder_sources(batch), ph_subst)
                         ph_idxs = filter_placeholder_mismatch(ph_sources, lines)
 
                         # ── 로컬 자동 복구: ChatGPT 왕복 없이 훼손 토큰을 원본으로 복원 ──
@@ -1096,6 +1210,7 @@ class TranslationWorker(threading.Thread):
                                 retry_lines, _ = parse_response(retry_resp, retry_batch)
                                 retry_lines = repair_masked_tokens(retry_lines, ph_map)
                                 retry_lines = unmask_placeholders(retry_lines, ph_map)
+                                retry_lines = gloss.apply_substitutions(retry_lines, ph_subst)
                                 for j, idx in enumerate(ph_idxs):
                                     if j < len(retry_lines) and idx < len(lines):
                                         if retry_lines[j]:
@@ -1224,6 +1339,15 @@ class TranslationWorker(threading.Thread):
                 self._pause_event.wait()
                 if self.stop_flag:
                     break
+
+            if self.glossary is not None and (self.gl_changed or self.gl_unmatched):
+                self.log(
+                    f"📖 용어집 적용 요약 — 플레이스홀더 확정 치환 {self.gl_changed:,}건 · "
+                    f"용어집에 없던 항목 {len(self.gl_unmatched):,}종", "info")
+                if self.gl_unmatched:
+                    head = ", ".join(sorted(self.gl_unmatched)[:15])
+                    more = "" if len(self.gl_unmatched) <= 15 else f" 외 {len(self.gl_unmatched) - 15}종"
+                    self.log(f"   ↳ 미등록(원문 유지): {head}{more}", "warn")
 
             if self.stop_flag:
                 self.log(f"⏹ 중지 — {processed}행 처리됨", "warn")
@@ -1692,6 +1816,41 @@ class SettingsDialog(ctk.CTkToplevel):
         ctk.CTkFrame(scroll, height=1, fg_color="#3a3a4a").pack(
             fill="x", pady=10)
 
+        # ── 용어집 ──────────────────────────────────────────────
+        ctk.CTkLabel(scroll, text="📖  용어집 (Glossary)",
+                     font=ctk.CTkFont(size=13, weight="bold")).pack(
+            anchor="w", pady=(0, 6))
+        gl_frame = ctk.CTkFrame(scroll, fg_color="transparent")
+        gl_frame.pack(fill="x", pady=(0, 4))
+
+        self.v_gl_on = tk.BooleanVar(value=bool(getattr(config, "GLOSSARY_ENABLED", False)))
+        ctk.CTkCheckBox(
+            gl_frame, text="용어집 사용 (같은 스프레드시트의 다른 탭에서 읽음)",
+            variable=self.v_gl_on).pack(anchor="w", padx=4)
+
+        gl_row = ctk.CTkFrame(gl_frame, fg_color="transparent")
+        gl_row.pack(fill="x", pady=(6, 0))
+        ctk.CTkLabel(gl_row, text="용어집 탭 이름", width=90, anchor="w").pack(side="left")
+        self.v_gl_tab = tk.StringVar(value=getattr(config, "GLOSSARY_TAB", ""))
+        ctk.CTkEntry(gl_row, textvariable=self.v_gl_tab, width=200,
+                     placeholder_text="예: glossary_master").pack(side="left", padx=4)
+
+        ctk.CTkLabel(
+            gl_frame,
+            text="· «T:...» 안의 내용이 용어집에 통째로 있으면 그 언어의 공식 용어로 "
+                 "바꿔 기입합니다 (AI 를 거치지 않아 확정적).\n"
+                 "· 문장 속 용어는 바꾸지 않고, 그 배치에 등장하는 용어만 뽑아 "
+                 "'이 번역을 쓰라'고 프롬프트에 첨부합니다.\n"
+                 "· 필요한 열: ko-KR(열쇠), 언어별 열(en-US, zh-CN, th-TH, es-ES …), "
+                 "aliases, match_mode, protect_level, priority, status.\n"
+                 "· 열 순서는 상관없고 이름으로 찾습니다. 대상 언어 칸이 비어 있으면 "
+                 "원문을 그대로 둡니다.",
+            text_color="#888", font=ctk.CTkFont(size=11), justify="left",
+            wraplength=430).pack(anchor="w", padx=4, pady=(6, 0))
+
+        ctk.CTkFrame(scroll, height=1, fg_color="#3a3a4a").pack(
+            fill="x", pady=10)
+
         # 번역 언어 (프롬프트 선택)
         ctk.CTkLabel(scroll, text="🌍  번역 언어 (프롬프트)",
                      font=ctk.CTkFont(size=13, weight="bold")).pack(
@@ -1836,6 +1995,9 @@ class SettingsDialog(ctk.CTkToplevel):
             setattr(config, attr, None if val == "None" else val)
         config.RESULT_COL = self.v_result_col.get().strip().upper() or "D"
         config.NOTE_COL = self.v_note_col.get().strip().upper()   # 빈 값 = 자동(결과열+1)
+        config.GLOSSARY_TAB = self.v_gl_tab.get().strip()
+        # 탭 이름이 없으면 켤 수 없다 (읽을 곳이 없으므로)
+        config.GLOSSARY_ENABLED = bool(self.v_gl_on.get()) and bool(config.GLOSSARY_TAB)
         ai_mode = (self.v_ai_mode.get() or "chatgpt").lower()
         config.AI_MODE = ai_mode if ai_mode in ("chatgpt", "claude") else "chatgpt"
         config.PROMPT_LANG = self.v_prompt_lang.get()
@@ -2524,6 +2686,9 @@ def save_settings():
         "REVIEW_TGT_LANG":            getattr(config, "REVIEW_TGT_LANG", "es"),
         "REVIEW_CROSS_CHECK":         getattr(config, "REVIEW_CROSS_CHECK", True),
         "MODE_COL_ROLES":             _mode_presets(),
+        "GLOSSARY_ENABLED":           bool(getattr(config, "GLOSSARY_ENABLED", False)),
+        "GLOSSARY_TAB":               getattr(config, "GLOSSARY_TAB", ""),
+        "GLOSSARY_MAX_TERMS":         int(getattr(config, "GLOSSARY_MAX_TERMS", 60) or 60),
         "SEQ_JOBS":                   getattr(config, "SEQ_JOBS", []) or [],
         "SEQ_COPY_FROM":              getattr(config, "SEQ_COPY_FROM", "auto"),
     }
@@ -2604,6 +2769,15 @@ def load_settings():
             }
         # 프리셋 보정 후 현재 모드의 열 역할을 COL_* 에 적용
         apply_mode_columns()
+
+        # ── 용어집 ────────────────────────────────────────────────
+        config.GLOSSARY_TAB = str(data.get("GLOSSARY_TAB",
+                                           getattr(config, "GLOSSARY_TAB", "")) or "").strip()
+        config.GLOSSARY_ENABLED = bool(data.get("GLOSSARY_ENABLED", False)) and bool(config.GLOSSARY_TAB)
+        try:
+            config.GLOSSARY_MAX_TERMS = max(1, int(data.get("GLOSSARY_MAX_TERMS", 60)))
+        except (TypeError, ValueError):
+            config.GLOSSARY_MAX_TERMS = 60
 
         # ── 연속 번역 계획 ─────────────────────────────────────────
         # 열 역할이 확정된 뒤에 정리해야 기본 결과열 계산이 맞는다.
@@ -2913,6 +3087,8 @@ class App(ctk.CTk):
         self.worker = None
         # 연속 번역 진행 상태 — None 이면 단일 언어 실행(기존 동작)
         self._seq = None
+        # 용어집 캐시 — (탭 이름, Glossary). 탭이 바뀌면 다시 읽는다.
+        self._gl_cache = (None, None)
         self._waiting_msg = ""
         self._dot_count = 0
         self._is_waiting = False
@@ -3101,6 +3277,44 @@ class App(ctk.CTk):
             return False
         return True
 
+    def load_glossary(self):
+        """용어집을 읽어 온다 (탭이 그대로면 캐시 재사용).
+
+        용어집은 8천 줄이 넘어 매번 읽으면 느리므로, 앱이 켜져 있는 동안
+        한 번만 읽고 캐시한다. 설정에서 탭 이름을 바꾸면 자동으로 다시 읽는다.
+        반환: Glossary (끄거나 실패하면 None)
+        """
+        if not getattr(config, "GLOSSARY_ENABLED", False):
+            return None
+        tab = (getattr(config, "GLOSSARY_TAB", "") or "").strip()
+        if not tab:
+            return None
+        if self._gl_cache[0] == tab and self._gl_cache[1] is not None:
+            return self._gl_cache[1]
+
+        self._add_log(f"📖 용어집 불러오는 중... (탭 '{tab}')", "info")
+        self.update_idletasks()
+        try:
+            ws = get_worksheet(tab)
+            rows = ws.get_all_values()
+            gl = gloss.Glossary.from_rows(rows, tab=tab)
+        except Exception as e:
+            # 용어집을 못 읽어도 번역 자체는 되므로, 알리고 없이 진행한다
+            msg = str(e).split("\n")[0][:160]
+            self._add_log(f"⚠️ 용어집을 읽지 못했습니다 — 없이 진행합니다: {msg}", "error")
+            messagebox.showwarning(
+                "용어집",
+                f"용어집을 읽지 못했습니다. 용어집 없이 번역을 진행합니다.\n\n{e}")
+            return None
+        if not len(gl):
+            self._add_log(f"⚠️ 탭 '{tab}' 에서 쓸 수 있는 용어를 찾지 못했습니다.", "warn")
+            return None
+        self._gl_cache = (tab, gl)
+        self._add_log(
+            f"📖 용어집 {len(gl):,}개 용어 로드 완료 "
+            f"(건너뛴 행 {gl.skipped:,})", "success")
+        return gl
+
     def _start(self):
         if not self._preflight():
             return
@@ -3157,7 +3371,8 @@ class App(ctk.CTk):
                                 fg_color=self.COLORS["secondary"],
                                 hover_color=self.COLORS["secondary_hover"],
                                 text_color=self.COLORS["text_main"])
-        self.worker = TranslationWorker(self.log_queue, self._on_done)
+        gl = None if mode in REVIEW_MODES else self.load_glossary()
+        self.worker = TranslationWorker(self.log_queue, self._on_done, glossary=gl)
         self.worker.start()
 
     def _stop(self):
@@ -3245,11 +3460,13 @@ class App(ctk.CTk):
             self._add_log(
                 "⚠️ 열 역할에 '플레이스홀더'가 없어 플레이스홀더 검증을 할 수 없습니다.", "warn")
 
+        # 용어집은 언어와 무관하게 한 벌이므로 연속 번역 시작 시 한 번만 읽는다
         self._seq = {
             "jobs": list(jobs),
             "i": 0,
             "results": [],
             "cancel": False,
+            "glossary": self.load_glossary(),
             # 연속 번역이 끝나면 되돌릴 단일 언어 설정
             "backup": (getattr(config, "PROMPT_LANG", ""),
                        getattr(config, "RESULT_COL", "D"),
@@ -3308,7 +3525,8 @@ class App(ctk.CTk):
                 self.after(300, self._seq_run_step)
                 return
             config.FIXED_PROMPT = loaded
-            self.worker = TranslationWorker(self.log_queue, self._on_done)
+            self.worker = TranslationWorker(
+                self.log_queue, self._on_done, glossary=seq.get("glossary"))
         self.worker.start()
 
     def _seq_step_done(self, processed, total, fail_lines):

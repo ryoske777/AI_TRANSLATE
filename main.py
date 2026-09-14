@@ -361,6 +361,29 @@ def get_sheet():
             f"설정의 '시트 이름'을 다음 중 하나로 맞춰주세요: {names}")
 
 
+def get_worksheet(tab_name):
+    """같은 스프레드시트의 다른 탭을 연다 (용어집 등 보조 탭용).
+
+    get_sheet() 는 작업 대상 탭(config.SHEET_NAME)만 열기 때문에, 용어집처럼
+    다른 탭을 읽어야 할 때 쓴다. 탭 이름이 틀리면 실제 탭 목록을 알려준다.
+    """
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = Credentials.from_service_account_file(paths.app_path("credentials.json"), scopes=scopes)
+    client = gspread.authorize(creds)
+    sid = extract_spreadsheet_id(config.SPREADSHEET_ID)
+    spreadsheet = client.open_by_key(sid)
+    try:
+        return spreadsheet.worksheet(tab_name)
+    except Exception:
+        try:
+            names = ", ".join(ws.title for ws in spreadsheet.worksheets())
+        except Exception:
+            names = "(목록을 가져오지 못함)"
+        raise RuntimeError(
+            f"'{tab_name}' 탭을 찾을 수 없습니다.\n"
+            f"이 스프레드시트의 탭 목록: {names}")
+
+
 def test_connection():
     """현재 설정으로 시트 연결을 즉시 점검한다. (성공여부, 메시지) 반환.
 
