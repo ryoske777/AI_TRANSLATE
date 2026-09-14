@@ -40,7 +40,8 @@ from main import (
     WORK_MODE_LABELS, REVIEW_MODES, REVIEW_LANGS,
     LANG_LOCALES, SEQ_DEFAULT_ORDER, SEQ_MODE_TRANSLATE, SEQ_MODE_COPY,
     lang_display, seq_lang_choices, has_prompt, idx_to_col,
-    PLACEHOLDER_RE, get_worksheet,
+    PLACEHOLDER_RE, get_worksheet, write_column_headers, header_row_num,
+    STALE_PROMPTS, restore_default_prompt, prompt_is_default,
 )
 import glossary as gloss
 import config
@@ -86,6 +87,10 @@ if not hasattr(config, "GLOSSARY_TAB"):
     config.GLOSSARY_TAB = ""
 if not hasattr(config, "GLOSSARY_MAX_TERMS"):
     config.GLOSSARY_MAX_TERMS = 60
+
+# 결과열/특이사항열 머리글 자동 기입 (어느 열이 무슨 언어인지 시트에서 보이게)
+if not hasattr(config, "WRITE_HEADER"):
+    config.WRITE_HEADER = True
 
 
 # ── 모드별 열 역할 프리셋 ────────────────────────────────────────────────────
@@ -637,6 +642,14 @@ class CopyWorker(threading.Thread):
             self.status("Google Sheets 연결 중...", "#e0af68")
             sheet = get_sheet()
 
+            # 복사 단계는 특이사항을 쓰지 않으므로 결과열 머리글만 적는다
+            wrote = write_column_headers(
+                sheet, getattr(config, "PROMPT_LANG", ""), with_note=False)
+            if wrote:
+                self.log("🏷 머리글 기입: "
+                         + " · ".join(f"{c}{header_row_num()}={v}" for c, v in wrote.items()),
+                         "info")
+
             self.waiting("복사 대상 행 확인 중")
             pending = get_pending_rows(sheet)
             self.done_waiting()
@@ -902,6 +915,15 @@ class TranslationWorker(threading.Thread):
             self.status("Google Sheets 연결 중...", "#e0af68")
             self.log("Google Sheets 연결 중...")
             sheet = get_sheet()
+
+            # 결과열 머리글 — 어느 열이 무슨 언어인지 시트에서 바로 보이게 한다
+            if not is_review:
+                wrote = write_column_headers(sheet, tgt_lang)
+                if wrote:
+                    self.log(
+                        "🏷 머리글 기입: "
+                        + " · ".join(f"{c}{header_row_num()}={v}" for c, v in wrote.items()),
+                        "info")
 
             pending_rows = get_pending_rows(sheet)
             if not pending_rows:
@@ -2511,6 +2533,36 @@ class PromptDialog(ctk.CTkToplevel):
         ctk.CTkButton(btn, text="저장", width=80,
                       command=self._save).pack(side="right")
 
+        # 편집본이라 자동 갱신에서 보존된 경우 — 최신 기본값으로 되돌릴 탈출구.
+        # (이게 없으면 옛 프롬프트를 쓰고 있어도 되돌릴 방법이 없다)
+        if self.lang and not prompt_is_default(self.lang):
+            ctk.CTkButton(
+                btn, text="기본값으로 복원", width=130,
+                fg_color="#dd6b20", hover_color="#c05621",
+                command=self._restore).pack(side="left")
+            ctk.CTkLabel(
+                btn, text="  이 프롬프트는 편집본입니다 — 배포 기본값과 다릅니다",
+                text_color="#dd6b20", font=ctk.CTkFont(size=11)).pack(side="left")
+
+    def _restore(self):
+        if not messagebox.askyesno(
+                "기본값으로 복원",
+                f"'{LANG_LABELS.get(self.lang, self.lang)}' 프롬프트를 최신 배포 기본값으로\n"
+                "되돌립니다. 편집한 내용은 사라집니다.\n\n계속할까요?", parent=self):
+            return
+        if not restore_default_prompt(self.lang):
+            messagebox.showerror(
+                "복원 실패",
+                "번들된 기본 프롬프트를 찾지 못했습니다.\n"
+                "(개발 모드에서는 prompts 폴더가 곧 원본이라 복원할 대상이 없습니다.)",
+                parent=self)
+            return
+        self.txt.delete("1.0", "end")
+        with open(self.prompt_file, "r", encoding="utf-8") as f:
+            self.txt.insert("1.0", f.read())
+        messagebox.showinfo("복원 완료", "최신 기본값으로 되돌렸습니다.", parent=self)
+        self.destroy()
+
     def _save(self):
         if not self.lang:
             messagebox.showwarning("언어 미선택", "먼저 설정에서 번역 언어를 선택해주세요.", parent=self)
@@ -3099,6 +3151,11 @@ class App(ctk.CTk):
         self._build_ui()
         self._poll()
         self._animate()
+        # 편집본이라 최신 기본값으로 갱신하지 못한 프롬프트가 있으면 알린다.
+        # (조용히 옛 프롬프트로 번역이 나가는 일을 막는다 — pt 가 pt-PT 로
+        #  계속 번역되던 사고의 재발 방지)
+        if STALE_PROMPTS:
+            self.after(1200, self._warn_stale_prompts)
         # UI가 뜬 뒤 백그라운드로 업데이트 확인 (네트워크 지연이 UI를 막지 않도록)
         self.after(800, self._check_update_async)
         if self._first_run:
@@ -3106,6 +3163,19 @@ class App(ctk.CTk):
 
     def _run_setup_wizard(self):
         SetupWizard(self)
+
+    def _warn_stale_prompts(self):
+        """편집본이라 보존된 프롬프트를 알린다 — 기본값이 바뀌었는데 옛 것을 쓰는 상태."""
+        names = ", ".join(LANG_LABELS.get(l, l) for l in STALE_PROMPTS)
+        self._add_log(
+            f"⚠️ 편집본이라 기본값 갱신을 건너뛴 프롬프트: {names} "
+            f"— 📝 프롬프트 편집에서 '기본값으로 복원' 가능", "warn")
+        messagebox.showwarning(
+            "프롬프트 기본값이 갱신되었습니다",
+            f"다음 프롬프트는 편집본이라 새 기본값으로 바꾸지 않았습니다.\n\n"
+            f"  {names}\n\n"
+            "편집한 기억이 없다면 옛 프롬프트를 쓰고 있는 것일 수 있습니다.\n"
+            "📝(프롬프트 편집) → '기본값으로 복원' 으로 최신본으로 되돌릴 수 있습니다.")
 
     def _build_ui(self):
         # ── 헤더
