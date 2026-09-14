@@ -25,6 +25,11 @@ COL_B_ROLE = "placeholder"  # B열: 플레이스홀더 포함 번역대상
 COL_C_ROLE = None           # C열: 미사용
 RESULT_COL = "D"            # 번역 결과 기입 열
 
+#   특이사항(비고) 기입 열 — 비우면 '결과열 바로 다음 열'을 자동으로 쓴다.
+#   기본 배치는 결과 D → 특이사항 E. 연속 번역처럼 결과열이 언어마다 다를 때도
+#   각 결과열에 붙은 특이사항 열을 자동으로 따라간다.
+NOTE_COL = ""
+
 # ── 배치/속도 ────────────────────────────────────────────────────────────────
 BATCH_SIZE                 = 30    # 한 번에 보낼 줄 수 (자동 분량 꺼짐일 때 사용)
 AUTO_BATCH_SIZE            = False # True면 BATCH_SIZE 무시, 글자 수 기준으로 행 수 자동 결정
@@ -78,6 +83,20 @@ MODE_COL_ROLES = {
     "review_glossary": {"COL_A_ROLE": "source", "COL_B_ROLE": "category",    "COL_C_ROLE": "review", "RESULT_COL": "D"},
     "review_general":  {"COL_A_ROLE": "source", "COL_B_ROLE": "review",      "COL_C_ROLE": None,     "RESULT_COL": "D"},
 }
+
+# ── 연속 번역 (여러 언어를 순서대로 자동 실행) ───────────────────────────────
+#   메인 화면 🗂 버튼에서 편집한다. 실제 정본은 settings.json 의 SEQ_JOBS.
+#   각 단계: {"lang": 언어코드, "mode": "translate"|"copy",
+#             "result_col": 결과열, "note_col": 특이사항열, "enabled": bool}
+#     - mode "translate" : prompts/{lang}.txt 로 AI 번역
+#     - mode "copy"      : AI 호출 없이 입력열 값을 결과열로 그대로 복사 (ko-KR 용)
+SEQ_JOBS = []
+
+#   '원본 복사' 단계가 가져올 입력열 역할.
+#     "auto"        : 플레이스홀더(번역대상) 열이 있으면 그 열, 없으면 원본 열
+#     "placeholder" / "source" / "ref" : 해당 역할 열을 직접 지정
+SEQ_COPY_FROM = "auto"
+
 
 # ── 런타임 주입 ──────────────────────────────────────────────────────────────
 #   load_prompt(PROMPT_LANG) 결과가 실행 시 여기에 채워진다. 직접 편집 불필요.

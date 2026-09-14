@@ -206,7 +206,78 @@ make_version.py
 
 ---
 
-## 8. 빠른 점검 명령
+## 8. 연속 번역 (2026-09 추가)
+
+메인 화면 헤더 **🗂** → `SeqDialog` → 체크한 언어를 순서대로 자동 실행한다.
+
+### 구조 — 왜 이렇게 짰나
+번역 루프(`TranslationWorker`)를 다시 쓰지 않았다. 대신 **App 이 오케스트레이터**가
+되어 단계마다 `config.PROMPT_LANG / RESULT_COL / NOTE_COL` 을 갈아끼우고
+기존 워커를 한 번씩 돌린다. 워커 본문을 건드리지 않으므로 단일 언어 동작이
+그대로 보존된다(회귀 테스트로 확인).
+
+```
+App._start_sequence(jobs)
+  └ _seq_run_step()        # config 에 이번 단계 언어/열을 꽂고 워커 start
+       └ TranslationWorker | CopyWorker
+            └ done → log_queue("done") → App._poll
+                 └ _seq_step_done()  → 다음 단계 or _seq_finish()
+                      └ _seq_finish() : config 원복 + 버튼 복구 + SeqDoneDialog
+```
+
+- `self._seq` 가 None 이면 단일 실행(기존 경로), dict 면 연속 실행.
+- `_seq["backup"]` 에 원래 (PROMPT_LANG, RESULT_COL, NOTE_COL) 를 담아 끝나면 복원한다.
+  **연속 번역이 단일 언어 설정을 영구히 바꾸면 안 된다.**
+- 실행 중에는 `_set_seq_controls(True)` 가 ⚙/📝/🌍/🗂 와 모드 세그먼트를 잠근다.
+  (도중에 열 역할이 바뀌면 남은 언어가 엉뚱한 열에 기입됨 + `save_settings()` 가
+  임시 RESULT_COL 을 모드 프리셋에 굳혀버림)
+- 한 언어에서 오류가 나도 다음 언어로 계속 간다. STOP 은 `_seq["cancel"]` 을 세워
+  현재 언어를 정리한 뒤 전체를 끝낸다.
+
+### 특이사항(비고) 열 — 핵심 변경
+전에는 E열이 `main.write_status` / `main_ui.reconcile_status` /
+`audit_completed_rows` 에 **하드코딩**돼 있었다. 여러 언어를 한 시트에 붙이면
+D/E(ko), F/G(en), H/I(zh-CN) … 처럼 쌍이 반복되므로 하드코딩을 걷어냈다.
+
+- `main.get_note_col()` 이 단일 진실 원천.
+  `config.NOTE_COL` 이 있으면 그 열, 비어 있으면 `next_col_letter(RESULT_COL)`.
+- 기본 배치(결과 D)에서는 그대로 E → **기존 동작 무변화**.
+- 설정창(⚙) → 열 설정에 '특이사항 기입' 칸이 생겼다(비우면 자동).
+- 검수 모드 `write_review_notes` 도 같은 함수를 쓴다.
+
+### 단계(job) 자료구조
+```python
+{"lang": "en", "mode": "translate"|"copy",
+ "result_col": "F", "note_col": "G", "enabled": True}
+```
+settings.json 의 `SEQ_JOBS` 가 정본. `normalize_seq_jobs()` 가 손상/구버전 값을
+복구하고, 목록에 없던 언어를 '꺼진 상태'로 뒤에 붙인다.
+
+`validate_seq_jobs()` 가 막는 사고(시작 전 전부 검사):
+열 문자 아님 / 결과열 == 특이사항열 / 단계 간 열 중복 / 입력열(A·B·C) 침범.
+
+### ko-KR 은 '원본 복사'
+원본이 한국어라 번역할 게 없다. `prompts/ko.txt` 는 만들지 않았고,
+`CopyWorker` 가 AI 를 거치지 않고 입력열 → 결과열로 값을 그대로 복사한다.
+가져올 열은 `SEQ_COPY_FROM`(기본 `auto` = 플레이스홀더 열 → 없으면 원본 열).
+복사본은 원문과 100% 같으므로 플레이스홀더 검증·한글 감지·특이사항 표시를 하지 않는다.
+
+> 나중에 한국어로 **진짜 번역**할 일이 생기면 `prompts/ko.txt` 를 추가하고 단계
+> 방식을 'AI 번역'으로 바꾸면 된다. `main.is_korean_target()` 이 이미 그 경우의
+> 한글 감지·재번역·'한글 포함' 표시를 자동으로 끈다 (결과에 한글이 있는 게 정상).
+
+### 드래그 앤 드롭 구현 노트 (중요)
+끄는 동안 위젯을 **절대 파괴/재생성하지 않는다**. 재생성하면 마우스 이벤트
+스트림이 끊겨 드래그가 중간에 죽는다.
+- 줄을 `place(x=0, y=i*ROW_H+PAD, relwidth=1.0)` 로 배치한다.
+- 드래그 중엔 `place_configure(y=…)` 로 y 만 옮겨 미리보기를 준다.
+- 버튼을 놓는 순간에만 `self.items` 순서를 확정하고 한 번 재배치한다.
+- CTk 위젯은 `place(width=…/height=…)` 를 막는다 → 높이는 **생성자**에서 주고
+  `pack_propagate(False)` 로 고정한다.
+
+---
+
+## 9. 빠른 점검 명령
 
 ```bash
 # 문법 검사
@@ -223,7 +294,7 @@ python -c "import main; print(main.list_prompt_langs())"
 
 ---
 
-## 9. 프롬프트 지역 기준 (2026-09 정리)
+## 10. 프롬프트 지역 기준 (2026-09 정리)
 
 각 프롬프트는 **서비스 지역이 하나로 고정**돼 있다. 다른 지역/다른 언어의 표현이
 섞이면 번역 품질이 직접 깨지므로, 프롬프트를 편집할 때 이 기준을 유지할 것.
