@@ -55,6 +55,8 @@
   tbody tr:nth-child(even){background:var(--zebra)}
   td.id,td.type{white-space:nowrap;color:var(--muted)}
   td.id{font-weight:600;color:var(--text)}
+  tr.blockhead td{background:var(--head);font-weight:700;color:var(--text);white-space:nowrap}
+  tr.blockhead td:first-child{color:var(--accent)}
   .hint{color:var(--muted);font-size:12.5px;margin-top:8px}
   code{background:var(--head);padding:1px 5px;border-radius:4px;font-size:12px}
 </style>
@@ -77,6 +79,7 @@
       <label class="opt"><input type="checkbox" id="repeatId"> 모든 행에 ID 반복</label>
       <label class="opt"><input type="checkbox" id="allLangs"> 표준 언어 열 모두 표시</label>
       <label class="opt"><input type="checkbox" id="skipEmpty"> 내용이 빈 행 제외</label>
+      <label class="opt"><input type="checkbox" id="mergeSheet"> <b>통합 시트</b> (모든 파일을 한 시트에)</label>
     </div>
     <div class="msg" id="msg"></div>
   </div>
@@ -99,6 +102,8 @@
       <code>Npcdata</code> … 시트로 나뉩니다.<br>
       · <b>각각 저장</b>: JSON의 키 이름 그대로 <code>itemInfo.xlsx</code>,
       <code>Npcdata.xlsx</code> … 여러 파일이 받아집니다. (브라우저가 연속 다운로드를 물어보면 허용)<br>
+      · <b>통합 시트</b>를 켜면 <code>통합</code> 시트가 맨 앞에 추가되고(개별 시트도 그대로 유지),
+      각 파일 구간의 첫 행에 파일명이 들어갑니다. '각각 저장' 시에는 <code>통합.xlsx</code> 도 함께 받아집니다.<br>
       · 모든 셀은 <b>셀 서식 = 텍스트</b>로 고정됩니다. 앞자리 0(<code>00123</code>), 긴 숫자 ID,
       <code>2024-01-02</code> 같은 날짜형 문자열, <code>=</code> 로 시작하는 값이 변형되지 않습니다.
     </p>
@@ -116,7 +121,10 @@
       ⑤ ID 바로 아래가 국가 코드면(<code>Npcdata</code>, <code>mobdef</code> 등) type 열 없이 출력<br>
       ⑥ 언어 <b>아래</b>에 또 구조가 있으면(<code>"ko-KR": {"prev":…, "curr":…}</code>)
          <code>prev</code>/<code>curr</code>가 type 열로 내려가고 언어는 열로 유지 →
-         한 행에 전 언어의 <code>prev</code>, 다음 행에 전 언어의 <code>curr</code>
+         한 행에 전 언어의 <code>prev</code>, 다음 행에 전 언어의 <code>curr</code><br>
+      ⑦ <b>통합 시트</b> 옵션: 모든 파일을 한 시트에 이어 붙입니다. type 열 개수와 언어 목록을
+         전체 공통으로 맞추므로 <code>ko-KR</code> 은 시트 전체에서 같은 열에 있고, 각 파일이
+         시작되는 행에 파일명이 적힙니다
     </p>
   </div>
 </div>
@@ -304,6 +312,54 @@ function forceTextFormat(ws){
   return ws;
 }
 
+/* 여러 파일(시트)을 한 시트로 합친다.
+   - type 열 개수와 언어 목록을 전체 공통으로 맞춰 열 위치를 통일 (ko-KR 은 늘 같은 열)
+   - 각 파일 구간의 첫 행에 파일명이 들어간 머리글 행을 넣어 구분 */
+function mergeSheets(sheets, name){
+  var maxType = 0, langSet = {}, hasValue = false;
+  sheets.forEach(function(s){
+    if(s.typeCols.length > maxType) maxType = s.typeCols.length;
+    s.langs.forEach(function(l){ langSet[l] = true; });
+    if(s.header[s.header.length - 1] === "value") hasValue = true;
+  });
+
+  var langs = sortLangs(langSet);
+  var typeCols = [];
+  for(var d = 0; d < maxType; d++) typeCols.push(d === 0 ? "type" : "type" + (d+1));
+
+  function headerRow(label){
+    var h = [label].concat(typeCols, langs);
+    if(hasValue) h.push("value");
+    return h;
+  }
+
+  var aoa = [], rowCount = 0, idCount = 0, blockHeadRows = {};
+  sheets.forEach(function(s){
+    var base = 1 + s.typeCols.length;                       /* 원본 시트의 언어 열 시작 위치 */
+    var valIdx = (s.header[s.header.length - 1] === "value") ? s.header.length - 1 : -1;
+    blockHeadRows[aoa.length] = true;      /* 파일명이 적힌 머리글 행 위치 */
+    aoa.push(headerRow(s.file));
+    idCount += s.idCount;
+    for(var r = 1; r < s.aoa.length; r++){
+      var src = s.aoa[r], row = [src[0]];
+      for(var t = 0; t < maxType; t++) row.push(t < s.typeCols.length ? src[1 + t] : "");
+      langs.forEach(function(l){
+        var i = s.langs.indexOf(l);
+        row.push(i === -1 ? "" : src[base + i]);
+      });
+      if(hasValue) row.push(valIdx === -1 ? "" : src[valIdx]);
+      aoa.push(row);
+      rowCount++;
+    }
+  });
+
+  return {
+    file: name || "통합", header: aoa.length ? aoa[0] : headerRow(name || "통합"),
+    aoa: aoa, langs: langs, typeCols: typeCols, blockHeadRows: blockHeadRows,
+    idCount: idCount, rowCount: rowCount, merged: true
+  };
+}
+
 /* 열 너비(문자 수 기준) */
 function colWidths(sheet){
   return sheet.header.map(function(h, i){
@@ -321,8 +377,8 @@ function colWidths(sheet){
 if(typeof module !== "undefined" && module.exports){
   module.exports = { LANG_ORDER:LANG_ORDER, isLangLevel:isLangLevel, collectRows:collectRows,
                      flattenValue:flattenValue, buildSheet:buildSheet, buildAll:buildAll,
-                     sheetName:sheetName, colWidths:colWidths, forceTextFormat:forceTextFormat,
-                     VALUE_KEY:VALUE_KEY };
+                     mergeSheets:mergeSheets, sheetName:sheetName, colWidths:colWidths,
+                     forceTextFormat:forceTextFormat, VALUE_KEY:VALUE_KEY };
 }
 </script>
 
@@ -330,7 +386,9 @@ if(typeof module !== "undefined" && module.exports){
 (function(){
   var $ = function(id){ return document.getElementById(id); };
   var input = $("input"), msg = $("msg"), tabs = $("tabs"), preview = $("preview");
-  var sheets = [], active = 0;
+  var sheets = [], merged = null, active = 0;
+  var MERGED_NAME = "통합";
+  function views(){ return merged ? [merged].concat(sheets) : sheets; }   /* 미리보기/다운로드 대상 */
 
   function say(text, cls){ msg.textContent = text || ""; msg.className = "msg" + (cls ? " " + cls : ""); }
   function opts(){ return { repeatId: $("repeatId").checked, allLangs: $("allLangs").checked,
@@ -341,24 +399,26 @@ if(typeof module !== "undefined" && module.exports){
   }
 
   function render(){
+    var list = views();
     tabs.innerHTML = "";
-    sheets.forEach(function(s, i){
+    list.forEach(function(s, i){
       var b = document.createElement("button");
       b.className = "tab" + (i === active ? " active" : "");
-      b.textContent = s.file + " (" + s.rowCount + ")";
+      b.textContent = (s.merged ? "★ " + MERGED_NAME + " " : s.file + " ") + "(" + s.rowCount + ")";
       b.onclick = function(){ active = i; render(); };
       tabs.appendChild(b);
     });
 
-    var s = sheets[active];
+    var s = list[active];
     if(!s){ preview.innerHTML = ""; return; }
 
     var LIMIT = 200, shown = Math.min(s.aoa.length - 1, LIMIT);
     var html = "<table><thead><tr>";
     s.header.forEach(function(h){ html += "<th>" + esc(h) + "</th>"; });
     html += "</tr></thead><tbody>";
+    var heads = s.blockHeadRows || {};
     for(var r = 1; r <= shown; r++){
-      html += "<tr>";
+      html += heads[r] ? '<tr class="blockhead">' : "<tr>";
       s.aoa[r].forEach(function(c, ci){
         var cls = ci === 0 ? "id" : (ci <= s.typeCols.length ? "type" : "");
         var t = String(c);
@@ -370,6 +430,7 @@ if(typeof module !== "undefined" && module.exports){
     html += "</tbody></table>";
     preview.innerHTML = html;
     $("previewHint").textContent =
+      (s.merged ? "파일 " + sheets.length + "개 통합 / " : "") +
       "ID " + s.idCount + "개 / 행 " + s.rowCount + "개 / 언어 " + s.langs.length + "개" +
       (s.rowCount > shown ? "  -  미리보기는 " + shown + "행까지만 표시 (다운로드는 전체)" : "");
   }
@@ -380,7 +441,10 @@ if(typeof module !== "undefined" && module.exports){
     var json;
     try{ json = JSON.parse(raw); }
     catch(e){ say("JSON 형식 오류: " + e.message, "err"); return false; }
-    try{ sheets = buildAll(json, opts()); }
+    try{
+      sheets = buildAll(json, opts());
+      merged = $("mergeSheet").checked ? mergeSheets(sheets, MERGED_NAME) : null;
+    }
     catch(e){ say("변환 오류: " + e.message, "err"); return false; }
 
     active = 0;
@@ -388,7 +452,8 @@ if(typeof module !== "undefined" && module.exports){
     $("dlCard").hidden = false;
     render();
     var totalRows = sheets.reduce(function(a, s){ return a + s.rowCount; }, 0);
-    say("변환 완료 - 파일(시트) " + sheets.length + "개, 전체 " + totalRows + "행", "ok");
+    say("변환 완료 - 파일(시트) " + sheets.length + "개, 전체 " + totalRows + "행" +
+        (merged ? "  (+ 통합 시트 1개)" : ""), "ok");
     return true;
   }
 
@@ -417,32 +482,38 @@ if(typeof module !== "undefined" && module.exports){
   $("repeatId").onchange = function(){ if(sheets.length) parse(); };
   $("allLangs").onchange = function(){ if(sheets.length) parse(); };
   $("skipEmpty").onchange = function(){ if(sheets.length) parse(); };
+  $("mergeSheet").onchange = function(){ if(sheets.length) parse(); };
 
   $("dlOne").onclick = function(){
     if(!ready()) return;
     if(!sheets.length && !parse()) return;
     var wb = XLSX.utils.book_new(), used = {};
-    sheets.forEach(function(s){ XLSX.utils.book_append_sheet(wb, toWorksheet(s), sheetName(s.file, used)); });
+    views().forEach(function(s){
+      XLSX.utils.book_append_sheet(wb, toWorksheet(s), sheetName(s.merged ? MERGED_NAME : s.file, used));
+    });
     XLSX.writeFile(wb, "translations_" + stamp() + ".xlsx", WRITE_OPTS);
-    say("통합 파일을 저장했습니다.", "ok");
+    say("저장했습니다 - 시트 " + views().length + "개" +
+        (merged ? " (첫 시트가 통합본)" : ""), "ok");
   };
 
   $("dlMany").onclick = function(){
     if(!ready()) return;
     if(!sheets.length && !parse()) return;
-    sheets.forEach(function(s, i){
+    var list = views();
+    list.forEach(function(s, i){
       setTimeout(function(){
         var wb = XLSX.utils.book_new(), used = {};
-        XLSX.utils.book_append_sheet(wb, toWorksheet(s), sheetName(s.file, used));
-        var name = /\.xlsx$/i.test(s.file) ? s.file : s.file + ".xlsx";
+        XLSX.utils.book_append_sheet(wb, toWorksheet(s), sheetName(s.merged ? MERGED_NAME : s.file, used));
+        var base = s.merged ? MERGED_NAME : s.file;
+        var name = /\.xlsx$/i.test(base) ? base : base + ".xlsx";
         XLSX.writeFile(wb, name, WRITE_OPTS);
       }, i * 400);
     });
-    say(sheets.length + "개 파일을 순서대로 저장합니다. 브라우저가 여러 파일 다운로드를 물어보면 허용해 주세요.", "ok");
+    say(list.length + "개 파일을 순서대로 저장합니다. 브라우저가 여러 파일 다운로드를 물어보면 허용해 주세요.", "ok");
   };
 
   $("clear").onclick = function(){
-    input.value = ""; sheets = []; $("previewCard").hidden = true; $("dlCard").hidden = true; say("");
+    input.value = ""; sheets = []; merged = null; $("previewCard").hidden = true; $("dlCard").hidden = true; say("");
   };
 
   $("sample").onclick = function(){
