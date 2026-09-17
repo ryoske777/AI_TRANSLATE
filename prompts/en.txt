@@ -57,6 +57,11 @@ Allowed actions:
 - copy and preserve existing «T:...», {CL:n}, and other placeholders exactly as they appear
 - translate only the text outside the placeholders
 
+Keep the marker itself (the « » guillemets) in your output — never output the inner
+text without the marker. The markers are removed later, by hand, by a human reviewer;
+it is not your job to remove them. Still, write the sentence so that it reads naturally
+once the markers are stripped (word order, articles, spacing).
+
 Examples:
 
 Input Target:

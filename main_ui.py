@@ -28,7 +28,7 @@ from main import (
     extract_placeholders, extract_preserve_tokens,
     check_placeholder_match, filter_placeholder_mismatch,
     batch_placeholder_sources, repair_masked_tokens, repair_placeholder_lines,
-    repair_placeholder_line,
+    repair_placeholder_line, marker_source,
     PH_MISMATCH_MARK, KOREAN_MARK, MANAGED_MARKS,
     is_empty, col_to_idx,
     list_prompt_langs, load_prompt, load_review_prompt, ensure_external_prompts,
@@ -160,14 +160,21 @@ SETTINGS_FILE = paths.app_path("settings.json")
 # 특이사항열 자체는 main.get_note_col() 이 결정한다 (기본: 결과열 바로 다음 열).
 
 
-def get_placeholder_col_letter():
-    """COL_A/B/C_ROLE 중 'placeholder'로 지정된 컬럼 문자(A/B/C) 반환. 없으면 None."""
-    for col_letter, role_attr in [("A", "COL_A_ROLE"),
-                                  ("B", "COL_B_ROLE"),
-                                  ("C", "COL_C_ROLE")]:
-        if getattr(config, role_attr, None) == "placeholder":
-            return col_letter
-    return None
+def get_marker_col_letters():
+    """마커(«T:...»)가 들어있을 수 있는 입력열 문자 목록 (앞에 있는 열이 우선).
+
+    번역 대상(placeholder 역할) 열이 1순위, 원문(source 역할) 열이 2순위다.
+    '플레이스홀더' 역할을 지정하지 않고 원문 열 하나로만 작업하는 시트에서도
+    마커 보존을 검증하기 위한 것 — main.marker_source() 의 열 우선순위와 같다.
+    """
+    order = []
+    for role in ("placeholder", "source"):
+        for col_letter, role_attr in [("A", "COL_A_ROLE"),
+                                      ("B", "COL_B_ROLE"),
+                                      ("C", "COL_C_ROLE")]:
+            if getattr(config, role_attr, None) == role and col_letter not in order:
+                order.append(col_letter)
+    return order
 
 
 def _clear_cells(sheet, ranges):
@@ -327,8 +334,24 @@ def audit_completed_rows(sheet, do_repair=True, glossary=None, lang=None):
     note_col = get_note_col()
     e_idx = col_to_idx(note_col)
     check_ko = not is_korean_target()   # 한국어 번역 단계에선 한글이 정상
-    ph_col = get_placeholder_col_letter()                 # 'A'/'B'/'C' 또는 None
-    ph_idx = col_to_idx(ph_col) if ph_col else None
+    # 마커 원본 후보 열 — 번역 대상(placeholder) 우선, 없으면 원문(source).
+    # 행마다 '비어 있지 않은' 첫 열을 기준으로 삼는다 (main.marker_cell_index 와 동일).
+    marker_cols = get_marker_col_letters()
+    marker_idxs = [col_to_idx(c) for c in marker_cols]
+    ph_col = marker_cols[0] if marker_cols else None
+    ph_idx = marker_idxs[0] if marker_idxs else None
+
+    def _marker_src(sheet_row):
+        """시트 한 행에서 마커 검증 기준이 될 셀 값 (없으면 '').
+
+        main.marker_cell_index() 와 같은 우선순위 — 비어 있지 않은 첫 열
+        (번역 대상 → 원문).
+        """
+        for idx in marker_idxs:
+            val = sheet_row[idx] if len(sheet_row) > idx else ""
+            if val and val.strip():
+                return val
+        return ""
     # 용어집을 쓰면 결과열의 «T:...» 는 대상 언어 용어로 치환돼 있으므로,
     # 비교 기준이 되는 원본에도 같은 치환을 적용한다.
     gl = glossary
@@ -346,14 +369,13 @@ def audit_completed_rows(sheet, do_repair=True, glossary=None, lang=None):
         result["checked"] += 1
 
         # 원본열을 모르면 기존 불일치 표시는 검증 불가 → 그대로 둔다
-        if ph_idx is None and e_val == PH_MISMATCH_MARK:
+        if not marker_idxs and e_val == PH_MISMATCH_MARK:
             result["unverifiable"].append(i)
             continue
 
         desired = ""
         if ph_idx is not None:
-            src_val = row[ph_idx] if len(row) > ph_idx else ""
-            src_val = localize_ph_cell(src_val, gl_lang, gl)
+            src_val = localize_ph_cell(_marker_src(row), gl_lang, gl)
             if not check_placeholder_match(src_val, d_val):
                 fixed = repair_placeholder_line(src_val, d_val) if do_repair else None
                 if fixed is not None:
@@ -803,7 +825,7 @@ class TranslationWorker(threading.Thread):
                 f"  ⚠️ 검증 불가(플레이스홀더 원본열 미설정): "
                 f"{_preview(au['unverifiable'])}행", "warn")
         if au["ph_col"] is None:
-            self.log("  ↳ 참고: 플레이스홀더 원본열이 설정돼 있지 않아 플레이스홀더 검사는 못 했습니다.", "warn")
+            self.log("  ↳ 참고: 마커 원본열(플레이스홀더/원본)이 설정돼 있지 않아 마커 검사는 못 했습니다.", "warn")
         if not au["ok"]:
             self.log(f"  ⚠️ 일부 기입 실패: {au['error']}", "error")
 
@@ -822,7 +844,8 @@ class TranslationWorker(threading.Thread):
 
         tokens = []
         for row in batch:
-            cell = row[3] if len(row) > 3 else ""
+            # 번역 대상 열 우선, 그 역할이 없으면 원문 열 — main.marker_source() 와 동일 기준
+            cell = marker_source(row)
             if cell:
                 tokens.extend(PLACEHOLDER_RE.findall(cell))
         subst, stats = gloss.placeholder_substitutions(tokens, lang, gl)
@@ -891,16 +914,19 @@ class TranslationWorker(threading.Thread):
                     "info")
             else:
                 self.log("📖 용어집: 사용 안 함", "info")
-            # 플레이스홀더 검증 가능 여부를 실행 시작 시점에 명확히 알린다
-            # (조건이 안 맞아 검증이 조용히 생략되는 일이 없도록)
-            if get_placeholder_col_letter() is None:
+            # 마커(«T:...») 보존 검증이 어느 열을 기준으로 도는지 실행 시작 시점에 알린다
+            marker_cols = get_marker_col_letters()
+            if not marker_cols:
                 self.log(
-                    "⚠️ 열 역할에 '플레이스홀더'가 지정돼 있지 않아 "
-                    f"플레이스홀더 검증({get_note_col()}열 불일치 표시)을 할 수 없습니다.", "warn")
-            elif not getattr(config, "PRESERVE_PLACEHOLDERS", True):
+                    "⚠️ 열 역할에 '플레이스홀더'도 '원본'도 지정돼 있지 않아 "
+                    f"마커(«T:...») 보존 검증({get_note_col()}열 불일치 표시)을 할 수 없습니다.",
+                    "warn")
+            else:
+                auto = ("켜짐" if getattr(config, "PRESERVE_PLACEHOLDERS", True) else "꺼짐")
                 self.log(
-                    f"플레이스홀더 검증: 켜짐 (불일치 시 {get_note_col()}열 표시) · "
-                    "자동 재번역: 꺼짐", "info")
+                    f"마커(«T:...») 보존: 결과열에 그대로 남깁니다 · "
+                    f"검증 기준 열 {'→'.join(marker_cols)} · "
+                    f"불일치 시 {get_note_col()}열 표시 · 자동 재번역 {auto}", "info")
 
         processed = 0
         total = 0
@@ -1163,12 +1189,16 @@ class TranslationWorker(threading.Thread):
 
                     # ── 플레이스홀더 검증 (번역 모드 전용) ─────────────────
                     # 검수 모드의 결과는 번역문이 아니라 판정 텍스트라 검증 대상이 아니다.
-                    # 원본은 시트를 다시 읽지 않고 배치가 이미 들고 있는
-                    # placeholder 역할 열 값을 쓴다 — 시트 재읽기가 실패하면
-                    # 빈 값과 비교돼 훼손이 '일치'로 조용히 통과하던 문제 제거.
+                    # 원본은 시트를 다시 읽지 않고 배치가 이미 들고 있는 값을 쓴다
+                    # — 시트 재읽기가 실패하면 빈 값과 비교돼 훼손이 '일치'로
+                    # 조용히 통과하던 문제 제거.
+                    # 기준 열은 행마다 marker_source() 가 고른다(번역 대상 열 우선,
+                    # 없으면 원문 열). 열 역할에 '플레이스홀더'가 없어도 마커 보존을
+                    # 검증하기 위함 — 예전에는 이 경우 검증이 통째로 꺼져서 모델이
+                    # 마커를 지워도 그대로 시트에 기입됐다.
                     # 검증과 특이사항열 표시는 항상 수행하고, PRESERVE_PLACEHOLDERS 는
                     # '불일치 시 자동 재번역'만 켜고 끈다.
-                    if not is_review and get_placeholder_col_letter():
+                    if not is_review:
                         # 용어집을 켜면 결과의 «T:...» 는 대상 언어 용어로 바뀌어 있다.
                         # 따라서 비교 기준인 원본에도 같은 치환을 적용해야 한다.
                         # (원본 한국어 그대로 비교하면 정상 행이 전부 불일치로 잡힌다)
@@ -1201,7 +1231,9 @@ class TranslationWorker(threading.Thread):
                             for idx in ph_idxs:
                                 if idx < len(ph_sources):
                                     if mask_ph and idx < len(masked_batch):
-                                        phs = extract_preserve_tokens(masked_batch[idx][3])
+                                        # 마스킹된 행에서도 마커를 들고 있는 열을 기준으로
+                                        phs = extract_preserve_tokens(
+                                            marker_source(masked_batch[idx]))
                                     else:
                                         phs = extract_preserve_tokens(ph_sources[idx])
                                     if phs:
@@ -1312,6 +1344,38 @@ class TranslationWorker(threading.Thread):
                                         finals[i], notes[i] = f2, n2
                                 if reverted:
                                     self.log(f"  ↩️ 크로스체크로 OK 정정: {reverted}", "success")
+
+                        # ── 검수 수정안의 마커 보존 검사 ─────────────────
+                        # 검수 결과도 결과열에 그대로 들어가므로 마커를 지키는
+                        # 마지막 관문이 필요하다. 수정안이 검수 대상 문장의
+                        # «T:...» 마커를 잃었으면 먼저 로컬 복구를 시도하고,
+                        # 복구가 안 되면 그 수정안은 채택하지 않는다(기존 번역 유지).
+                        # 마커가 빠진 문장을 결과열에 쓰는 것보다 안전하다.
+                        #
+                        # 여기서는 «T:...» 마커만 본다. {CL:n} 같은 코드는 검수자가
+                        # '원문과 다르다'며 바로잡는 것이 정당한 수정일 수 있는데,
+                        # 비교 기준이 원문이 아니라 '검수 대상 번역문'이라 그런
+                        # 정상 수정까지 폐기해 버리기 때문이다.
+                        ph_dropped = []
+                        for i, f_val in enumerate(finals):
+                            orig = batch[i][5] if i < len(batch) and len(batch[i]) > 5 else ""
+                            if not f_val or not orig or f_val == orig:
+                                continue
+                            if sorted(extract_placeholders(orig)) == sorted(extract_placeholders(f_val)):
+                                continue
+                            fixed = repair_placeholder_line(orig, f_val)
+                            if fixed is not None:
+                                finals[i] = fixed
+                                self.log(f"🔧 {s_row + i}행 검수 수정안의 마커 로컬 복구", "success")
+                            else:
+                                finals[i] = orig      # 수정안 폐기 — 기존 번역 유지
+                                notes[i] = (notes[i] + " | [도구] 수정안이 «T:...» 마커를 "
+                                                      "잃어 채택하지 않음").strip(" |")
+                                ph_dropped.append(s_row + i)
+                        if ph_dropped:
+                            self.log(
+                                f"⚠️ 마커가 빠진 수정안 {len(ph_dropped)}건 미채택(기존 번역 유지): "
+                                + ", ".join(str(r) for r in ph_dropped), "warn")
 
                         issue_rows = [s_row + i for i, n in enumerate(notes)
                                       if n and n != "OK"]
@@ -3526,9 +3590,10 @@ class App(ctk.CTk):
         """
         if not self._preflight():
             return
-        if get_placeholder_col_letter() is None:
+        if not get_marker_col_letters():
             self._add_log(
-                "⚠️ 열 역할에 '플레이스홀더'가 없어 플레이스홀더 검증을 할 수 없습니다.", "warn")
+                "⚠️ 열 역할에 '플레이스홀더'도 '원본'도 없어 "
+                "마커(«T:...») 보존 검증을 할 수 없습니다.", "warn")
 
         # 용어집은 언어와 무관하게 한 벌이므로 연속 번역 시작 시 한 번만 읽는다
         self._seq = {

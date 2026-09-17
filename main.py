@@ -300,6 +300,11 @@ PLACEHOLDER_RULE_BLOCK = """
   풀어 쓰거나, « » 안에 다른 텍스트를 적지 마십시오.
 - 원본에 없는 토큰을 새로 만들지 마십시오. 원본 토큰의 종류·개수와 출력
   토큰의 종류·개수는 정확히 일치해야 합니다. (위치만 문장에 맞게 이동 가능)
+- **마커(« » 기호)를 떼고 내용만 적는 것도 금지입니다.** 출력에는 «T:...» 를
+  마커째로 남겨 두십시오. 마커 제거는 번역이 끝난 뒤 사람이 직접 눈으로 확인하며
+  수작업으로 합니다. 당신이 대신 지우거나 정리하면 안 됩니다.
+- 다만 나중에 사람이 마커를 떼어낼 것을 감안해, 마커를 뗀 상태에서도 문장이
+  자연스럽게 읽히도록 어순·조사·관사·띄어쓰기를 맞춰 두십시오.
 - 이 규칙 위반은 게임 오류로 직결됩니다. 문장의 자연스러움보다 이 규칙이 우선합니다.
 """
 
@@ -1255,6 +1260,17 @@ _PRESERVE_TOKEN_RE = re.compile(r'«T:[^«»]*»|\{[^{}]*\}')
 
 # get_pending_rows 행 튜플에서 번역 대상(placeholder 역할) 열의 인덱스
 _PH_CELL_IDX = 3
+# 원문(source 역할) 열의 인덱스
+_SRC_CELL_IDX = 1
+
+# 마커(«T:...») 검증·마스킹의 기준 셀을 고를 때 훑는 순서.
+#
+# 보통은 번역 대상(placeholder 역할) 열에 마커가 있지만, 그 역할을 지정하지 않고
+# 원문(source) 열 하나만 쓰는 시트도 있다. 예전에는 그런 설정에서 마스킹·검증·
+# 복구가 통째로 꺼져, 모델이 마커를 지워도 아무도 모르게 결과열에 기입됐다.
+# 마커 보존은 열 역할 설정과 무관하게 보장돼야 하므로 원문 열까지 후보로 본다.
+# (참조(ref) 열은 번역의 원본이 아니라 참고용이므로 후보에서 제외)
+_MARKER_CELL_IDXS = (_PH_CELL_IDX, _SRC_CELL_IDX)
 
 
 # E열 상태 문구 (UI·CLI 공용 — main_ui 가 import 해서 사용)
@@ -1303,15 +1319,47 @@ def filter_placeholder_mismatch(sources, translations):
     return out
 
 
+def marker_cell_index(row):
+    """행에서 마커 검증·마스킹의 기준이 될 셀의 인덱스. 없으면 None.
+
+    **비어 있지 않은 첫 셀**을 고른다 (번역 대상 열 → 원문 열 순서).
+    '토큰을 든 셀'이 아니라 '비어 있지 않은 셀'인 이유:
+    번역 결과는 번역 대상 셀에 대응하므로, 대상 셀에 없는 토큰을 원문 셀에서
+    가져와 요구하면 정상 행이 불일치로 잡힌다. 대상 열이 아예 비어 있을 때
+    (= 열 역할에 '플레이스홀더'를 지정하지 않은 시트)만 원문 열로 내려간다.
+    """
+    for i in _MARKER_CELL_IDXS:
+        cell = row[i] if len(row) > i else ""
+        if isinstance(cell, str) and cell.strip():
+            return i
+    return None
+
+
+def marker_source(row):
+    """마커 보존 검증의 기준이 되는 셀 값.
+
+    번역 대상(placeholder) 열이 1순위, 비어 있으면 원문(source) 열.
+    둘 다 비었으면 "" — 토큰이 없는 행은 check_placeholder_match 가
+    검증 대상에서 제외한다.
+    """
+    i = marker_cell_index(row)
+    if i is None:
+        i = _PH_CELL_IDX
+    cell = row[i] if len(row) > i else ""
+    return cell if isinstance(cell, str) else ""
+
+
 def batch_placeholder_sources(batch_rows):
-    """배치 행 튜플에서 플레이스홀더 원본(placeholder 역할 열) 값 리스트를 꺼낸다.
+    """배치 행 튜플에서 마커 검증의 기준이 될 원본 값 리스트를 꺼낸다.
 
     검증 원본은 시트를 다시 읽지 않고 배치가 이미 들고 있는 값을 쓴다.
     (시트 재읽기가 실패하면 빈 값과 비교하게 되어 훼손된 번역이
     '일치'로 조용히 통과하던 문제를 원천 제거)
+
+    행마다 marker_source() 가 기준 열을 고르므로(번역 대상 열 → 원문 열),
+    열 역할에 '플레이스홀더'가 지정돼 있지 않아도 마커 보존이 검증된다.
     """
-    return [row[_PH_CELL_IDX] if len(row) > _PH_CELL_IDX else ""
-            for row in batch_rows]
+    return [marker_source(row) for row in batch_rows]
 
 
 # ── 플레이스홀더 로컬 자동 복구 ──────────────────────────────────────────────
@@ -1453,7 +1501,8 @@ def repair_placeholder_lines(sources, lines, idxs=None):
 
 
 def mask_placeholders_in_batch(batch_rows):
-    """번역 대상 열(placeholder 역할)의 «T:...» 를 «T:번호» 토큰으로 치환한다.
+    """번역 대상 열의 «T:...» 를 «T:번호» 토큰으로 치환한다.
+    (placeholder 역할 열이 1순위, 그 열이 비어 있으면 원문(source) 열)
 
     모델이 플레이스홀더 내부 텍스트를 번역·축약·변형하는 사고(예:
     «T:Asistencia diaria» → «T diaria»)를 원천 차단하기 위해, '복사만 해야
@@ -1477,9 +1526,12 @@ def mask_placeholders_in_batch(batch_rows):
     masked_rows = []
     for row in batch_rows:
         new_row = list(row)
-        cell = row[_PH_CELL_IDX] if len(row) > _PH_CELL_IDX else None
-        if isinstance(cell, str) and cell:
-            new_row[_PH_CELL_IDX] = PLACEHOLDER_RE.sub(repl, cell)
+        # 기준 열을 행마다 고른다 (번역 대상 열 우선, 비어 있으면 원문 열).
+        # 한 행에서 한 셀만 마스킹한다 — 같은 내용이 두 열에 있으면 서로 다른
+        # 번호가 붙어 복원이 흔들리기 때문이다.
+        idx = marker_cell_index(row)
+        if idx is not None:
+            new_row[idx] = PLACEHOLDER_RE.sub(repl, row[idx])
         masked_rows.append(tuple(new_row))
     return masked_rows, mapping
 
@@ -1766,8 +1818,9 @@ def main():
                                     print(f"  ❌ {start_row_num+idx}행 재번역 후에도 한글 포함 — 원본 유지")
                         print(f"  → 재번역 완료")
 
-                # ── 플레이스홀더 검증 → 로컬 복구 → 불일치 행 E열 표시 ──
-                # 원본은 배치가 이미 들고 있는 placeholder 역할 열 값 사용
+                # ── 마커(«T:...») 보존 검증 → 로컬 복구 → 불일치 행 E열 표시 ──
+                # 원본은 배치가 이미 들고 있는 값 사용 (marker_source: 번역 대상
+                # 열 우선, 그 역할이 없으면 원문 열)
                 ph_sources = batch_placeholder_sources(batch)
                 ph_idxs = filter_placeholder_mismatch(ph_sources, lines)
                 if ph_idxs:
