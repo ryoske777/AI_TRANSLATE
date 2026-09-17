@@ -19,6 +19,8 @@ main.ensure_external_prompts() 가 시작 시 3-way 로 머지(편집 보존)한
 
 import os
 import sys
+import glob
+import stat
 import time
 import json
 import shutil
@@ -164,6 +166,81 @@ def check_for_update(timeout=15):
 
 # ── 다운로드 ─────────────────────────────────────────────────────────────────
 
+DL_BASENAME = "_update_download"
+
+
+def _make_writable(path):
+    """읽기 전용 속성 때문에 지워지지 않는 경우를 푼다."""
+    try:
+        os.chmod(path, stat.S_IWRITE)
+    except Exception:
+        pass
+
+
+def _clear_path(path):
+    """그 경로를 쓸 수 있게 만든다. 없거나 지웠으면 True, 잠겨 있으면 False."""
+    if not os.path.exists(path):
+        return True
+    _make_writable(path)
+    try:
+        os.remove(path)
+        return True
+    except Exception:
+        return False
+
+
+def _pick_download_path():
+    """다운로드 결과를 둘 경로를 고른다.
+
+    기본 이름(_update_download.exe)이 잠겨 있으면(백신 검사 중이거나 지난 번
+    찌꺼기가 물려 있으면) 번호를 붙인 다른 이름을 쓴다. '이름 하나가 막혔다'는
+    이유로 업데이트 전체가 실패하지 않게 하기 위함이다.
+    """
+    base = paths.app_path(DL_BASENAME + ".exe")
+    if _clear_path(base):
+        return base
+    for i in range(2, 10):
+        alt = paths.app_path(f"{DL_BASENAME}_{i}.exe")
+        if _clear_path(alt):
+            return alt
+    return paths.app_path(f"{DL_BASENAME}_{os.getpid()}.exe")
+
+
+def _finalize_download(tmp, dest):
+    """검증까지 끝난 .part 를 최종 이름으로 옮긴다. 옮긴 경로를 반환.
+
+    Windows 에서 이 rename 이 [WinError 5] 로 막히는 경우가 실제로 있다.
+      · 방금 받은 exe 를 백신이 실시간 검사 중이라 잠깐 잠겨 있다
+        (특히 다운로드 폴더·바탕화면에서 자주 걸린다)
+      · 지난 번 업데이트가 남긴 _update_download.exe 가 아직 물려 있다
+    둘 다 '잠깐' 이거나 '이름만 바꾸면 되는' 문제라, 재시도 → 다른 이름 →
+    받은 파일 그대로 쓰기 순으로 물러선다. 파일 내용은 이미 검증됐으므로
+    이름이 무엇이든 교체에 쓰는 데는 문제가 없다.
+    """
+    deadline = time.time() + 20
+    delay = 0.3
+    last = None
+    while time.time() < deadline:
+        try:
+            os.replace(tmp, dest)
+            return dest
+        except OSError as e:
+            last = e
+            _make_writable(dest)
+            time.sleep(delay)
+            delay = min(delay * 1.6, 2.0)
+    _log(f"다운로드 파일 이름 변경 재시도 실패: {last!r}")
+
+    alt = paths.app_path(f"{DL_BASENAME}_{os.getpid()}.exe")
+    try:
+        os.replace(tmp, alt)
+        _log(f"대체 이름으로 저장: {alt}")
+        return alt
+    except OSError as e:
+        _log(f"대체 이름도 실패({e!r}) — 받은 파일을 그대로 사용한다: {tmp}")
+        return tmp          # 검증을 통과한 파일이므로 그대로 써도 안전하다
+
+
 def download_update(info, progress=None, timeout=180):
     """새 exe 를 받아 exe 옆에 저장하고 그 경로를 반환. 실패 시 예외.
 
@@ -174,12 +251,13 @@ def download_update(info, progress=None, timeout=180):
     url = info.get("url")
     if not url:
         raise RuntimeError("릴리스에 .exe 자산이 없습니다.")
-    dest = paths.app_path("_update_download.exe")
+    dest = _pick_download_path()
     tmp = dest + ".part"
+    _clear_path(tmp)
     try:
         got, expected = _http_download(url, tmp, timeout=timeout, progress=progress)
         _verify_download(tmp, got, expected, info.get("size") or 0)
-        os.replace(tmp, dest)
+        final = _finalize_download(tmp, dest)
     except Exception:
         if os.path.exists(tmp):
             try:
@@ -187,7 +265,7 @@ def download_update(info, progress=None, timeout=180):
             except Exception:
                 pass
         raise
-    return dest
+    return final
 
 
 def _verify_download(path, got, expected, asset_size):
@@ -329,7 +407,9 @@ def perform_swap(target, old_pid=None):
             raise RuntimeError("복사본 크기가 원본과 다릅니다.")
 
         # ② 구 exe 를 옆으로 밀어낸다 (실행 중이어도 이름 변경은 가능)
+        _make_writable(backup)
         _safe_remove(backup)
+        _make_writable(target)
         moved = False
         if os.path.exists(target):
             os.replace(target, backup)
@@ -395,14 +475,17 @@ def _safe_remove(path):
 
 
 def cleanup_after_update():
-    """업데이트 직후 첫 실행 시 남은 임시 파일을 정리한다(있으면)."""
-    names = [
-        "_update_download.exe",
-        "_update_download.exe.part",
-        "_apply_update.bat",
-        STAGING_NAME,
-    ]
+    """업데이트 직후 첫 실행 시 남은 임시 파일을 정리한다(있으면).
+
+    이름이 하나가 아니다 — 기본 이름이 잠겨 있으면 번호/PID 를 붙인 이름으로
+    받기 때문에(_pick_download_path) 같은 계열을 전부 훑어 지운다.
+    """
+    names = ["_apply_update.bat", STAGING_NAME]
     if paths.is_frozen():
         names.append(os.path.basename(sys.executable) + BACKUP_SUFFIX)
     for name in names:
         _safe_remove(paths.app_path(name))
+    for pattern in (DL_BASENAME + "*.exe", DL_BASENAME + "*.part"):
+        for path in glob.glob(paths.app_path(pattern)):
+            _make_writable(path)
+            _safe_remove(path)
