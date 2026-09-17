@@ -59,6 +59,21 @@ _PARTICLES = (
 )
 
 
+# 자동 마커 부착 대상 보호 등급 — 기본은 HARD 하나.
+# SOFT 는 '권장(굴절 허용)' 등급이라 마커로 굳히면 성·수·격 변화가 막혀
+# 스페인어·독일어·프랑스어 문장이 어색해진다.
+MARK_LEVELS_DEFAULT = (LEVEL_HARD,)
+
+
+def _unsafe_mark_text(s):
+    """이 문자열을 «T:...» 안에 넣으면 토큰 구조가 깨지는지.
+
+    토큰은 '내부에 길리메가 없다'는 전제로 파싱되고, 줄바꿈·탭은 배치 포맷을
+    깨뜨린다. 감싸려는 실제 본문(별칭으로 잡혔을 수도 있다)을 검사한다.
+    """
+    return any(ch in (s or "") for ch in "«»\n\r\t")
+
+
 def _is_word(ch):
     return bool(ch) and bool(_WORD_CH.match(ch))
 
@@ -274,6 +289,65 @@ class Glossary:
         out = sorted(found.values(),
                      key=lambda t: (-_LEVEL_ORDER.get(t.level, 0), -t.priority, t.ko))
         return out[:limit] if limit else out
+
+    def find_spans(self, text, lang, levels=None, skip=()):
+        """마커를 붙일 위치를 찾는다 — [(start, end, Term)], 앞에서부터 겹치지 않게.
+
+        find_in_text() 가 '어떤 용어가 나왔나'(프롬프트 지시용)를 돌려준다면,
+        이쪽은 '어디에 나왔나'(마커 부착용)를 돌려준다. 매칭 규칙(match_mode,
+        긴 용어 우선, 한국어 조사 경계)은 같은 것을 쓴다.
+
+        levels : 대상 보호 등급 (기본 HARD 만). 굴절이 필요한 SOFT 를 마커로
+                 굳히면 성·수·격이 깨지므로 기본값은 HARD 하나다.
+        skip   : 건드리면 안 되는 구간 [(s, e)] — 이미 «...» / {...} 안인 자리.
+                 호출자(main)가 토큰 정규식으로 찾아 넘긴다.
+        """
+        text = text or ""
+        levels = tuple(levels or MARK_LEVELS_DEFAULT)
+        if not text or not self.terms:
+            return []
+
+        taken = [tuple(x) for x in skip]
+
+        def free(s, e):
+            return not any(s < e2 and s2 < e for s2, e2 in taken)
+
+        def usable(t):
+            return t.level in levels and bool(t.target(lang))
+
+        spans = []
+
+        # 셀 전체가 한 용어와 같은 경우 (match_mode=exact 포함) — 통째로 감싼다
+        for t in self._exact.get(_fold(text), ()):
+            if usable(t) and free(0, len(text)) and not _unsafe_mark_text(text):
+                spans.append((0, len(text), t))
+                taken.append((0, len(text)))
+                break
+
+        # 부분 일치 — 긴 표기 우선, 겹치면 먼저 잡힌 쪽이 이긴다
+        seen_chars = {c.casefold() for c in text}
+        cands = []
+        for ch in seen_chars:
+            cands.extend(self._by_first.get(ch, ()))
+        cands.sort(key=lambda p: (-len(p[0]), -p[1].priority))
+
+        low = text.casefold()
+        for surface, t in cands:
+            if not usable(t):
+                continue
+            s = surface.casefold()
+            start = low.find(s)
+            while start != -1:
+                end = start + len(s)
+                if (free(start, end)
+                        and self._boundary_ok(text, start, end, t.match_mode)
+                        and not _unsafe_mark_text(text[start:end])):
+                    spans.append((start, end, t))
+                    taken.append((start, end))
+                start = low.find(s, end)
+
+        spans.sort(key=lambda x: x[0])
+        return spans
 
     @staticmethod
     def _boundary_ok(text, start, end, mode):

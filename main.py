@@ -1374,6 +1374,77 @@ def marker_source(row):
     return cell if isinstance(cell, str) else ""
 
 
+# ── 용어집 용어에 마커 자동 부착 ─────────────────────────────────────────────
+#
+# 용어집에는 두 갈래가 있다.
+#   ① «T:...» 안에 통째로 들어있는 용어 → 기계 치환 (마커 유지, 확정적)
+#   ② 문장 속에 그냥 들어있는 용어      → 프롬프트 지시만 (마커가 안 붙는다)
+# ②는 예전에 사용자가 '번역 돌리기 전에 손으로 «T:...» 를 씌우던' 단계다.
+# 그 수작업을 여기서 대신한다. 마커를 씌우면 그 뒤는 기존 경로가 그대로 처리한다:
+#   마스킹(«T:1») → 모델은 복사만 → 언마스킹 → 용어집 확정 치환 → 검증.
+# 결과열에는 «T:대상언어용어» 가 남고, 마커는 사람이 눈으로 보고 손으로 뗀다.
+#
+# 대상 등급은 기본 HARD 뿐이다(glossary.MARK_LEVELS_DEFAULT). 굴절이 필요한
+# SOFT 를 마커로 굳히면 성·수·격이 막혀 문장이 깨진다.
+
+
+def mark_glossary_terms(text, lang, gl, levels=None):
+    """문장 속 용어집 용어를 «T:용어» 로 감싼 문자열을 돌려준다.
+
+    이미 «...» 안이거나 {...} 코드 안인 자리는 건드리지 않는다(중첩 금지).
+    바꿀 것이 없으면 원본 문자열을 그대로 돌려준다 — 두 번 돌려도 결과가 같다
+    (한 번 씌운 «T:검» 은 다음 번엔 보호 구간이라 건너뛴다).
+    """
+    if not text or gl is None:
+        return text
+    skip = [m.span() for m in _GUILLEMET_SPAN_RE.finditer(text)]
+    skip += [m.span() for m in _CURLY_CODE_RE.finditer(text)]
+    try:
+        spans = gl.find_spans(text, lang, levels=levels, skip=skip)
+    except Exception:
+        return text                      # 용어집 문제로 번역을 막지는 않는다
+    if not spans:
+        return text
+    out, last = [], 0
+    for start, end, _term in spans:
+        out.append(text[last:start])
+        out.append(f"«T:{text[start:end]}»")
+        last = end
+    out.append(text[last:])
+    return "".join(out)
+
+
+def mark_batch_glossary(batch_rows, lang, gl, levels=None):
+    """배치의 '마커 기준 셀'에 용어집 마커를 붙인다.
+
+    반환: (새 배치, changed)
+      changed = [(행번호, 셀 인덱스, 새 값)] — 실제로 바뀐 행만
+    """
+    if gl is None:
+        return batch_rows, []
+    new_rows, changed = [], []
+    for row in batch_rows:
+        idx = marker_cell_index(row)
+        if idx is None:
+            new_rows.append(row)
+            continue
+        before = row[idx]
+        after = mark_glossary_terms(before, lang, gl, levels=levels)
+        if after == before:
+            new_rows.append(row)
+            continue
+        new_row = list(row)
+        new_row[idx] = after
+        new_rows.append(tuple(new_row))
+        changed.append((row[0], idx, after))
+    return new_rows, changed
+
+
+def marker_cell_role(idx):
+    """마커 기준 셀 인덱스 → 열 역할 이름 (시트 열 문자를 찾을 때 쓴다)."""
+    return {_PH_CELL_IDX: "placeholder", _SRC_CELL_IDX: "source"}.get(idx)
+
+
 def batch_placeholder_sources(batch_rows):
     """배치 행 튜플에서 마커 검증의 기준이 될 원본 값 리스트를 꺼낸다.
 
