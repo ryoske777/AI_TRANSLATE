@@ -357,6 +357,28 @@ def load_prompt(lang):
     return body + PLACEHOLDER_RULE_BLOCK + ID_RULE_BLOCK
 
 
+# 검수 모드용 마커 보존 규칙 — 번역용 PLACEHOLDER_RULE_BLOCK 의 검수판.
+# 검수 결과(수정안)도 그대로 결과열에 들어가므로, 번역과 같은 강도로 마커를
+# 지켜야 한다. 다만 출력 형식이 '번역문'이 아니라 'OK / 수정: … | 사유: …' 라서
+# 문구를 따로 둔다.
+REVIEW_PLACEHOLDER_RULE_BLOCK = """
+
+────────────────────────────────
+[ 마커·코드 보존 규칙 — 시스템 필수 (판정 기준보다 우선) ]
+────────────────────────────────
+
+- «T:...» (길리메 « » 포함) 와 {...} (예: {CL:3}) 는 게임 엔진이 문자 그대로
+  읽는 코드입니다. 번역·검수 대상이 아닙니다.
+- '수정:' 제안을 쓸 때는 검수 대상 문장에 있던 «T:...» 를 **마커째로, 문자 하나
+  다르지 않게** 그대로 옮겨 적으십시오. 마커 안의 텍스트도 손대지 마십시오.
+- **마커를 떼고 내용만 적은 수정안은 채택되지 않습니다.** 마커 제거는 검수가
+  끝난 뒤 사람이 눈으로 확인하며 수작업으로 합니다. 당신이 대신 지우면 안 됩니다.
+- 마커가 붙어 있다는 것 자체를 문제로 지적하지 마십시오. (정상입니다)
+- 마커 바깥의 표현만 판정하십시오. 다만 나중에 사람이 마커를 떼어낼 것을
+  감안해, 마커를 뗀 상태에서도 자연스럽게 읽히는지를 기준으로 보십시오.
+"""
+
+
 # 검수 모드용 행 ID 규칙 — 출력이 '번역'이 아니라 '검수 결과'라는 점만 다르다.
 REVIEW_ID_RULE_BLOCK = """
 
@@ -378,7 +400,10 @@ def load_review_prompt(mode, src_lang, tgt_lang):
     """검수 모드 프롬프트 로드 — prompts/{mode}.txt 를 읽어 언어 토큰을 치환해 반환.
 
     템플릿 안의 {SRC_LANG} / {TGT_LANG} 토큰을 선택된 언어 설명으로 바꾸고,
-    끝에 검수용 행 ID 규칙을 자동 주입한다. 파일이 없으면 빈 문자열 + 경고.
+    끝에 마커 보존 규칙 + 검수용 행 ID 규칙을 자동 주입한다.
+    (프롬프트 파일은 사용자가 편집할 수 있으므로, 시스템이 보장해야 하는 규칙은
+    파일이 아니라 코드가 단일 지점에서 붙인다 — load_prompt() 와 같은 원칙)
+    파일이 없으면 빈 문자열 + 경고.
     """
     if mode not in REVIEW_MODES:
         return ""
@@ -391,7 +416,7 @@ def load_review_prompt(mode, src_lang, tgt_lang):
     src = REVIEW_LANG_DESC.get(src_lang, LANG_LABELS.get(src_lang, src_lang))
     tgt = REVIEW_LANG_DESC.get(tgt_lang, LANG_LABELS.get(tgt_lang, tgt_lang))
     body = body.replace("{SRC_LANG}", src).replace("{TGT_LANG}", tgt)
-    return body + REVIEW_ID_RULE_BLOCK
+    return body + REVIEW_PLACEHOLDER_RULE_BLOCK + REVIEW_ID_RULE_BLOCK
 
 
 # ── Google Sheets 연결 ──────────────────────────────────────────────────────
