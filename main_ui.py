@@ -3965,11 +3965,19 @@ class App(ctk.CTk):
 if __name__ == "__main__":
     import updater
     # 새 exe 가 --apply-update 모드로 실행되면 GUI 대신 교체만 수행하고 종료한다.
+    #   --apply-update "<구 exe 경로>" [구 프로세스 PID]
+    # PID 는 1.8.0 부터 넘어온다(구버전이 띄운 경우엔 없을 수 있다).
     if updater.APPLY_FLAG in sys.argv:
         idx = sys.argv.index(updater.APPLY_FLAG)
         target = sys.argv[idx + 1] if idx + 1 < len(sys.argv) else ""
+        old_pid = None
+        if idx + 2 < len(sys.argv):
+            try:
+                old_pid = int(sys.argv[idx + 2])
+            except ValueError:
+                old_pid = None
         if target:
-            updater.perform_swap(target)
+            updater.perform_swap(target, old_pid)
         sys.exit(0)
 
     # 교체 후 첫 실행이면 남은 다운로드 임시파일 정리

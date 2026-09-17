@@ -437,3 +437,68 @@ python -c "import main; print(main.list_prompt_langs())"
   복사해 만들 때 예시 단어를 같이 가져오지 말 것.
 - `review_general.txt` / `review_glossary.txt` 는 전 언어 공용이므로 지역 중립으로 쓰고,
   지역 기준은 `main.REVIEW_LANG_DESC` 가 `{TGT_LANG}` 자리에 주입한다.
+
+---
+
+## 14. exe 실행 시 "오디널(ordinal) 380" 로더 오류 (2026-09, v1.8.0 에서 수정)
+
+### 증상
+exe 를 실행하면 `RO_Translator.exe - 오디널 찾기 실패` 창이 뜨고,
+**확인을 누른 뒤 다시 실행하면 멀쩡히 동작**한다. 매번 재현되지 않는다.
+
+### 원인 — 번들에 들어가 있던 Windows 런타임(UCRT)
+v1.7.0 릴리스 exe 를 뜯어보니(PyInstaller CArchive 파싱) 다음이 함께 들어 있었다.
+
+```
+ucrtbase.dll                 10.0.26100.1742   ← 빌드 서버(Windows Server 2025)의 것
+api-ms-win-crt-*.dll   (13개) 10.0.26100.1742
+api-ms-win-core-*.dll  (30개) 10.0.26100.1742
+VCRUNTIME140.dll             14.38.33126.1     ← 이건 OS 구성요소가 아니라 유지해야 함
+```
+
+`ucrtbase.dll` 과 `api-ms-win-*.dll` 은 **Windows 10 부터 OS 구성요소**다.
+PyInstaller 는 빌드 PC 의 파이썬 폴더 옆에 이 파일들이 있으면 의존 DLL 로 보고
+그대로 담는데, onefile exe 는 실행 시 내부 파일을 `%TEMP%\_MEIxxxx` 에 풀고
+그 폴더를 **DLL 검색 경로 앞쪽**에 놓는다. 그래서
+
+- 어떤 모듈은 `_MEIxxxx` 의 26100 빌드 런타임을,
+- 어떤 모듈은 시스템(System32)의 사용자 PC 빌드 런타임을
+
+물게 되고, 한 프로세스 안에 서로 다른 빌드의 CRT 가 섞인다. 어느 쪽이 먼저
+잡히는지는 로드 순서(백신 후킹·주입 DLL·캐시 상태)에 좌우되므로 **"떴다 안 떴다"**
+하는 증상이 된다. 로더가 export 를 못 찾으면 나오는 게 오디널/진입점 오류다.
+
+참고로 UPX 는 원인이 아니었다. `upx=True` 였지만 GitHub Actions 러너에 upx 가
+없어 실제로는 압축되지 않았다(릴리스 exe 안에 UPX 시그니처 0개). 다만 러너 이미지가
+바뀌면 조용히 압축이 켜져 같은 계열의 오류를 만들 수 있어 `upx=False` 로 못박았다.
+
+### 조치 (v1.8.0)
+1. **RO_Translator.spec** — `a.binaries` 에서 `api-ms-win-*.dll` / `ucrtbase.dll` 을
+   제거. OS 것을 쓰게 한다. (Windows 10 이상 필요. `VCRUNTIME140.dll` 은 유지)
+   빌드 로그에 `[spec] OS 런타임 DLL N개를 번들에서 제외했습니다.` 가 찍힌다.
+2. **RO_Translator.spec** — `upx=False` 로 고정(재현성·백신 오탐 방지).
+3. **updater.py — 교체 방식 변경.** 실행 중이던 exe 를 `shutil.copy2` 로 그 자리에
+   덮어쓰지 않는다. 방금 종료한 exe 를 같은 자리에 덮으면 Windows 이미지 캐시 +
+   백신 실시간 검사와 겹쳐 '교체 직후 첫 실행'만 깨지는 일이 있다. 이제는
+   `_update_new.exe` 로 완전히 쓴 뒤 → 구 exe 를 `.old` 로 밀어내고 → rename 으로
+   제자리에 넣는다(같은 폴더라 원자적). 실패하면 `.old` 를 되돌려 구버전을 지킨다.
+4. **updater.py — 다운로드 검증.** Content-Length / 릴리스 자산 크기 / `MZ` 서명을
+   확인한 뒤에만 교체에 쓴다. 받다 만 파일로 교체해 exe 를 깨뜨리지 않기 위함.
+5. **updater.py — 대기 강화.** 구 프로세스 PID 를 `--apply-update <target> <pid>` 로
+   넘겨 `WaitForSingleObject` 로 기다리고, 파일 잠금이 풀릴 때까지 한 번 더 기다린다.
+   (onefile 은 부트로더 + 앱 두 프로세스로 돌아 앱이 죽어도 잠금이 잠깐 남는다)
+   구버전(1.7.0 이하)이 PID 없이 띄워도 동작하도록 인자는 선택이다.
+6. **updater.py — `update.log`.** 교체 각 단계를 exe 옆에 기록. 다음에 업데이트가
+   이상하게 끝나면 이 파일부터 본다. 찌꺼기(`_update_new.exe`, `*.old`,
+   `_update_download.exe`)는 다음 실행 때 `cleanup_after_update()` 가 지운다.
+
+### 다시 진단해야 할 때 쓰는 방법
+릴리스 exe 를 받아 PyInstaller 아카이브를 직접 뜯으면 무엇이 들어갔는지 다 보인다.
+exe 끝에서 `MEI\x0c\x0b\x0a\x0b\x0e` 쿠키를 찾아 TOC(`!iiiiBc` + 이름)를 훑으면
+번들 목록과 각 항목(zlib) 내용을 꺼낼 수 있다. PE export/import 테이블을 같이 보면
+'무엇이 무엇을 오디널로 가져오는지'까지 확인된다.
+
+### 주의 — 위 4번 섹션은 옛 설명이다
+`## 4. GitHub 자동 업데이트` 의 `version.json` / 파일 단위 교체 설명은 지금 코드와
+다르다. 현재는 **GitHub Releases 태그 + exe 자산 하나를 통째로 교체**하는 방식이고,
+프롬프트 보존은 `main.ensure_external_prompts()` 의 3-way 머지가 담당한다.
