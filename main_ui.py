@@ -4007,10 +4007,20 @@ class App(ctk.CTk):
 
     def _after_download(self, path, err):
         if err or not path:
-            messagebox.showwarning(
-                "업데이트 실패",
-                f"다운로드에 실패했습니다.\n\n{err or '알 수 없는 오류'}\n\n"
-                "잠시 후 다시 시도해주세요.")
+            msg = f"다운로드에 실패했습니다.\n\n{err or '알 수 없는 오류'}\n\n"
+            # 액세스 거부(WinError 5)는 '권한이 없다'기보다 '방금 받은 파일을
+            # 백신이 검사하느라 잠깐 붙잡고 있다'인 경우가 대부분이다.
+            # 사용자가 무엇을 하면 되는지 구체적으로 알려준다.
+            if "WinError 5" in str(err) or "액세스가 거부" in str(err):
+                msg += ("백신 실시간 검사가 방금 받은 파일을 잠깐 붙잡고 있을 때 나는 오류입니다.\n"
+                        "· 잠시 후 🔄 버튼으로 다시 시도해보세요 (대개 됩니다).\n"
+                        "· 다운로드·바탕화면 폴더는 검사가 특히 잦습니다. "
+                        "프로그램을 별도 폴더(예: C:\\RO_Translator)에 두면 덜 겹칩니다.\n"
+                        "· 계속 실패하면 GitHub 릴리스 페이지에서 RO_Translator.exe 를 "
+                        "직접 받아 덮어써도 됩니다.")
+            else:
+                msg += "잠시 후 다시 시도해주세요."
+            messagebox.showwarning("업데이트 실패", msg)
             self._set_status("Ready", self.COLORS["text_sub"])
             return
 
