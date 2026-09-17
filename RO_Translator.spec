@@ -76,7 +76,10 @@ def _is_os_runtime(dest_name):
 
 _dropped = [b[0] for b in a.binaries if _is_os_runtime(b[0])]
 a.binaries = [b for b in a.binaries if not _is_os_runtime(b[0])]
-print(f"[spec] OS 런타임 DLL {len(_dropped)}개를 번들에서 제외했습니다.")
+# 빌드 로그 메시지는 반드시 ASCII 로만 쓴다. GitHub Actions 러너의 콘솔 인코딩이
+# cp1252 라서 한글을 print 하면 UnicodeEncodeError 로 빌드가 통째로 죽는다.
+print(f"[spec] excluded {len(_dropped)} OS runtime DLLs "
+      f"(ucrtbase / api-ms-win-*) from the bundle")
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
