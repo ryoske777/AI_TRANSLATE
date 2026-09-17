@@ -300,6 +300,11 @@ PLACEHOLDER_RULE_BLOCK = """
   풀어 쓰거나, « » 안에 다른 텍스트를 적지 마십시오.
 - 원본에 없는 토큰을 새로 만들지 마십시오. 원본 토큰의 종류·개수와 출력
   토큰의 종류·개수는 정확히 일치해야 합니다. (위치만 문장에 맞게 이동 가능)
+- **마커(« » 기호)를 떼고 내용만 적는 것도 금지입니다.** 출력에는 «T:...» 를
+  마커째로 남겨 두십시오. 마커 제거는 번역이 끝난 뒤 사람이 직접 눈으로 확인하며
+  수작업으로 합니다. 당신이 대신 지우거나 정리하면 안 됩니다.
+- 다만 나중에 사람이 마커를 떼어낼 것을 감안해, 마커를 뗀 상태에서도 문장이
+  자연스럽게 읽히도록 어순·조사·관사·띄어쓰기를 맞춰 두십시오.
 - 이 규칙 위반은 게임 오류로 직결됩니다. 문장의 자연스러움보다 이 규칙이 우선합니다.
 """
 
@@ -352,6 +357,28 @@ def load_prompt(lang):
     return body + PLACEHOLDER_RULE_BLOCK + ID_RULE_BLOCK
 
 
+# 검수 모드용 마커 보존 규칙 — 번역용 PLACEHOLDER_RULE_BLOCK 의 검수판.
+# 검수 결과(수정안)도 그대로 결과열에 들어가므로, 번역과 같은 강도로 마커를
+# 지켜야 한다. 다만 출력 형식이 '번역문'이 아니라 'OK / 수정: … | 사유: …' 라서
+# 문구를 따로 둔다.
+REVIEW_PLACEHOLDER_RULE_BLOCK = """
+
+────────────────────────────────
+[ 마커·코드 보존 규칙 — 시스템 필수 (판정 기준보다 우선) ]
+────────────────────────────────
+
+- «T:...» (길리메 « » 포함) 와 {...} (예: {CL:3}) 는 게임 엔진이 문자 그대로
+  읽는 코드입니다. 번역·검수 대상이 아닙니다.
+- '수정:' 제안을 쓸 때는 검수 대상 문장에 있던 «T:...» 를 **마커째로, 문자 하나
+  다르지 않게** 그대로 옮겨 적으십시오. 마커 안의 텍스트도 손대지 마십시오.
+- **마커를 떼고 내용만 적은 수정안은 채택되지 않습니다.** 마커 제거는 검수가
+  끝난 뒤 사람이 눈으로 확인하며 수작업으로 합니다. 당신이 대신 지우면 안 됩니다.
+- 마커가 붙어 있다는 것 자체를 문제로 지적하지 마십시오. (정상입니다)
+- 마커 바깥의 표현만 판정하십시오. 다만 나중에 사람이 마커를 떼어낼 것을
+  감안해, 마커를 뗀 상태에서도 자연스럽게 읽히는지를 기준으로 보십시오.
+"""
+
+
 # 검수 모드용 행 ID 규칙 — 출력이 '번역'이 아니라 '검수 결과'라는 점만 다르다.
 REVIEW_ID_RULE_BLOCK = """
 
@@ -373,7 +400,10 @@ def load_review_prompt(mode, src_lang, tgt_lang):
     """검수 모드 프롬프트 로드 — prompts/{mode}.txt 를 읽어 언어 토큰을 치환해 반환.
 
     템플릿 안의 {SRC_LANG} / {TGT_LANG} 토큰을 선택된 언어 설명으로 바꾸고,
-    끝에 검수용 행 ID 규칙을 자동 주입한다. 파일이 없으면 빈 문자열 + 경고.
+    끝에 마커 보존 규칙 + 검수용 행 ID 규칙을 자동 주입한다.
+    (프롬프트 파일은 사용자가 편집할 수 있으므로, 시스템이 보장해야 하는 규칙은
+    파일이 아니라 코드가 단일 지점에서 붙인다 — load_prompt() 와 같은 원칙)
+    파일이 없으면 빈 문자열 + 경고.
     """
     if mode not in REVIEW_MODES:
         return ""
@@ -386,7 +416,7 @@ def load_review_prompt(mode, src_lang, tgt_lang):
     src = REVIEW_LANG_DESC.get(src_lang, LANG_LABELS.get(src_lang, src_lang))
     tgt = REVIEW_LANG_DESC.get(tgt_lang, LANG_LABELS.get(tgt_lang, tgt_lang))
     body = body.replace("{SRC_LANG}", src).replace("{TGT_LANG}", tgt)
-    return body + REVIEW_ID_RULE_BLOCK
+    return body + REVIEW_PLACEHOLDER_RULE_BLOCK + REVIEW_ID_RULE_BLOCK
 
 
 # ── Google Sheets 연결 ──────────────────────────────────────────────────────
@@ -1255,6 +1285,17 @@ _PRESERVE_TOKEN_RE = re.compile(r'«T:[^«»]*»|\{[^{}]*\}')
 
 # get_pending_rows 행 튜플에서 번역 대상(placeholder 역할) 열의 인덱스
 _PH_CELL_IDX = 3
+# 원문(source 역할) 열의 인덱스
+_SRC_CELL_IDX = 1
+
+# 마커(«T:...») 검증·마스킹의 기준 셀을 고를 때 훑는 순서.
+#
+# 보통은 번역 대상(placeholder 역할) 열에 마커가 있지만, 그 역할을 지정하지 않고
+# 원문(source) 열 하나만 쓰는 시트도 있다. 예전에는 그런 설정에서 마스킹·검증·
+# 복구가 통째로 꺼져, 모델이 마커를 지워도 아무도 모르게 결과열에 기입됐다.
+# 마커 보존은 열 역할 설정과 무관하게 보장돼야 하므로 원문 열까지 후보로 본다.
+# (참조(ref) 열은 번역의 원본이 아니라 참고용이므로 후보에서 제외)
+_MARKER_CELL_IDXS = (_PH_CELL_IDX, _SRC_CELL_IDX)
 
 
 # E열 상태 문구 (UI·CLI 공용 — main_ui 가 import 해서 사용)
@@ -1303,15 +1344,118 @@ def filter_placeholder_mismatch(sources, translations):
     return out
 
 
+def marker_cell_index(row):
+    """행에서 마커 검증·마스킹의 기준이 될 셀의 인덱스. 없으면 None.
+
+    **비어 있지 않은 첫 셀**을 고른다 (번역 대상 열 → 원문 열 순서).
+    '토큰을 든 셀'이 아니라 '비어 있지 않은 셀'인 이유:
+    번역 결과는 번역 대상 셀에 대응하므로, 대상 셀에 없는 토큰을 원문 셀에서
+    가져와 요구하면 정상 행이 불일치로 잡힌다. 대상 열이 아예 비어 있을 때
+    (= 열 역할에 '플레이스홀더'를 지정하지 않은 시트)만 원문 열로 내려간다.
+    """
+    for i in _MARKER_CELL_IDXS:
+        cell = row[i] if len(row) > i else ""
+        if isinstance(cell, str) and cell.strip():
+            return i
+    return None
+
+
+def marker_source(row):
+    """마커 보존 검증의 기준이 되는 셀 값.
+
+    번역 대상(placeholder) 열이 1순위, 비어 있으면 원문(source) 열.
+    둘 다 비었으면 "" — 토큰이 없는 행은 check_placeholder_match 가
+    검증 대상에서 제외한다.
+    """
+    i = marker_cell_index(row)
+    if i is None:
+        i = _PH_CELL_IDX
+    cell = row[i] if len(row) > i else ""
+    return cell if isinstance(cell, str) else ""
+
+
+# ── 용어집 용어에 마커 자동 부착 ─────────────────────────────────────────────
+#
+# 용어집에는 두 갈래가 있다.
+#   ① «T:...» 안에 통째로 들어있는 용어 → 기계 치환 (마커 유지, 확정적)
+#   ② 문장 속에 그냥 들어있는 용어      → 프롬프트 지시만 (마커가 안 붙는다)
+# ②는 예전에 사용자가 '번역 돌리기 전에 손으로 «T:...» 를 씌우던' 단계다.
+# 그 수작업을 여기서 대신한다. 마커를 씌우면 그 뒤는 기존 경로가 그대로 처리한다:
+#   마스킹(«T:1») → 모델은 복사만 → 언마스킹 → 용어집 확정 치환 → 검증.
+# 결과열에는 «T:대상언어용어» 가 남고, 마커는 사람이 눈으로 보고 손으로 뗀다.
+#
+# 대상 등급은 기본 HARD 뿐이다(glossary.MARK_LEVELS_DEFAULT). 굴절이 필요한
+# SOFT 를 마커로 굳히면 성·수·격이 막혀 문장이 깨진다.
+
+
+def mark_glossary_terms(text, lang, gl, levels=None):
+    """문장 속 용어집 용어를 «T:용어» 로 감싼 문자열을 돌려준다.
+
+    이미 «...» 안이거나 {...} 코드 안인 자리는 건드리지 않는다(중첩 금지).
+    바꿀 것이 없으면 원본 문자열을 그대로 돌려준다 — 두 번 돌려도 결과가 같다
+    (한 번 씌운 «T:검» 은 다음 번엔 보호 구간이라 건너뛴다).
+    """
+    if not text or gl is None:
+        return text
+    skip = [m.span() for m in _GUILLEMET_SPAN_RE.finditer(text)]
+    skip += [m.span() for m in _CURLY_CODE_RE.finditer(text)]
+    try:
+        spans = gl.find_spans(text, lang, levels=levels, skip=skip)
+    except Exception:
+        return text                      # 용어집 문제로 번역을 막지는 않는다
+    if not spans:
+        return text
+    out, last = [], 0
+    for start, end, _term in spans:
+        out.append(text[last:start])
+        out.append(f"«T:{text[start:end]}»")
+        last = end
+    out.append(text[last:])
+    return "".join(out)
+
+
+def mark_batch_glossary(batch_rows, lang, gl, levels=None):
+    """배치의 '마커 기준 셀'에 용어집 마커를 붙인다.
+
+    반환: (새 배치, changed)
+      changed = [(행번호, 셀 인덱스, 새 값)] — 실제로 바뀐 행만
+    """
+    if gl is None:
+        return batch_rows, []
+    new_rows, changed = [], []
+    for row in batch_rows:
+        idx = marker_cell_index(row)
+        if idx is None:
+            new_rows.append(row)
+            continue
+        before = row[idx]
+        after = mark_glossary_terms(before, lang, gl, levels=levels)
+        if after == before:
+            new_rows.append(row)
+            continue
+        new_row = list(row)
+        new_row[idx] = after
+        new_rows.append(tuple(new_row))
+        changed.append((row[0], idx, after))
+    return new_rows, changed
+
+
+def marker_cell_role(idx):
+    """마커 기준 셀 인덱스 → 열 역할 이름 (시트 열 문자를 찾을 때 쓴다)."""
+    return {_PH_CELL_IDX: "placeholder", _SRC_CELL_IDX: "source"}.get(idx)
+
+
 def batch_placeholder_sources(batch_rows):
-    """배치 행 튜플에서 플레이스홀더 원본(placeholder 역할 열) 값 리스트를 꺼낸다.
+    """배치 행 튜플에서 마커 검증의 기준이 될 원본 값 리스트를 꺼낸다.
 
     검증 원본은 시트를 다시 읽지 않고 배치가 이미 들고 있는 값을 쓴다.
     (시트 재읽기가 실패하면 빈 값과 비교하게 되어 훼손된 번역이
     '일치'로 조용히 통과하던 문제를 원천 제거)
+
+    행마다 marker_source() 가 기준 열을 고르므로(번역 대상 열 → 원문 열),
+    열 역할에 '플레이스홀더'가 지정돼 있지 않아도 마커 보존이 검증된다.
     """
-    return [row[_PH_CELL_IDX] if len(row) > _PH_CELL_IDX else ""
-            for row in batch_rows]
+    return [marker_source(row) for row in batch_rows]
 
 
 # ── 플레이스홀더 로컬 자동 복구 ──────────────────────────────────────────────
@@ -1453,7 +1597,8 @@ def repair_placeholder_lines(sources, lines, idxs=None):
 
 
 def mask_placeholders_in_batch(batch_rows):
-    """번역 대상 열(placeholder 역할)의 «T:...» 를 «T:번호» 토큰으로 치환한다.
+    """번역 대상 열의 «T:...» 를 «T:번호» 토큰으로 치환한다.
+    (placeholder 역할 열이 1순위, 그 열이 비어 있으면 원문(source) 열)
 
     모델이 플레이스홀더 내부 텍스트를 번역·축약·변형하는 사고(예:
     «T:Asistencia diaria» → «T diaria»)를 원천 차단하기 위해, '복사만 해야
@@ -1477,9 +1622,12 @@ def mask_placeholders_in_batch(batch_rows):
     masked_rows = []
     for row in batch_rows:
         new_row = list(row)
-        cell = row[_PH_CELL_IDX] if len(row) > _PH_CELL_IDX else None
-        if isinstance(cell, str) and cell:
-            new_row[_PH_CELL_IDX] = PLACEHOLDER_RE.sub(repl, cell)
+        # 기준 열을 행마다 고른다 (번역 대상 열 우선, 비어 있으면 원문 열).
+        # 한 행에서 한 셀만 마스킹한다 — 같은 내용이 두 열에 있으면 서로 다른
+        # 번호가 붙어 복원이 흔들리기 때문이다.
+        idx = marker_cell_index(row)
+        if idx is not None:
+            new_row[idx] = PLACEHOLDER_RE.sub(repl, row[idx])
         masked_rows.append(tuple(new_row))
     return masked_rows, mapping
 
@@ -1766,8 +1914,9 @@ def main():
                                     print(f"  ❌ {start_row_num+idx}행 재번역 후에도 한글 포함 — 원본 유지")
                         print(f"  → 재번역 완료")
 
-                # ── 플레이스홀더 검증 → 로컬 복구 → 불일치 행 E열 표시 ──
-                # 원본은 배치가 이미 들고 있는 placeholder 역할 열 값 사용
+                # ── 마커(«T:...») 보존 검증 → 로컬 복구 → 불일치 행 E열 표시 ──
+                # 원본은 배치가 이미 들고 있는 값 사용 (marker_source: 번역 대상
+                # 열 우선, 그 역할이 없으면 원문 열)
                 ph_sources = batch_placeholder_sources(batch)
                 ph_idxs = filter_placeholder_mismatch(ph_sources, lines)
                 if ph_idxs:

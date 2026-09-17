@@ -6,8 +6,9 @@ glossary.py — 용어집(Glossary) 로딩·매칭
 
   1) **플레이스홀더 확정 치환** — «T:내용» 의 내용이 용어집에 있으면 대상 언어의
      공식 용어로 바꿔서 복원한다. AI 를 전혀 거치지 않으므로 100% 확정적이다.
-     («T: » 마커는 이후 파이프라인이 벗겨내고 내용이 그대로 게임에 들어가므로,
-      대상 언어 용어가 들어있어야 한다)
+     (마커(«T: »)는 결과 시트에 그대로 남는다. 나중에 사람이 눈으로 확인하며
+      수작업으로 떼어내면 그 안의 내용이 그대로 게임에 들어가므로, 내용은
+      반드시 대상 언어의 공식 용어여야 한다)
   2) **프롬프트 지시문** — 배치에 실제로 등장하는 용어만 뽑아 "이 번역을 쓰라"는
      표를 만들어 배치 메시지에 붙인다. 문장 속 용어를 기계 치환하면 조사·성수·
      어순이 깨지므로, 치환하지 않고 모델에게 지시한다.
@@ -56,6 +57,21 @@ _PARTICLES = (
     "은", "는", "이", "가", "을", "를", "의", "에", "도", "만", "와", "과",
     "로", "나", "야", "여", "께", "든", "란", "라",
 )
+
+
+# 자동 마커 부착 대상 보호 등급 — 기본은 HARD 하나.
+# SOFT 는 '권장(굴절 허용)' 등급이라 마커로 굳히면 성·수·격 변화가 막혀
+# 스페인어·독일어·프랑스어 문장이 어색해진다.
+MARK_LEVELS_DEFAULT = (LEVEL_HARD,)
+
+
+def _unsafe_mark_text(s):
+    """이 문자열을 «T:...» 안에 넣으면 토큰 구조가 깨지는지.
+
+    토큰은 '내부에 길리메가 없다'는 전제로 파싱되고, 줄바꿈·탭은 배치 포맷을
+    깨뜨린다. 감싸려는 실제 본문(별칭으로 잡혔을 수도 있다)을 검사한다.
+    """
+    return any(ch in (s or "") for ch in "«»\n\r\t")
 
 
 def _is_word(ch):
@@ -274,6 +290,65 @@ class Glossary:
                      key=lambda t: (-_LEVEL_ORDER.get(t.level, 0), -t.priority, t.ko))
         return out[:limit] if limit else out
 
+    def find_spans(self, text, lang, levels=None, skip=()):
+        """마커를 붙일 위치를 찾는다 — [(start, end, Term)], 앞에서부터 겹치지 않게.
+
+        find_in_text() 가 '어떤 용어가 나왔나'(프롬프트 지시용)를 돌려준다면,
+        이쪽은 '어디에 나왔나'(마커 부착용)를 돌려준다. 매칭 규칙(match_mode,
+        긴 용어 우선, 한국어 조사 경계)은 같은 것을 쓴다.
+
+        levels : 대상 보호 등급 (기본 HARD 만). 굴절이 필요한 SOFT 를 마커로
+                 굳히면 성·수·격이 깨지므로 기본값은 HARD 하나다.
+        skip   : 건드리면 안 되는 구간 [(s, e)] — 이미 «...» / {...} 안인 자리.
+                 호출자(main)가 토큰 정규식으로 찾아 넘긴다.
+        """
+        text = text or ""
+        levels = tuple(levels or MARK_LEVELS_DEFAULT)
+        if not text or not self.terms:
+            return []
+
+        taken = [tuple(x) for x in skip]
+
+        def free(s, e):
+            return not any(s < e2 and s2 < e for s2, e2 in taken)
+
+        def usable(t):
+            return t.level in levels and bool(t.target(lang))
+
+        spans = []
+
+        # 셀 전체가 한 용어와 같은 경우 (match_mode=exact 포함) — 통째로 감싼다
+        for t in self._exact.get(_fold(text), ()):
+            if usable(t) and free(0, len(text)) and not _unsafe_mark_text(text):
+                spans.append((0, len(text), t))
+                taken.append((0, len(text)))
+                break
+
+        # 부분 일치 — 긴 표기 우선, 겹치면 먼저 잡힌 쪽이 이긴다
+        seen_chars = {c.casefold() for c in text}
+        cands = []
+        for ch in seen_chars:
+            cands.extend(self._by_first.get(ch, ()))
+        cands.sort(key=lambda p: (-len(p[0]), -p[1].priority))
+
+        low = text.casefold()
+        for surface, t in cands:
+            if not usable(t):
+                continue
+            s = surface.casefold()
+            start = low.find(s)
+            while start != -1:
+                end = start + len(s)
+                if (free(start, end)
+                        and self._boundary_ok(text, start, end, t.match_mode)
+                        and not _unsafe_mark_text(text[start:end])):
+                    spans.append((start, end, t))
+                    taken.append((start, end))
+                start = low.find(s, end)
+
+        spans.sort(key=lambda x: x[0])
+        return spans
+
     @staticmethod
     def _boundary_ok(text, start, end, mode):
         if mode == MATCH_EXACT:
@@ -299,9 +374,10 @@ class Glossary:
 
 # ── 플레이스홀더 확정 치환 ───────────────────────────────────────────────────
 #
-# «T:내용» 은 이후 파이프라인이 마커를 벗겨내고 내용이 그대로 게임에 들어간다.
-# 그래서 내용은 '대상 언어의 공식 용어'여야 하는데, 지금까지는 원문(한국어)이
-# 그대로 복사돼 왔다. 여기서 용어집을 보고 언어별 용어로 바꾼다.
+# 마커(«T: »)는 결과 시트에 그대로 남고, 사람이 나중에 수작업으로 떼어낸다.
+# 떼어내면 «T:내용» 의 '내용'이 그대로 게임에 들어가므로 내용은 '대상 언어의
+# 공식 용어'여야 하는데, 지금까지는 원문(한국어)이 그대로 복사돼 왔다.
+# 여기서 용어집을 보고 언어별 용어로 바꾼다. (마커 자체는 건드리지 않는다)
 #
 # AI 를 거치지 않는 기계 치환이므로 100% 확정적이다. 대신 '토큰 전체가 한 용어와
 # 정확히 같을 때'만 바꾼다 — 토큰 안의 일부만 바꾸면 남은 부분과 어색하게 섞여
