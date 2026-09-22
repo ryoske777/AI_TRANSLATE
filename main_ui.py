@@ -218,6 +218,86 @@ def _clear_cells(sheet, ranges):
             print(f"  ❌ 특이사항열 정리 실패: {e}")
 
 
+# ── 특이사항 표시된 행 재번역 준비 ───────────────────────────────────────────
+#
+# 재번역 대상은 오직 '결과열이 비어 있는가' 로 정해진다(main.get_pending_rows).
+# 특이사항열은 표시만 할 뿐 대상 선정에 쓰이지 않으므로, 문제가 표시된 행을
+# 다시 돌리려면 사람이 결과열을 손으로 비워야 했다. 여기서 그 손작업을 대신한다.
+#
+# 건드리는 것은 **우리가 자동으로 적은 표시**(MANAGED_MARKS) 가 있는 행뿐이다.
+# 사람이 직접 적어 둔 메모가 있는 행은 세기만 하고 그대로 둔다 — 자동 정리가
+# 사람의 판단을 지우면 안 되기 때문이다.
+
+
+def scan_flagged_rows(all_values, start_row, result_col, note_col):
+    """특이사항열에 자동 표시가 있는 행을 훑는다 (시트를 다시 읽지 않는다).
+
+    all_values : sheet.get_all_values() 결과 — 여러 열 쌍을 한 번 읽어 재사용한다.
+
+    반환(dict): {
+        "to_clear": [(행번호, 표시)],  # 결과열에 값이 있어 비워야 할 행
+        "pending":  [행번호],          # 표시는 있지만 결과열이 이미 비어 있는 행
+        "memo":     [행번호],          # 사람이 적은 메모 — 건드리지 않는다
+    }
+    """
+    r_idx = col_to_idx(result_col)
+    n_idx = col_to_idx(note_col)
+    out = {"to_clear": [], "pending": [], "memo": []}
+    for i, row in enumerate(all_values[start_row - 1:], start=start_row):
+        note = row[n_idx].strip() if len(row) > n_idx else ""
+        if not note:
+            continue
+        if note not in MANAGED_MARKS:
+            out["memo"].append(i)
+            continue
+        val = row[r_idx] if len(row) > r_idx else ""
+        if is_empty(val):
+            out["pending"].append(i)
+        else:
+            out["to_clear"].append((i, note))
+    return out
+
+
+def sweep_targets(scope_all):
+    """검사할 (이름, 결과열, 특이사항열) 목록.
+
+    scope_all 이 참이면 연속 번역 계획에서 **켜져 있는 단계**를 전부, 아니면
+    지금 설정된 단일 언어 한 쌍만 돌려준다. 결과열이 겹치는 단계는 한 번만 넣는다.
+    """
+    if not scope_all:
+        lang = getattr(config, "PROMPT_LANG", "")
+        return [(lang_display(lang), getattr(config, "RESULT_COL", "D"), get_note_col())]
+    out, seen = [], set()
+    for j in get_seq_jobs():
+        if not j.get("enabled"):
+            continue
+        key = (j["result_col"], j["note_col"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((lang_display(j["lang"]), j["result_col"], j["note_col"]))
+    return out
+
+
+def clear_ranges(sheet, ranges):
+    """셀 값을 지운다. 반환: (지운 개수, 오류 문구 또는 None).
+
+    _clear_cells() 와 달리 실패를 삼키지 않는다 — 결과열을 비우는 작업은
+    '비워졌다'고 잘못 보고하면 사용자가 재번역된 줄 알고 넘어가기 때문이다.
+    """
+    if not ranges:
+        return 0, None
+    done = 0
+    try:
+        for k in range(0, len(ranges), 500):
+            chunk = ranges[k:k + 500]
+            sheet.batch_clear(chunk)
+            done += len(chunk)
+    except Exception as e:
+        return done, str(e).split("\n")[0][:200]
+    return done, None
+
+
 def reconcile_status(sheet, start_row, lines, sources=None):
     """배치 전체의 특이사항열 상태(한글 포함 / 플레이스홀더 불일치)를 최종 결과 기준으로 정리한다.
 
@@ -3405,7 +3485,7 @@ class App(ctk.CTk):
                      text_color=self.COLORS["text_main"]).pack(side="left")
 
         # side="right" 로 쌓이므로 목록의 앞쪽이 화면 오른쪽 끝에 온다.
-        # 화면 왼→오: 🔄 🗂 🌍 📝 ⚙
+        # 화면 왼→오: 🔄 🧹 🗂 🌍 📝 ⚙
         # (🔁 는 업데이트 🔄 와 글리프가 너무 비슷해 🗂 로 구분한다)
         self._hdr_btns = {}
         for key, icon, cmd, tip in [
@@ -3413,6 +3493,8 @@ class App(ctk.CTk):
                 ("prompt",   "📝", self._open_prompt,         "프롬프트 편집"),
                 ("lang",     "🌍", self._open_lang,           "번역 언어 선택"),
                 ("seq",      "🗂", self._open_seq,            "연속 번역 — 여러 언어를 순서대로 번역"),
+                ("sweep",    "🧹", self._sweep_flagged,
+                 "특이사항 행 재번역 — 표시된 행의 결과열을 비워 다시 번역 대상으로"),
                 ("update",   "🔄", self._check_update_manual, "업데이트 확인")]:
             btn = ctk.CTkButton(header, text=icon, width=40, height=35,
                                 font=ctk.CTkFont(size=18),
@@ -3684,6 +3766,125 @@ class App(ctk.CTk):
 
     # ── 연속 번역 ────────────────────────────────────────────────────────────
 
+    def _sweep_flagged(self):
+        """헤더 🧹 — 특이사항에 표시된 행의 결과열을 비워 재번역 대상으로 만든다.
+
+        재번역 대상은 '결과열이 비어 있는 행'으로만 정해지므로(get_pending_rows),
+        표시가 있는 행을 다시 돌리려면 결과열을 비워야 한다. 그 손작업을 대신한다.
+        지우는 것은 결과열 값뿐이고, 특이사항 표시는 그대로 둔다 — 재번역이
+        정상으로 끝나면 reconcile_status 가 그때 지운다.
+        """
+        if self.worker is not None and self.worker.is_alive():
+            messagebox.showinfo(
+                "실행 중", "작업이 진행 중입니다.\n먼저 중지하거나 완료를 기다려주세요.")
+            return
+        if _current_mode() in REVIEW_MODES:
+            messagebox.showinfo(
+                "특이사항 행 재번역",
+                "이 기능은 '번역' 모드에서만 쓸 수 있습니다.\n"
+                "특이사항열의 자동 표시는 번역 모드에서만 기입되기 때문입니다.")
+            return
+        if not self._preflight():
+            return
+
+        # 대상 범위 — 연속 번역 계획이 켜져 있으면 전체/현재 언어 중 고른다
+        seq_on = [j for j in get_seq_jobs() if j.get("enabled")]
+        scope_all = False
+        if len(seq_on) > 1:
+            ans = messagebox.askyesnocancel(
+                "어디를 검사할까요?",
+                f"연속 번역 계획에 켜진 언어가 {len(seq_on)}개 있습니다.\n\n"
+                f"[예]     계획의 모든 언어를 검사합니다\n"
+                f"[아니오] 지금 언어만 검사합니다 "
+                f"({getattr(config, 'RESULT_COL', 'D')}열 / {get_note_col()}열)")
+            if ans is None:
+                return
+            scope_all = bool(ans)
+
+        targets = sweep_targets(scope_all)
+        if not targets:
+            messagebox.showinfo("특이사항 행 재번역", "검사할 열이 없습니다.")
+            return
+
+        self._add_log("🧹 특이사항 표시된 행을 찾는 중...", "info")
+        self.update_idletasks()
+        try:
+            sheet = get_sheet()
+            all_values = sheet.get_all_values()
+        except Exception as e:
+            msg = str(e).split("\n")[0][:200]
+            self._add_log(f"❌ 시트를 읽지 못했습니다: {msg}", "error")
+            messagebox.showerror("특이사항 행 재번역", f"시트를 읽지 못했습니다.\n\n{e}")
+            return
+
+        start = int(getattr(config, "START_ROW", 2) or 2)
+        found, ranges, lines = [], [], []
+        n_pending = n_memo = 0
+        for name, rcol, ncol in targets:
+            hit = scan_flagged_rows(all_values, start, rcol, ncol)
+            n_pending += len(hit["pending"])
+            n_memo += len(hit["memo"])
+            if not hit["to_clear"]:
+                continue
+            found.append((name, rcol, ncol, hit["to_clear"]))
+            ranges += [f"{rcol}{r}" for r, _m in hit["to_clear"]]
+            tally = {}
+            for _r, mark in hit["to_clear"]:
+                tally[mark] = tally.get(mark, 0) + 1
+            detail = ", ".join(f"{m} {c}행" for m, c in sorted(tally.items()))
+            lines.append(f"  · {name} — {rcol}열 {len(hit['to_clear'])}행  ({detail})")
+
+        if n_memo:
+            self._add_log(
+                f"   ↳ 직접 적으신 메모가 있는 {n_memo}행은 건드리지 않습니다.", "info")
+        if n_pending:
+            self._add_log(
+                f"   ↳ 표시는 있지만 결과열이 이미 비어 있는 {n_pending}행은 "
+                f"그대로 두면 다음 실행에서 번역됩니다.", "info")
+        if not ranges:
+            self._add_log("🧹 비울 행이 없습니다.", "success")
+            messagebox.showinfo(
+                "특이사항 행 재번역",
+                "자동 표시가 붙은 채 결과가 채워져 있는 행이 없습니다.\n\n"
+                f"· 이미 비어 있어 다음 실행 대상인 행: {n_pending}행\n"
+                f"· 직접 적으신 메모라서 건너뛴 행: {n_memo}행")
+            return
+
+        if not messagebox.askyesno(
+                "결과열을 비울까요?",
+                f"아래 {len(ranges)}행의 결과열 값을 지웁니다.\n"
+                f"지우면 다음 실행에서 다시 번역됩니다.\n\n"
+                + "\n".join(lines)
+                + "\n\n특이사항 표시는 그대로 두었다가, 재번역이 정상으로 "
+                  "끝나면 자동으로 지워집니다.\n계속할까요?"):
+            self._add_log("🧹 취소했습니다 — 시트는 그대로입니다.", "warn")
+            return
+
+        done, err = clear_ranges(sheet, ranges)
+        for name, rcol, _ncol, rows in found:
+            head = ", ".join(str(r) for r, _m in rows[:40])
+            more = "" if len(rows) <= 40 else f" 외 {len(rows) - 40}행"
+            self._add_log(f"🧹 {name} {rcol}열 비움 ({len(rows)}행): {head}{more}",
+                          "success")
+        if err:
+            self._add_log(f"❌ 일부만 비웠습니다 ({done}/{len(ranges)}셀): {err}", "error")
+            messagebox.showerror(
+                "특이사항 행 재번역",
+                f"{len(ranges)}셀 중 {done}셀만 비웠습니다.\n\n{err}")
+            return
+        self._add_log(f"🧹 총 {done}행을 재번역 대상으로 되돌렸습니다.", "success")
+
+        if scope_all:
+            messagebox.showinfo(
+                "완료",
+                f"{done}행을 재번역 대상으로 되돌렸습니다.\n\n"
+                "상단 🗂 (연속 번역) 을 눌러 실행하세요.")
+            return
+        if messagebox.askyesno(
+                "완료", f"{done}행을 재번역 대상으로 되돌렸습니다.\n\n"
+                        "지금 바로 번역을 시작할까요?"):
+            self._start()
+
     def _open_seq(self):
         """헤더 🗂 — 연속 번역 설정 창을 열고, '시작'으로 닫히면 바로 실행한다."""
         if self.worker is not None and self.worker.is_alive():
@@ -3709,7 +3910,7 @@ class App(ctk.CTk):
         실행 중에는 설정을 건드릴 수 없게 막는다.
         """
         state = "disabled" if running else "normal"
-        for key in ("settings", "prompt", "lang", "seq"):
+        for key in ("settings", "prompt", "lang", "seq", "sweep"):
             btn = self._hdr_btns.get(key)
             if btn is not None:
                 btn.configure(state=state)
