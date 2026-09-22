@@ -29,7 +29,7 @@ from main import (
     check_placeholder_match, filter_placeholder_mismatch,
     batch_placeholder_sources, repair_masked_tokens, repair_placeholder_lines,
     repair_placeholder_line, marker_source, marker_cell_role,
-    mark_batch_glossary, mark_glossary_terms,
+    mark_batch_glossary, mark_glossary_terms, glossary_mark_gaps,
     PH_MISMATCH_MARK, KOREAN_MARK, MANAGED_MARKS,
     is_empty, col_to_idx,
     list_prompt_langs, load_prompt, load_review_prompt, ensure_external_prompts,
@@ -91,9 +91,13 @@ if not hasattr(config, "GLOSSARY_MAX_TERMS"):
 # 문장 속 용어집 용어에 «T:» 마커를 자동으로 씌울지 (예전 수동 1차 마커 처리 대체)
 if not hasattr(config, "GLOSSARY_AUTO_MARK"):
     config.GLOSSARY_AUTO_MARK = True
-# 마커를 씌울 보호 등급. SOFT 는 굴절(성·수·격)이 막혀 문장이 깨지므로 기본은 HARD 만.
+# '부분 일치'까지 마커를 씌울 보호 등급. SOFT 를 부분 일치까지 굳히면 굴절
+# (성·수·격)이 막혀 문장이 깨지므로 기본은 HARD 만.
 if not hasattr(config, "GLOSSARY_MARK_LEVELS"):
     config.GLOSSARY_MARK_LEVELS = list(gloss.MARK_LEVELS_DEFAULT)
+# 표기가 용어집과 완전히 같은 자리는 등급과 무관하게 항상 마커를 씌울지
+if not hasattr(config, "GLOSSARY_MARK_EXACT_ALWAYS"):
+    config.GLOSSARY_MARK_EXACT_ALWAYS = bool(gloss.MARK_EXACT_ALWAYS_DEFAULT)
 # 씌운 마커를 시트의 입력(번역대상/원본) 열에도 기입할지
 if not hasattr(config, "GLOSSARY_MARK_WRITE_BACK"):
     config.GLOSSARY_MARK_WRITE_BACK = True
@@ -188,10 +192,16 @@ def get_marker_col_letters():
 
 
 def mark_levels():
-    """자동 마커를 붙일 용어집 보호 등급 (설정값, 기본 HARD 만)."""
+    """부분 일치까지 마커를 붙일 용어집 보호 등급 (설정값, 기본 HARD 만)."""
     vals = getattr(config, "GLOSSARY_MARK_LEVELS", None) or gloss.MARK_LEVELS_DEFAULT
     out = tuple(str(v).upper() for v in vals if str(v).upper() in gloss._LEVEL_ORDER)
     return out or gloss.MARK_LEVELS_DEFAULT
+
+
+def mark_exact_always():
+    """표기가 완전히 같은 자리에 등급과 무관하게 마커를 붙일지 (설정값, 기본 켬)."""
+    return bool(getattr(config, "GLOSSARY_MARK_EXACT_ALWAYS",
+                        gloss.MARK_EXACT_ALWAYS_DEFAULT))
 
 
 def _clear_cells(sheet, ranges):
@@ -297,12 +307,21 @@ def marked_and_localized(cell, lang, gl):
     """검증 기준 원본을 '실제로 보낸 모습'으로 맞춘다.
 
     번역할 때와 같은 순서로 ① 용어집 마커 자동 부착 ② 마커 안쪽 확정 치환을
-    적용한다. 마커를 입력 열에 기입하지 않는 설정(GLOSSARY_MARK_WRITE_BACK=False)
-    에서도 전수 검증이 정상 행을 '불일치'로 잡지 않게 하기 위한 것이다.
-    (입력 열에 이미 마커가 있으면 ①은 아무 것도 하지 않는다 — 멱등)
+    적용한다. 전수 검증(audit_completed_rows)이 정상 행을 '불일치'로 잡지 않게
+    하기 위한 것이다.
+
+    ①은 **마커를 입력 열에 기입하지 않는 설정일 때만** 한다
+    (GLOSSARY_MARK_WRITE_BACK=False — 무엇을 보냈는지 시트에 남지 않으므로
+    현재 규칙으로 재현할 수밖에 없다). 기입하는 설정에서는 시트의 입력 열
+    자체가 '실제로 보낸 모습'이므로 다시 씌우지 않는다 — 그러지 않으면 마커
+    부착 규칙을 넓힐 때마다 예전에 끝난 행이 전부 '불일치'로 잡힌다.
+    기입 설정에서도 검증 강도는 그대로다: 보낸 마커가 입력 열에 남아 있으니
+    모델이 지운 마커는 여전히 불일치로 걸린다.
     """
-    if gl is not None and getattr(config, "GLOSSARY_AUTO_MARK", True):
-        cell = mark_glossary_terms(cell, lang, gl, levels=mark_levels())
+    if (gl is not None and getattr(config, "GLOSSARY_AUTO_MARK", True)
+            and not getattr(config, "GLOSSARY_MARK_WRITE_BACK", True)):
+        cell = mark_glossary_terms(cell, lang, gl, levels=mark_levels(),
+                                   exact_always=mark_exact_always())
     return localize_ph_cell(cell, lang, gl)
 
 
@@ -775,6 +794,7 @@ class TranslationWorker(threading.Thread):
         self.gl_changed = 0                 # 이번 실행에서 확정 치환한 토큰 수
         self.gl_marked = 0                  # 이번 실행에서 새로 씌운 마커 수
         self.gl_unmatched = set()           # 용어집에 없던 «T:» 내용
+        self.gl_gaps = {}                   # 등장했으나 마커가 안 붙은 용어 {ko: 사유}
         self.stop_flag = False
         self.pause_flag = False
         self.force_new_conv = False  # 재시작 시 새 대화 강제
@@ -1137,8 +1157,16 @@ class TranslationWorker(threading.Thread):
                 # 기존 경로가 그대로 처리하므로 결과열에 «T:대상언어용어» 가 남는다.
                 if (not is_review) and self.glossary is not None \
                         and getattr(config, "GLOSSARY_AUTO_MARK", True):
+                    _levels, _exact_always = mark_levels(), mark_exact_always()
+                    # 마커가 안 붙은 용어를 먼저 모은다 (부착 전 원본 기준).
+                    # 실행이 끝날 때 한 번에 알려 '용어집에 있는데 마커가 없다'를
+                    # 사람이 바로 확인할 수 있게 하는 진단용이다.
+                    self.gl_gaps.update(glossary_mark_gaps(
+                        batch, tgt_lang, self.glossary, levels=_levels,
+                        exact_always=_exact_always))
                     batch, gl_marked = mark_batch_glossary(
-                        batch, tgt_lang, self.glossary, levels=mark_levels())
+                        batch, tgt_lang, self.glossary, levels=_levels,
+                        exact_always=_exact_always)
                     if gl_marked:
                         self.gl_marked += sum(
                             len(extract_placeholders(v)) for _, _, v in gl_marked)
@@ -1498,7 +1526,7 @@ class TranslationWorker(threading.Thread):
                     break
 
             if self.glossary is not None and (self.gl_changed or self.gl_marked
-                                              or self.gl_unmatched):
+                                              or self.gl_unmatched or self.gl_gaps):
                 self.log(
                     f"📖 용어집 적용 요약 — 마커 자동 부착 {self.gl_marked:,}건 · "
                     f"플레이스홀더 확정 치환 {self.gl_changed:,}건 · "
@@ -1507,6 +1535,14 @@ class TranslationWorker(threading.Thread):
                     head = ", ".join(sorted(self.gl_unmatched)[:15])
                     more = "" if len(self.gl_unmatched) <= 15 else f" 외 {len(self.gl_unmatched) - 15}종"
                     self.log(f"   ↳ 미등록(원문 유지): {head}{more}", "warn")
+                if self.gl_gaps:
+                    head = ", ".join(f"{ko}({why.split(' — ')[0]})"
+                                     for ko, why in sorted(self.gl_gaps.items())[:10])
+                    more = "" if len(self.gl_gaps) <= 10 else f" 외 {len(self.gl_gaps) - 10}종"
+                    self.log(
+                        f"   ↳ 등장했으나 마커를 안 붙인 용어 {len(self.gl_gaps):,}종 "
+                        f"(표기가 완전히 같지 않은 자리 — 프롬프트 지시로만 전달): "
+                        f"{head}{more}", "warn")
 
             if self.stop_flag:
                 self.log(f"⏹ 중지 — {processed}행 처리됨", "warn")
@@ -1996,8 +2032,13 @@ class SettingsDialog(ctk.CTkToplevel):
 
         self.v_gl_mark = tk.BooleanVar(value=bool(getattr(config, "GLOSSARY_AUTO_MARK", True)))
         ctk.CTkCheckBox(
-            gl_frame, text="문장 속 용어집 용어에 «T:» 마커 자동 부착 (HARD 등급)",
+            gl_frame, text="문장 속 용어집 용어에 «T:» 마커 자동 부착",
             variable=self.v_gl_mark).pack(anchor="w", padx=4, pady=(8, 0))
+        self.v_gl_mark_exact = tk.BooleanVar(value=mark_exact_always())
+        ctk.CTkCheckBox(
+            gl_frame,
+            text="표기가 용어집과 완전히 같으면 등급(HARD/SOFT/HINT)과 무관하게 항상 부착",
+            variable=self.v_gl_mark_exact).pack(anchor="w", padx=22, pady=(2, 0))
         self.v_gl_mark_wb = tk.BooleanVar(
             value=bool(getattr(config, "GLOSSARY_MARK_WRITE_BACK", True)))
         ctk.CTkCheckBox(
@@ -2008,11 +2049,15 @@ class SettingsDialog(ctk.CTkToplevel):
             gl_frame,
             text="· «T:...» 안의 내용이 용어집에 통째로 있으면 그 언어의 공식 용어로 "
                  "바꿔 기입합니다 (AI 를 거치지 않아 확정적).\n"
-                 "· 마커 자동 부착을 켜면, 문장 속에 그냥 있던 HARD 용어도 «T:용어» 로 "
+                 "· 마커 자동 부착을 켜면, 문장 속에 그냥 있던 용어도 «T:용어» 로 "
                  "감싸 보내므로 결과열에 마커가 붙어 나옵니다 (손으로 1차 마커 처리하던 단계).\n"
                  "  마커는 사람이 눈으로 확인하고 직접 떼는 용도이며, 도구는 떼지 않습니다.\n"
-                 "· 마커가 안 붙은 용어(SOFT/HINT)는 프롬프트에 '이 번역을 쓰라'고 "
-                 "첨부만 합니다.\n"
+                 "· 표기가 용어집과 '완전히 같은' 자리(셀 전체가 용어이거나, 앞뒤가 단어 "
+                 "경계이고 조사만 붙은 형태)는 등급을 보지 않고 항상 감쌉니다.\n"
+                 "· 표기가 달라지는 부분 일치(예: 합성어 안)는 HARD 등급만 감쌉니다 — "
+                 "SOFT 를 거기까지 굳히면 성·수·격 변화가 막혀 문장이 깨집니다.\n"
+                 "· 그래서 마커가 안 붙은 용어는 프롬프트에 '이 번역을 쓰라'고 "
+                 "첨부만 하며, 어떤 용어가 그랬는지는 실행 로그 끝에 알려 줍니다.\n"
                  "· 필요한 열: ko-KR(열쇠), 언어별 열(en-US, zh-CN, th-TH, es-ES …), "
                  "aliases, match_mode, protect_level, priority, status.\n"
                  "· 열 순서는 상관없고 이름으로 찾습니다. 대상 언어 칸이 비어 있으면 "
@@ -2171,6 +2216,7 @@ class SettingsDialog(ctk.CTkToplevel):
         # 탭 이름이 없으면 켤 수 없다 (읽을 곳이 없으므로)
         config.GLOSSARY_ENABLED = bool(self.v_gl_on.get()) and bool(config.GLOSSARY_TAB)
         config.GLOSSARY_AUTO_MARK = bool(self.v_gl_mark.get())
+        config.GLOSSARY_MARK_EXACT_ALWAYS = bool(self.v_gl_mark_exact.get())
         config.GLOSSARY_MARK_WRITE_BACK = bool(self.v_gl_mark_wb.get())
         ai_mode = (self.v_ai_mode.get() or "chatgpt").lower()
         config.AI_MODE = ai_mode if ai_mode in ("chatgpt", "claude") else "chatgpt"
@@ -2894,6 +2940,7 @@ def save_settings():
         "GLOSSARY_TAB":               getattr(config, "GLOSSARY_TAB", ""),
         "GLOSSARY_MAX_TERMS":         int(getattr(config, "GLOSSARY_MAX_TERMS", 60) or 60),
         "GLOSSARY_AUTO_MARK":         bool(getattr(config, "GLOSSARY_AUTO_MARK", True)),
+        "GLOSSARY_MARK_EXACT_ALWAYS": mark_exact_always(),
         "GLOSSARY_MARK_LEVELS":       list(getattr(config, "GLOSSARY_MARK_LEVELS",
                                                    gloss.MARK_LEVELS_DEFAULT)),
         "GLOSSARY_MARK_WRITE_BACK":   bool(getattr(config, "GLOSSARY_MARK_WRITE_BACK", True)),
@@ -2983,6 +3030,8 @@ def load_settings():
                                            getattr(config, "GLOSSARY_TAB", "")) or "").strip()
         config.GLOSSARY_ENABLED = bool(data.get("GLOSSARY_ENABLED", False)) and bool(config.GLOSSARY_TAB)
         config.GLOSSARY_AUTO_MARK = bool(data.get("GLOSSARY_AUTO_MARK", True))
+        config.GLOSSARY_MARK_EXACT_ALWAYS = bool(data.get(
+            "GLOSSARY_MARK_EXACT_ALWAYS", gloss.MARK_EXACT_ALWAYS_DEFAULT))
         config.GLOSSARY_MARK_WRITE_BACK = bool(data.get("GLOSSARY_MARK_WRITE_BACK", True))
         lv = data.get("GLOSSARY_MARK_LEVELS", None)
         if isinstance(lv, (list, tuple)):
