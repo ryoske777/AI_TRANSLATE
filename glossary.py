@@ -50,19 +50,59 @@ _WORD_CH = re.compile(r"[0-9A-Za-z가-힣ㄱ-ㆎ]")
 # 한국어는 조사가 단어에 붙어버려서(예: '검' + '을') 단순 경계 검사로는 놓친다.
 # 용어집의 aliases 열이 이걸 보완하지만 1.6% 행에만 있어서, 뒤쪽 경계에 한해
 # 흔한 조사를 허용한다. (조사 뒤가 다시 단어 문자면 조사가 아니라고 보고 거른다)
+# 조사는 '단독 조사' 단위로만 적고, 겹침(예: '으로'+'도' = '으로도')은
+# _particles_only() 가 최대 _PARTICLE_CHAIN 개까지 이어붙여 처리한다.
+# 동사·형용사 어미와 헷갈리는 것('고', '며', '지' 등)은 일부러 뺀다 —
+# '검고'(검다+고) 를 '검'+조사로 잘못 보면 엉뚱한 곳에 마커가 붙는다.
 _PARTICLES = (
-    "으로써", "으로서", "이라고", "에게서", "에서는", "으로는", "이라는",
-    "라고", "로써", "로서", "에게", "에서", "부터", "까지", "처럼", "보다",
-    "마저", "조차", "이나", "이란", "라는", "이든", "이야", "이요",
+    "으로부터", "로부터", "이라고", "이라는", "이라도", "이라면", "이라서",
+    "이나마", "에게서", "에게로", "으로써", "으로서", "한테서", "께서",
+    "라고", "라는", "라도", "라면", "라서", "나마", "로써", "로서",
+    "에게", "한테", "에서", "부터", "까지", "처럼", "보다", "만큼",
+    "밖에", "대로", "마저", "조차", "이나", "이란", "이든", "이야",
+    "이요", "이랑", "으로", "들",
     "은", "는", "이", "가", "을", "를", "의", "에", "도", "만", "와", "과",
-    "로", "나", "야", "여", "께", "든", "란", "라",
+    "로", "나", "야", "여", "께", "든", "란", "라", "랑", "뿐",
 )
+# 긴 조사가 먼저 잡히도록 (예: '으로서' 를 '으로'+'서' 로 쪼개기 전에 통째로)
+_PARTICLES = tuple(sorted(set(_PARTICLES), key=len, reverse=True))
+
+# 조사를 몇 개까지 이어붙여 볼지 — '검으로도', '동료들에게는' 같은 겹조사용
+_PARTICLE_CHAIN = 3
 
 
-# 자동 마커 부착 대상 보호 등급 — 기본은 HARD 하나.
-# SOFT 는 '권장(굴절 허용)' 등급이라 마커로 굳히면 성·수·격 변화가 막혀
-# 스페인어·독일어·프랑스어 문장이 어색해진다.
+def _particles_only(tail):
+    """어절의 나머지(tail)가 조사만으로 이뤄져 단어 경계로 볼 수 있는지.
+
+    빈 문자열이거나 바로 다음이 단어 문자가 아니면 경계다. 단어 문자가
+    이어지면 긴 조사부터 떼어내며 다시 본다. 조사가 아닌 글자가 남으면 거짓이다
+    (예: '검은색' → '은' 을 떼면 '색' 이 남으므로 '검' 은 독립된 단어가 아니다).
+    """
+    for _ in range(_PARTICLE_CHAIN):
+        if not tail or not _is_word(tail[0]):
+            return True
+        for p in _PARTICLES:
+            if tail.startswith(p):
+                tail = tail[len(p):]
+                break
+        else:
+            return False
+    return not tail or not _is_word(tail[0])
+
+
+# '부분 일치'까지 마커를 붙일 보호 등급 — 기본은 HARD 하나.
+# SOFT 는 '권장(굴절 허용)' 등급이라, 문장 속 부분 일치까지 마커로 굳히면
+# 성·수·격 변화가 막혀 스페인어·독일어·프랑스어 문장이 어색해진다.
 MARK_LEVELS_DEFAULT = (LEVEL_HARD,)
+
+# '완전히 동일한 표기'는 등급과 무관하게 항상 마커를 붙인다.
+#
+# 등급만으로 거르면 용어집에 분명히 있는 단어인데도(SOFT/HINT) 마커 없이 그냥
+# 번역돼 나가는 일이 생긴다. 그래서 '셀 전체가 용어와 같다' 또는 '문장 속에서
+# 앞뒤가 단어 경계인 채로 표기가 똑같다(조사만 붙은 형태 포함)' 면 등급을 보지
+# 않고 감싼다. 굴절이 걱정되는 쪽은 '표기가 달라지는 자리'(부분 일치)인데,
+# 그런 자리는 여전히 MARK_LEVELS_DEFAULT 로만 걸러 들어온다.
+MARK_EXACT_ALWAYS_DEFAULT = True
 
 
 def _unsafe_mark_text(s):
@@ -85,6 +125,19 @@ def _norm(s):
 
 def _fold(s):
     return _norm(s).casefold()
+
+
+def _fold_pos(s):
+    """길이를 보존하는 소문자화 — 찾은 위치를 원문 인덱스로 그대로 쓰기 위한 것.
+
+    casefold() 는 글자 수를 바꿀 수 있어서('ß' → 'ss', 'İ' → 'i̇'), 그대로 쓰면
+    마커가 한두 칸 밀린 자리에 붙는다. 길이가 달라지는 경우에만 글자 단위로
+    접어 원문과 1:1 대응을 유지한다.
+    """
+    low = (s or "").casefold()
+    if len(low) == len(s or ""):
+        return low
+    return "".join((ch.casefold() or ch)[0] for ch in s)
 
 
 class Term:
@@ -212,10 +265,14 @@ class Glossary:
             for a in t.aliases:
                 self._exact.setdefault(_fold(a), []).append(t)
                 if t.match_mode != MATCH_EXACT:
-                    self._by_first.setdefault(a[0].casefold(), []).append((a, t))
-        # 긴 표기가 먼저 잡히도록(포함 관계에서 구체적인 용어가 이기도록) 정렬
+                    # 색인 열쇠와 본문 검색을 같은 방식(_fold_pos)으로 접어야
+                    # 후보가 조용히 빠지지 않는다
+                    self._by_first.setdefault(_fold_pos(a)[:1], []).append((a, t))
+        # 긴 표기가 먼저 잡히도록(포함 관계에서 구체적인 용어가 이기도록) 정렬.
+        # 길이·priority 가 같으면 보호 등급이 높은 쪽(HARD)이 자리를 가져간다.
         for lst in self._by_first.values():
-            lst.sort(key=lambda p: (-len(p[0]), -p[1].priority))
+            lst.sort(key=lambda p: (-len(p[0]), -p[1].priority,
+                                    -_LEVEL_ORDER.get(p[1].level, 0)))
         for lst in self._exact.values():
             lst.sort(key=lambda t: (-_LEVEL_ORDER.get(t.level, 0), -t.priority))
 
@@ -263,19 +320,19 @@ class Glossary:
             spans.append((0, len(text)))
 
         # 부분 일치 — 셀에 등장하는 글자로 후보를 좁힌다
-        seen_chars = {c.casefold() for c in text}
+        # (색인과 같은 _fold_pos 로 접어야 후보가 조용히 빠지지 않는다)
+        low = _fold_pos(text)
         cands = []
-        for ch in seen_chars:
+        for ch in set(low):
             cands.extend(self._by_first.get(ch, ()))
-        cands.sort(key=lambda p: (-len(p[0]), -p[1].priority))
-
-        low = text.casefold()
+        cands.sort(key=lambda p: (-len(p[0]), -p[1].priority,
+                                  -_LEVEL_ORDER.get(p[1].level, 0)))
         for surface, t in cands:
             if t.key in found:
                 continue
             if not t.target(lang):
                 continue
-            s = surface.casefold()
+            s = _fold_pos(surface)
             start = low.find(s)
             while start != -1:
                 end = start + len(s)
@@ -290,20 +347,31 @@ class Glossary:
                      key=lambda t: (-_LEVEL_ORDER.get(t.level, 0), -t.priority, t.ko))
         return out[:limit] if limit else out
 
-    def find_spans(self, text, lang, levels=None, skip=()):
+    def find_spans(self, text, lang, levels=None, skip=(), exact_always=None):
         """마커를 붙일 위치를 찾는다 — [(start, end, Term)], 앞에서부터 겹치지 않게.
 
         find_in_text() 가 '어떤 용어가 나왔나'(프롬프트 지시용)를 돌려준다면,
         이쪽은 '어디에 나왔나'(마커 부착용)를 돌려준다. 매칭 규칙(match_mode,
         긴 용어 우선, 한국어 조사 경계)은 같은 것을 쓴다.
 
-        levels : 대상 보호 등급 (기본 HARD 만). 굴절이 필요한 SOFT 를 마커로
-                 굳히면 성·수·격이 깨지므로 기본값은 HARD 하나다.
-        skip   : 건드리면 안 되는 구간 [(s, e)] — 이미 «...» / {...} 안인 자리.
-                 호출자(main)가 토큰 정규식으로 찾아 넘긴다.
+        한 자리를 감쌀지는 두 규칙 중 하나만 통과하면 된다.
+          ① 동일 표기 — 표기가 용어와 완전히 같은 자리(셀 전체이거나, 문장 속
+             단어 경계에 조사만 붙은 형태)는 **보호 등급을 보지 않고** 감싼다.
+             용어집에 있는 단어가 마커 없이 직역돼 나가는 것을 막는 규칙이다.
+          ② 등급 규칙 — levels 에 든 등급의 용어는 match_mode 규칙대로, 표기가
+             달라지는 부분 일치까지 감싼다.
+
+        levels       : ②의 대상 보호 등급 (기본 HARD 만). 굴절이 필요한 SOFT 를
+                       부분 일치까지 마커로 굳히면 성·수·격이 깨지므로 기본값은
+                       HARD 하나다.
+        exact_always : ①을 쓸지 (기본 MARK_EXACT_ALWAYS_DEFAULT = True).
+        skip         : 건드리면 안 되는 구간 [(s, e)] — 이미 «...» / {...} 안인 자리.
+                       호출자(main)가 토큰 정규식으로 찾아 넘긴다.
         """
         text = text or ""
         levels = tuple(levels or MARK_LEVELS_DEFAULT)
+        if exact_always is None:
+            exact_always = MARK_EXACT_ALWAYS_DEFAULT
         if not text or not self.terms:
             return []
 
@@ -312,35 +380,46 @@ class Glossary:
         def free(s, e):
             return not any(s < e2 and s2 < e for s2, e2 in taken)
 
-        def usable(t):
-            return t.level in levels and bool(t.target(lang))
+        def eligible(t, s, e):
+            """이 자리를 감쌀지 — 동일 표기 규칙(①) 또는 등급 규칙(②)."""
+            if not t.target(lang):
+                return False            # 대상 언어 용어가 없으면 감쌀 이유가 없다
+            if exact_always and self._exact_surface_ok(text, s, e, t.match_mode):
+                return True
+            return (t.level in levels
+                    and self._boundary_ok(text, s, e, t.match_mode))
 
         spans = []
 
-        # 셀 전체가 한 용어와 같은 경우 (match_mode=exact 포함) — 통째로 감싼다
-        for t in self._exact.get(_fold(text), ()):
-            if usable(t) and free(0, len(text)) and not _unsafe_mark_text(text):
-                spans.append((0, len(text), t))
-                taken.append((0, len(text)))
-                break
+        # 셀 전체가 한 용어와 같은 경우 (match_mode=exact 포함) — 통째로 감싼다.
+        # 앞뒤 공백은 마커 밖에 남긴다 («T: 검 » 이 아니라 ' «T:검» ').
+        body = _fold(text)
+        if body:
+            b0 = len(text) - len(text.lstrip())
+            b1 = b0 + len(text.strip())
+            for t in self._exact.get(body, ()):
+                if (eligible(t, b0, b1) and free(b0, b1)
+                        and not _unsafe_mark_text(text[b0:b1])):
+                    spans.append((b0, b1, t))
+                    taken.append((b0, b1))
+                    break
 
         # 부분 일치 — 긴 표기 우선, 겹치면 먼저 잡힌 쪽이 이긴다
-        seen_chars = {c.casefold() for c in text}
+        low = _fold_pos(text)
         cands = []
-        for ch in seen_chars:
+        for ch in set(low):
             cands.extend(self._by_first.get(ch, ()))
-        cands.sort(key=lambda p: (-len(p[0]), -p[1].priority))
+        cands.sort(key=lambda p: (-len(p[0]), -p[1].priority,
+                                  -_LEVEL_ORDER.get(p[1].level, 0)))
 
-        low = text.casefold()
         for surface, t in cands:
-            if not usable(t):
+            if not t.target(lang):
                 continue
-            s = surface.casefold()
+            s = _fold_pos(surface)
             start = low.find(s)
             while start != -1:
                 end = start + len(s)
-                if (free(start, end)
-                        and self._boundary_ok(text, start, end, t.match_mode)
+                if (free(start, end) and eligible(t, start, end)
                         and not _unsafe_mark_text(text[start:end])):
                     spans.append((start, end, t))
                     taken.append((start, end))
@@ -349,27 +428,72 @@ class Glossary:
         spans.sort(key=lambda x: x[0])
         return spans
 
+    def unmarked_terms(self, text, lang, levels=None, skip=(), exact_always=None):
+        """이 문장에 등장하지만 마커가 붙지 않은 용어 — [(Term, 사유)].
+
+        find_in_text() 와 find_spans() 를 같은 문장에 돌려 그 차이를 돌려준다.
+        '용어집에 있는데 마커가 안 붙었다'를 사람이 확인·추적할 수 있게 하려는
+        진단용이며, 번역 동작 자체에는 영향을 주지 않는다.
+
+        보호 구간(skip — 이미 «T:...»/{...} 안)은 공백으로 가리고 센다. 지난
+        실행에서 이미 마커가 씌워진 용어를 '안 붙었다'고 알리지 않기 위해서다.
+        """
+        visible = text or ""
+        for s0, e0 in skip:
+            visible = visible[:s0] + " " * (e0 - s0) + visible[e0:]
+        present = self.find_in_text(visible, lang)
+        if not present:
+            return []
+        marked = {t.key for _s, _e, t in self.find_spans(
+            text, lang, levels=levels, skip=skip, exact_always=exact_always)}
+        levels = tuple(levels or MARK_LEVELS_DEFAULT)
+        if exact_always is None:
+            exact_always = MARK_EXACT_ALWAYS_DEFAULT
+        out = []
+        for t in present:
+            if t.key in marked:
+                continue
+            if t.level in levels:
+                # 등급은 통과했는데 자리를 못 잡은 경우
+                why = "자리 문제 — 더 긴 용어와 겹치거나 «»·줄바꿈을 포함"
+            elif exact_always:
+                why = f"{t.level} 등급 — 표기가 완전히 같은 자리가 아님(부분 일치)"
+            else:
+                why = f"{t.level} 등급 — '동일 표기 항상 부착'이 꺼져 있음"
+            out.append((t, why))
+        return out
+
+    @staticmethod
+    def _exact_surface_ok(text, start, end, mode):
+        """이 자리의 표기가 용어와 '완전히 동일'한가 — 등급과 무관한 부착 조건.
+
+        · 셀 전체(앞뒤 공백 제외)가 용어와 같으면 언제나 참 (match_mode 무관)
+        · 문장 속이면 앞뒤가 단어 경계일 때만 참. 한국어 조사가 붙은 형태는
+          같은 단어로 본다 ('검을' 의 '검').
+        · match_mode=exact 는 '셀 전체와 같을 때만'이라는 뜻이므로, 문장 속
+          등장은 동일 표기로 치지 않는다 (용어집 작성자가 좁혀 둔 것을 넓히지
+          않기 위해).
+        """
+        if text[:start].strip() == "" and text[end:].strip() == "":
+            return True
+        if mode == MATCH_EXACT:
+            return False
+        return Glossary._word_boundary_ok(text, start, end)
+
     @staticmethod
     def _boundary_ok(text, start, end, mode):
         if mode == MATCH_EXACT:
             return start == 0 and end == len(text)
         if mode == MATCH_CONTAINS:
             return True
-        # boundary_only
+        return Glossary._word_boundary_ok(text, start, end)
+
+    @staticmethod
+    def _word_boundary_ok(text, start, end):
+        """앞뒤가 단어 경계인지. 뒤쪽은 한국어 조사가 붙은 형태도 경계로 인정한다."""
         if start > 0 and _is_word(text[start - 1]):
             return False
-        if end >= len(text):
-            return True
-        if not _is_word(text[end]):
-            return True
-        # 뒤에 한국어 조사가 붙은 형태도 경계로 인정
-        tail = text[end:]
-        for p in _PARTICLES:
-            if tail.startswith(p):
-                after = tail[len(p):]
-                if not after or not _is_word(after[0]):
-                    return True
-        return False
+        return _particles_only(text[end:])
 
 
 # ── 플레이스홀더 확정 치환 ───────────────────────────────────────────────────

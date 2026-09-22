@@ -1384,11 +1384,16 @@ def marker_source(row):
 #   마스킹(«T:1») → 모델은 복사만 → 언마스킹 → 용어집 확정 치환 → 검증.
 # 결과열에는 «T:대상언어용어» 가 남고, 마커는 사람이 눈으로 보고 손으로 뗀다.
 #
-# 대상 등급은 기본 HARD 뿐이다(glossary.MARK_LEVELS_DEFAULT). 굴절이 필요한
-# SOFT 를 마커로 굳히면 성·수·격이 막혀 문장이 깨진다.
+# 부착 규칙은 두 갈래다.
+#   ① 동일 표기 — 표기가 용어와 완전히 같은 자리(셀 전체이거나, 문장 속에서
+#      앞뒤가 단어 경계이고 조사만 붙은 형태)는 보호 등급과 무관하게 항상 씌운다.
+#      용어집에 분명히 있는 단어가 마커 없이 그냥 직역돼 나가는 것을 막는다.
+#   ② 등급 규칙 — 표기가 달라지는 부분 일치는 기본 HARD 등급만
+#      (glossary.MARK_LEVELS_DEFAULT). 굴절이 필요한 SOFT 를 부분 일치까지
+#      마커로 굳히면 성·수·격이 막혀 문장이 깨지기 때문이다.
 
 
-def mark_glossary_terms(text, lang, gl, levels=None):
+def mark_glossary_terms(text, lang, gl, levels=None, exact_always=None):
     """문장 속 용어집 용어를 «T:용어» 로 감싼 문자열을 돌려준다.
 
     이미 «...» 안이거나 {...} 코드 안인 자리는 건드리지 않는다(중첩 금지).
@@ -1400,7 +1405,8 @@ def mark_glossary_terms(text, lang, gl, levels=None):
     skip = [m.span() for m in _GUILLEMET_SPAN_RE.finditer(text)]
     skip += [m.span() for m in _CURLY_CODE_RE.finditer(text)]
     try:
-        spans = gl.find_spans(text, lang, levels=levels, skip=skip)
+        spans = gl.find_spans(text, lang, levels=levels, skip=skip,
+                              exact_always=exact_always)
     except Exception:
         return text                      # 용어집 문제로 번역을 막지는 않는다
     if not spans:
@@ -1414,7 +1420,7 @@ def mark_glossary_terms(text, lang, gl, levels=None):
     return "".join(out)
 
 
-def mark_batch_glossary(batch_rows, lang, gl, levels=None):
+def mark_batch_glossary(batch_rows, lang, gl, levels=None, exact_always=None):
     """배치의 '마커 기준 셀'에 용어집 마커를 붙인다.
 
     반환: (새 배치, changed)
@@ -1429,7 +1435,8 @@ def mark_batch_glossary(batch_rows, lang, gl, levels=None):
             new_rows.append(row)
             continue
         before = row[idx]
-        after = mark_glossary_terms(before, lang, gl, levels=levels)
+        after = mark_glossary_terms(before, lang, gl, levels=levels,
+                                    exact_always=exact_always)
         if after == before:
             new_rows.append(row)
             continue
@@ -1438,6 +1445,34 @@ def mark_batch_glossary(batch_rows, lang, gl, levels=None):
         new_rows.append(tuple(new_row))
         changed.append((row[0], idx, after))
     return new_rows, changed
+
+
+def glossary_mark_gaps(batch_rows, lang, gl, levels=None, exact_always=None):
+    """배치에 등장했지만 마커가 붙지 않은 용어 — {용어(ko): 사유}.
+
+    '용어집에 있는 단어인데 마커가 없다'를 사람이 바로 확인할 수 있게 하는
+    진단용이다. 번역 동작에는 관여하지 않으므로 실패해도 조용히 비운다.
+    """
+    gaps = {}
+    if gl is None:
+        return gaps
+    for row in batch_rows:
+        idx = marker_cell_index(row)
+        if idx is None:
+            continue
+        cell = row[idx]
+        if not cell:
+            continue
+        skip = [m.span() for m in _GUILLEMET_SPAN_RE.finditer(cell)]
+        skip += [m.span() for m in _CURLY_CODE_RE.finditer(cell)]
+        try:
+            for term, why in gl.unmarked_terms(cell, lang, levels=levels,
+                                               skip=skip,
+                                               exact_always=exact_always):
+                gaps.setdefault(term.ko, why)
+        except Exception:
+            return gaps
+    return gaps
 
 
 def marker_cell_role(idx):
