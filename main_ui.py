@@ -1114,7 +1114,9 @@ class TranslationWorker(threading.Thread):
                     self.audit_completed(sheet)
                 self.log(f"{work_word} 대상 행이 없습니다.", "warn")
                 self.log_q.put(("empty", None))
-                self.done_callback(0, 0, [])
+                # done_callback 은 finally 가 한 번만 부른다 — 여기서 또 부르면
+                # 'done' 이 두 번 들어가 연속 번역이 다음 언어를 건너뛰고
+                # 그 다음 언어를 워커 두 개로 동시에 띄운다.
                 return
 
             total = len(pending_rows)
