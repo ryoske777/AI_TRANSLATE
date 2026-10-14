@@ -160,6 +160,9 @@ EN과 KR이 충돌할 경우, 항상 KR의 의미를 우선합니다.
 - 브라질 포르투갈어(pt-BR)를 사용하세요.
 - 브라질에서 통용되는 어휘·철자(브라질 정서법)를 기준으로 하세요.
 - 2인칭은 브라질에서 표준적인 você 계열 활용을 기준으로 하세요. (tu 활용 위주의 유럽식 어법 지양)
+- 2인칭 복수는 vocês 를 쓰세요. vós 계열 활용(tendes, podeis, vosso)은 사용하지 마세요.
+- 철자는 2009년 신정서법(Novo Acordo Ortográfico) 이후의 브라질 표기를 따르세요.
+  (예: idéia → ideia, vôo → voo, lingüiça → linguiça, heróico → heroico, pára(동사) → para)
 - 명확하고 중립적이며 자연스러운 표현을 우선하세요.
 - 불필요한 구어체를 피하세요.
 - 유럽식 포르투갈어(pt-PT) 고유의 표현·철자를 피하세요:
@@ -183,7 +186,8 @@ EN과 KR이 충돌할 경우, 항상 KR의 의미를 우선합니다.
     (예: ecrã → tela, utilizador → usuário, ficheiro → arquivo, rato → mouse,
      equipa → equipe, telemóvel → celular, autocarro → ônibus,
      palavra-passe → senha, descarregar → baixar, guardar(저장) → salvar,
-     aplicação → aplicativo, ligar/desligar 맥락의 'carregar em' → 'clicar em',
+     aplicação(앱) → aplicativo, carregar em(버튼을 누르다) → clicar em / pressionar,
+     registo → registro, controlo → controle, planear → planejar, connosco → conosco,
      casa de banho → banheiro, comboio → trem, sumo → suco)
   · 대명사는 브라질 규범대로 동사 앞에 두는 형태를 기본으로 하고,
     유럽식 후치(ênclise/mesóclise) 남용은 피하세요. (예: dá-te → te dá)
@@ -198,6 +202,7 @@ EN과 KR이 충돌할 경우, 항상 KR의 의미를 우선합니다.
   3) receção/deteção/conceção/facto/contacto 같은 유럽식 철자가 없는가?
   4) ecrã·utilizador·ficheiro·telemóvel 같은 유럽식 어휘가 없는가?
   5) 스페인어 철자·기호(ñ, ll, ¿, ¡)가 섞이지 않았는가?
+  6) idéia·vôo·lingüiça 같은 2009년 이전 구철자나 vós 계열 활용이 없는가?
 
 ────────────────────────────────
 [ 문장부호 및 스타일 ]
