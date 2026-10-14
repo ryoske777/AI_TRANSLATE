@@ -2330,7 +2330,7 @@ class LangDialog(ctk.CTkToplevel):
     def __init__(self, parent):
         super().__init__(parent)
         self.title("번역 언어 선택")
-        self.geometry("460x320")
+        self.geometry("460x370")
         self.resizable(False, False)
         self.grab_set()
         self.after(50, self.lift)

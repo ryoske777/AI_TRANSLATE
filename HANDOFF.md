@@ -422,6 +422,7 @@ python -c "import main; print(main.list_prompt_langs())"
 |---|---|---|
 | `en` | 미국 영어(en-US) | 영국식 철자(colour/armour/realise) |
 | `es` | 유럽 스페인어(es-ES) | 중남미 어휘·voseo, 포르투갈어 혼입 |
+| `es_la` | 중남미 스페인어(es-419) | vosotros 활용·스페인 본토 어휘(ordenador/móvil), voseo·국가별 속어, 포르투갈어 혼입 |
 | `pt` | **브라질 포르투갈어(pt-BR)** | 유럽식 어휘(ecrã/utilizador)·`estar a + 부정사`, 스페인어 혼입(¿ ¡ ñ) |
 | `de` | 독일 표준(de-DE) | 스위스식 ss 표기, 오스트리아·스위스 고유 어휘 |
 | `fr` | 프랑스 본토(fr-FR) | 퀘벡·벨기에·스위스 고유 표현 |
