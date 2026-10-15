@@ -946,26 +946,70 @@ def _insert_text_fast(driver, textarea, text):
         return False
 
 
+# ChatGPT 화면이 바뀌어 예전 이름(#prompt-textarea, send-button)이 없어지면
+# 입력창 30초·전송 버튼 10초를 꼬박 기다린 뒤에야 대체 경로로 넘어갔다.
+# 후보를 한 번에 JS 로 훑어, 보이는 첫 요소를 바로 집는다.
+_FIND_COMPOSER_JS = """
+const vis = el => !!el && el.getClientRects().length > 0;
+const sels = ['#prompt-textarea', 'div.ProseMirror[contenteditable="true"]',
+              '[contenteditable="true"][role="textbox"]', 'form [contenteditable="true"]',
+              'div[contenteditable="true"]', 'form textarea', 'textarea'];
+for (const sel of sels)
+    for (const el of document.querySelectorAll(sel))
+        if (vis(el)) return el;
+return null;
+"""
+
+_FIND_SEND_BUTTON_JS = """
+const vis = el => !!el && el.getClientRects().length > 0;
+const sels = ["button[data-testid='send-button']", "#composer-submit-button",
+              "button[aria-label*='Send' i]", "button[aria-label*='보내기']",
+              "button[aria-label*='전송']", "form button[type='submit']"];
+for (const sel of sels)
+    for (const b of document.querySelectorAll(sel)) {
+        const label = ((b.getAttribute('aria-label') || '') + ' ' +
+                       (b.getAttribute('data-testid') || '')).toLowerCase();
+        if (/stop|중지/.test(label)) continue;     // 응답 중지 버튼은 제외
+        if (vis(b) && !b.disabled && b.getAttribute('aria-disabled') !== 'true')
+            return b;
+    }
+return null;
+"""
+
+
+def _find_composer(driver, timeout=30):
+    """보이는 입력창을 찾는다. 없으면 timeout 초까지 0.2초 간격으로 다시 본다."""
+    end = time.time() + timeout
+    while True:
+        try:
+            el = driver.execute_script(_FIND_COMPOSER_JS)
+            if el:
+                return el
+        except Exception:
+            pass
+        if time.time() >= end:
+            raise RuntimeError("ChatGPT 입력창을 찾을 수 없습니다.")
+        time.sleep(0.2)
+
+
 def _click_send_button(driver, textarea):
-    """전송 버튼 클릭. JS 클릭(백그라운드 안전) → Selenium 클릭 → Enter 순서로 시도."""
-    sel = "button[data-testid='send-button']"
-    # 1) JS 클릭 — 창이 안 보여도 동작
-    try:
-        btns = driver.find_elements(By.CSS_SELECTOR, sel)
-        if btns:
-            driver.execute_script("arguments[0].click();", btns[0])
-            return
-    except Exception:
-        pass
-    # 2) Selenium 클릭
-    try:
-        btn = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR, sel)))
-        btn.click()
-        return
-    except Exception:
-        pass
-    # 3) 최후 — Enter (포커스 필요, 백그라운드에선 실패할 수 있음)
+    """전송 버튼 클릭. JS 클릭(백그라운드 안전) → Enter 순서로 시도.
+
+    입력 직후 버튼이 활성화되기까지 잠깐 걸릴 수 있어 최대 2초만 기다린다.
+    """
+    end = time.time() + 2.0
+    while True:
+        try:
+            btn = driver.execute_script(_FIND_SEND_BUTTON_JS)
+            if btn:
+                driver.execute_script("arguments[0].click();", btn)
+                return
+        except Exception:
+            pass
+        if time.time() >= end:
+            break
+        time.sleep(0.2)
+    # 최후 — Enter
     try:
         textarea.send_keys(Keys.RETURN)
     except Exception:
@@ -981,20 +1025,9 @@ def send_message(driver, text):
     """
     timing = {}
     t0 = time.time()
-    wait = WebDriverWait(driver, 30)
 
     # 입력창 찾기
-    try:
-        textarea = wait.until(
-            EC.presence_of_element_located((By.ID, "prompt-textarea"))
-        )
-    except TimeoutException:
-        # 대체 셀렉터
-        textarea = wait.until(
-            EC.presence_of_element_located(
-                (By.CSS_SELECTOR, "div[contenteditable='true']")
-            )
-        )
+    textarea = _find_composer(driver, timeout=30)
     t1 = time.time()
     timing["find"] = t1 - t0
 
@@ -1068,6 +1101,9 @@ def wait_for_response(driver, timeout=300, should_stop=None, on_tick=None):
         "button[data-testid='stop-button']",
         "button[aria-label='Stop streaming']",
         "button[aria-label='Stop generating']",
+        # 화면 개편으로 이름이 바뀌어도 잡히게 (영문/한국어 UI)
+        "#composer-submit-button[aria-label*='Stop' i]",
+        "button[aria-label*='스트리밍 중지']",
     ]
 
     # 1단계: Stop 버튼이 나타날 때까지 대기 (최대 30초)
