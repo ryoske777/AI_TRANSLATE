@@ -1087,55 +1087,114 @@ const txt = el => {
     const a = (el.innerText || '').trim();
     return a || (el.textContent || '').trim();
 };
-const all = Array.from(document.querySelectorAll('[data-message-author-role="assistant"]'));
-if (all.length === 0) return null;
+const lastOf = sel => { const l = document.querySelectorAll(sel); return l.length ? l[l.length - 1] : null; };
+const USER_SEL = '[data-message-author-role="user"], [data-turn="user"], [data-testid="user-message"]';
+const ASSIST_SEL = '[data-message-author-role="assistant"], [data-turn="assistant"]';
+// 입력창(작성 중인 텍스트)은 절대 응답으로 읽지 않는다
+const inComposer = el => !!el.closest('form, #prompt-textarea, [contenteditable="true"]');
+const CODE_SEL = 'pre code, .cm-content, code';
 
-// 마지막 대화 턴의 assistant 요소들만 본다.
-// (추론 모델은 한 턴에 assistant 요소가 여러 개 생기고, 마지막 요소가
-//  빈 자리표시자일 수 있다. 이전 턴으로 거슬러 올라가면 지난 배치 응답을
-//  잘못 기입하게 되므로 같은 턴 안에서만 찾는다.)
-const last = all[all.length - 1];
-const turn = last.closest('[data-testid^="conversation-turn"], article');
-const msgs = turn
-    ? Array.from(turn.querySelectorAll('[data-message-author-role="assistant"]'))
-    : [last];
-
-const biggest = (sel) => {
+const pickBiggest = (roots, sel, accept) => {
     let best = '';
-    for (const m of msgs)
-        m.querySelectorAll(sel).forEach(el => {
+    for (const root of roots)
+        root.querySelectorAll(sel).forEach(el => {
+            if (accept && !accept(el)) return;
             const t = txt(el);
             if (t.length > best.length) best = t;
         });
     return best;
 };
+const fromRoots = (roots) => {
+    let r = pickBiggest(roots, CODE_SEL);
+    if (r) return r;
+    r = pickBiggest(roots, 'pre');
+    if (r) return r;
+    let best = '';
+    for (const m of roots) { const t = txt(m); if (t.length > best.length) best = t; }
+    return best;
+};
 
-// 1) 코드블록 본문 — 구형 <pre><code>, 신형 코드 뷰어(CodeMirror .cm-content)
-let r = biggest('pre code, .cm-content, code');
+// 1) assistant 표식이 있으면 — 마지막 대화 턴 안의 assistant 요소들만 본다.
+//    (추론 모델은 한 턴에 요소가 여러 개 생기고 마지막이 빈 자리표시자일 수 있다.
+//     이전 턴까지 거슬러 올라가면 지난 배치 응답을 기입하게 되므로 같은 턴 안에서만.)
+const lastA = lastOf(ASSIST_SEL);
+const lastU = lastOf(USER_SEL);
+if (lastA && !(lastU && (lastU.compareDocumentPosition(lastA) & Node.DOCUMENT_POSITION_PRECEDING))) {
+    const turn = lastA.closest('[data-testid^="conversation-turn"], article');
+    const roots = turn ? Array.from(turn.querySelectorAll(ASSIST_SEL)) : [lastA];
+    if (turn && roots.length === 0) roots.push(turn);
+    const r = fromRoots(roots);
+    if (r) return r;
+}
+
+// 2) 표식이 바뀌었거나 없을 때 — '마지막 사용자 메시지 뒤에 나오는' 코드블록.
+//    사용자 말풍선(내가 보낸 원문)·입력창 안의 것은 제외한다.
+const after = el => !lastU || (!lastU.contains(el) &&
+    (lastU.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING));
+const ok = el => after(el) && !inComposer(el) && !el.closest(USER_SEL);
+let r = pickBiggest([document], CODE_SEL, ok);
 if (r) return r;
-// 2) <pre> 전체 (헤더 '일반 텍스트' 등이 섞여도 행 ID 파싱이 걸러낸다)
-r = biggest('pre');
+r = pickBiggest([document], 'pre', ok);
 if (r) return r;
-// 3) 코드블록이 없으면 메시지 전체 텍스트
-let best = '';
-for (const m of msgs) { const t = txt(m); if (t.length > best.length) best = t; }
-return best || null;
+
+// 3) 사용자 메시지 다음 대화 턴의 전체 텍스트 (코드블록 없이 답한 경우)
+if (lastU) {
+    const turns = Array.from(document.querySelectorAll('[data-testid^="conversation-turn"], article'))
+        .filter(t => !t.contains(lastU) && (lastU.compareDocumentPosition(t) & Node.DOCUMENT_POSITION_FOLLOWING));
+    if (turns.length) { const t = txt(turns[turns.length - 1]); if (t) return t; }
+}
+return null;
+"""
+
+# 추출 실패 시 원인 분석용으로 대화 영역 구조를 남긴다 (exe 옆 extract_debug.html)
+_DEBUG_JS = r"""
+const turns = document.querySelectorAll('[data-testid^="conversation-turn"], article');
+const parts = [];
+parts.push('<!-- url: ' + location.href + ' -->');
+parts.push('<!-- turns: ' + turns.length +
+    ', assistant-role: ' + document.querySelectorAll('[data-message-author-role="assistant"]').length +
+    ', user-role: ' + document.querySelectorAll('[data-message-author-role="user"]').length +
+    ', data-turn: ' + document.querySelectorAll('[data-turn]').length +
+    ', pre: ' + document.querySelectorAll('pre').length +
+    ', code: ' + document.querySelectorAll('code').length + ' -->');
+const list = Array.from(turns).slice(-2);
+if (list.length === 0) {
+    const main = document.querySelector('main') || document.body;
+    parts.push(main.outerHTML.slice(-200000));
+} else {
+    for (const t of list) parts.push(t.outerHTML.slice(0, 200000));
+}
+return parts.join('\n\n');
 """
 
 
-def extract_last_response(driver):
-    """마지막 assistant 메시지에서 코드블록 내용 추출.
+def _dump_extract_debug(driver):
+    try:
+        import paths
+        html = driver.execute_script(_DEBUG_JS) or ""
+        out = os.path.join(paths.app_dir(), "extract_debug.html")
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(html)
+        print(f"  → 응답 영역 구조를 저장했습니다: {out}")
+    except Exception as e:
+        print(f"  ⚠️ 디버그 저장 실패: {e}")
 
-    Selenium 의 .text 는 '화면에 보이는' 텍스트만 돌려줘서, ChatGPT 의 새 코드
-    블록 UI(헤더 '일반 텍스트' + 복사 버튼)나 추론 모델 응답에서 빈 문자열이
-    나와 '응답 추출 실패'가 났다. 그래서 DOM 에서 직접 innerText/textContent 를
-    읽는다.
+
+def extract_last_response(driver):
+    """마지막 assistant 응답에서 코드블록 내용 추출.
+
+    Selenium 의 .text 는 '화면에 보이는' 텍스트만 돌려줘서 새 코드블록 UI
+    (헤더 '일반 텍스트' + 복사 버튼)에서 빈 문자열이 나왔고, ChatGPT 가
+    assistant 표식(data-message-author-role)을 바꾸면 아예 못 찾았다.
+    그래서 DOM 에서 직접 읽고, 표식이 없으면 '마지막 사용자 메시지 뒤의
+    코드블록'으로 찾는다. 그래도 못 찾으면 extract_debug.html 을 남긴다.
     """
     try:
         result = driver.execute_script(_EXTRACT_JS)
         if result and result.strip():
             return result.strip()
-        print("  ⚠️ assistant 메시지/코드블록을 찾지 못했습니다 (ChatGPT DOM 변경 가능성)")
+        print("  ⚠️ assistant 응답/코드블록을 찾지 못했습니다 (ChatGPT DOM 변경 가능성)")
+        _dump_extract_debug(driver)
         return None
     except Exception as e:
         print(f"  ⚠️ 응답 추출 오류: {e}")
