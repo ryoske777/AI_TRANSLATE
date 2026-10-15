@@ -1358,6 +1358,31 @@ class TranslationWorker(threading.Thread):
                         self.log(f"응답 추출 실패 ({attempt}회) — 재시도...", "warn")
                         import time as _t; _t.sleep(2)
 
+                # 행 ID 가 하나도 안 맞으면 '이번 응답'을 못 읽은 것 (지난 응답·덜 그려진
+                # 블록) — 잠시 뒤 다시 읽고, 그래도 안 되면 추출 실패로 처리한다.
+                # 그대로 진행하면 배치 전체가 빈 칸 + '플레이스홀더 불일치' 로 표시된다.
+                if response:
+                    from main import _strip_id
+                    _exp = {r[0] for r in batch}
+                    def _hits(text):
+                        return sum(1 for ln in text.split("\n") if _strip_id(ln)[0] in _exp)
+                    for again in range(1, 4):
+                        if _hits(response):
+                            break
+                        self.log(f"이번 배치 행 ID 를 응답에서 못 찾음 — 다시 읽기 ({again}/3)", "warn")
+                        import time as _t; _t.sleep(2)
+                        response = extract_last_response(
+                            driver, expect_ids=[row_id(r[0]) for r in batch]) or response
+                    if not _hits(response):
+                        dbg = None
+                        if ai_mode != "claude":
+                            from main import _dump_extract_debug
+                            dbg = _dump_extract_debug(driver)
+                        self.log("❌ 응답에서 이번 배치 행을 읽지 못함 — 빈 칸으로 두고 "
+                                 "재스캔 때 다시 번역합니다"
+                                 + (f" · 화면 구조 저장: {dbg}" if dbg else ""), "error")
+                        response = None
+
                 if response:
                     lines, missing = parse_response(response, batch)
                     lines = repair_masked_tokens(lines, ph_map)  # 깨진 «T:번호» 정규화
