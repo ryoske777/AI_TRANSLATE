@@ -1441,10 +1441,66 @@ return out.slice(-12);
 """
 
 
+# 화면에 보이는 대화 전체 텍스트 (입력창 제외) — 코드블록 구조와 무관한 최후 수단
+_PAGE_TEXT_JS = r"""
+const root = document.querySelector('main') || document.body;
+return root.innerText || '';
+"""
+
+
+# 페이지 텍스트 훑기는 '번역 결과에 한글이 없어야 하는' 작업(한국어가 아닌 언어로
+# 번역)에서만 켠다 — 원문 말풍선 줄(한글 포함)과 응답 줄을 한글로 구별하기 때문.
+_page_scan = {"on": False}
+_HANGUL_RE = re.compile(r"[가-힣ㄱ-ㆎ]")
+
+
+def set_page_scan(on):
+    _page_scan["on"] = bool(on)
+
+
+def _scan_page_text(driver, expect_ids):
+    """페이지 텍스트를 아래에서 위로 훑어 이번 배치 행 ID 줄만 모은다.
+
+    코드블록이 어떤 요소로 그려졌든(pre / CodeMirror / 그 밖의 새 구조) 화면에
+    보이는 글자라면 읽을 수 있다. 내가 보낸 원문 말풍선에도 같은 행 ID 가 있으므로,
+    아래(최신)부터 올라가다 이미 모은 행 ID 가 다시 나오면 거기서 멈춘다 —
+    그 위는 원문 말풍선이다. 원문 줄은 한글을 포함하므로 한글 줄에서도 멈춘다
+    (응답이 아직 없을 때 원문을 응답으로 착각하지 않도록).
+    """
+    if not _page_scan["on"]:
+        return None
+    text = _js(driver, _PAGE_TEXT_JS) or ""
+    want = {int(r[1:]) for r in expect_ids if r[1:].isdigit()}
+    got, seen = [], set()
+    for line in reversed(text.split("\n")):
+        rid, _rest = _strip_id(line)
+        if rid is None or rid not in want:
+            continue
+        # 이미 모은 행 ID 가 다시 나오거나 한글 줄(= 내가 보낸 원문)이면 응답 영역 끝
+        if rid in seen or _HANGUL_RE.search(line):
+            break
+        seen.add(rid)
+        got.append(line.strip())
+    if not got:
+        return None
+    got.reverse()
+    return "\n".join(got)
+
+
 def _pick_by_ids(driver, expect_ids):
-    """기대 행 ID 가 가장 많이 들어 있는 코드블록(동점이면 뒤쪽)을 돌려준다. 없으면 None."""
+    """기대 행 ID 가 가장 많이 들어 있는 코드블록(동점이면 뒤쪽)을 돌려준다.
+
+    코드블록에서 못 찾으면 페이지 텍스트를 훑는다. 그래도 없으면 None.
+    """
     if not expect_ids:
         return None
+    best = _pick_code_block(driver, expect_ids)
+    if best:
+        return best
+    return _scan_page_text(driver, expect_ids)
+
+
+def _pick_code_block(driver, expect_ids):
     blocks = _js(driver, _CODE_BLOCKS_JS) or []
     want = set(expect_ids)
     best, best_hits = None, 0
