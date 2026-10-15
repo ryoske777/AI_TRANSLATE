@@ -243,7 +243,8 @@ def send_message(driver, text):
     print(f"  → 메시지 전송 완료 (전송후딜레이 {post_send_delay:.1f}초), 응답 대기 중...")
 
 
-def wait_for_response(driver, timeout=300, should_stop=None, on_tick=None):
+def wait_for_response(driver, timeout=300, should_stop=None, on_tick=None,
+                      expect_ids=None):
     """Claude.ai 응답 완료까지 대기."""
     init_wait     = getattr(config, 'RESPONSE_INIT_WAIT',     2.0)
     poll_interval = getattr(config, 'RESPONSE_POLL_INTERVAL', 0.5)

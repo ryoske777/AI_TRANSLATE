@@ -22,7 +22,7 @@ from main import (
     get_sheet, get_pending_rows, log_failure, write_results, write_status,
     setup_driver, new_conversation, send_message, wait_for_response,
     extract_last_response, sanitize_cell, restore_cell,
-    group_consecutive_rows, format_batch, format_review_batch, parse_response,
+    group_consecutive_rows, format_batch, format_review_batch, parse_response, row_id,
     auto_batch_count, mask_placeholders_in_batch, unmask_placeholders,
     placeholder_legend,
     extract_placeholders, extract_preserve_tokens,
@@ -1333,7 +1333,8 @@ class TranslationWorker(threading.Thread):
                 wait_for_response(
                     driver,
                     should_stop=lambda: self.stop_flag,
-                    on_tick=lambda e: self.wait_text(f"{_base} · {int(e)}초"))
+                    on_tick=lambda e: self.wait_text(f"{_base} · {int(e)}초"),
+                    expect_ids=[row_id(r[0]) for r in batch])
                 self.done_waiting()
                 if self.stop_flag:
                     break
@@ -1379,7 +1380,8 @@ class TranslationWorker(threading.Thread):
                             retry_msg = placeholder_legend(ph_map) + "\n\n" + retry_msg
                         self.waiting("한글 포함 행 재번역 중")
                         send_message(driver, retry_msg)
-                        wait_for_response(driver, should_stop=lambda: self.stop_flag)
+                        wait_for_response(driver, should_stop=lambda: self.stop_flag,
+                                          expect_ids=[row_id(r[0]) for r in retry_batch])
                         self.done_waiting()
                         retry_resp = extract_last_response(driver)
                         if retry_resp:
@@ -1463,7 +1465,8 @@ class TranslationWorker(threading.Thread):
                                 retry_msg = placeholder_legend(ph_map) + "\n\n" + retry_msg
                             self.waiting("플레이스홀더 불일치 행 재번역 중")
                             send_message(driver, retry_msg)
-                            wait_for_response(driver, should_stop=lambda: self.stop_flag)
+                            wait_for_response(driver, should_stop=lambda: self.stop_flag,
+                                              expect_ids=[row_id(r[0]) for r in retry_batch])
                             self.done_waiting()
                             retry_resp = extract_last_response(driver)
                             if retry_resp:
