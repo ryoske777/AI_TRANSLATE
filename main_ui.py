@@ -1036,6 +1036,11 @@ class TranslationWorker(threading.Thread):
                 wait_for_response, extract_last_response,
             )
             self.log("AI 모드: ChatGPT (chatgpt.com 웹)", "info")
+        try:
+            import updater as _upd
+            self.log(f"툴 버전: v{_upd.get_local_version()}", "info")
+        except Exception:
+            pass
 
         # ── 작업 모드 (번역/검수) — 실행 시작 시점에 한 번 확정 ─────────
         work_mode = _current_mode()
@@ -1580,6 +1585,9 @@ class TranslationWorker(threading.Thread):
                     self.log(f"✅ {count}행 기입 완료 (누적: {processed}/{total})", "success")
                 else:
                     self.log(f"❌ 응답 추출 실패 — {s_row}~{e_row}행 건너뜀", "error")
+                    if ai_mode != "claude":
+                        self.log("   응답 화면 구조를 exe 옆 extract_debug.html 에 저장했습니다 — "
+                                 "문제가 계속되면 이 파일을 전달해 주세요.", "warn")
                     log_failure(s_row, e_row, "응답 추출 실패")
 
                 self.send_count += 1
