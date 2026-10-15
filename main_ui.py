@@ -1350,7 +1350,8 @@ class TranslationWorker(threading.Thread):
 
                 response = None
                 for attempt in range(1, 4):
-                    response = extract_last_response(driver)
+                    response = extract_last_response(
+                        driver, expect_ids=[row_id(r[0]) for r in batch])
                     if response:
                         break
                     if attempt < 3:
@@ -1392,7 +1393,8 @@ class TranslationWorker(threading.Thread):
                         wait_for_response(driver, should_stop=lambda: self.stop_flag,
                                           expect_ids=[row_id(r[0]) for r in retry_batch])
                         self.done_waiting()
-                        retry_resp = extract_last_response(driver)
+                        retry_resp = extract_last_response(
+                            driver, expect_ids=[row_id(r[0]) for r in retry_batch])
                         if retry_resp:
                             retry_lines, _ = parse_response(retry_resp, retry_batch)
                             retry_lines = repair_masked_tokens(retry_lines, ph_map)
@@ -1477,7 +1479,8 @@ class TranslationWorker(threading.Thread):
                             wait_for_response(driver, should_stop=lambda: self.stop_flag,
                                               expect_ids=[row_id(r[0]) for r in retry_batch])
                             self.done_waiting()
-                            retry_resp = extract_last_response(driver)
+                            retry_resp = extract_last_response(
+                            driver, expect_ids=[row_id(r[0]) for r in retry_batch])
                             if retry_resp:
                                 retry_lines, _ = parse_response(retry_resp, retry_batch)
                                 retry_lines = repair_masked_tokens(retry_lines, ph_map)

@@ -1093,7 +1093,7 @@ return false;
 # 폴링 사이에 떴다 사라져 못 보는 일이 잦아, 이쪽을 보고 바로 완료로 판단한다.
 _IDLE_JS = r"""
 const vis = el => !!el && el.getClientRects().length > 0;
-const re = /composer-speech-button|send-button|composer-submit|voice[ -]?mode|음성\s*모드|프롬프트\s*보내기|send prompt/i;
+const re = /composer-speech-button|send-button|composer-submit|voice[ -]?(mode|chat)|음성\s*(모드|대화)|프롬프트\s*보내기|send prompt/i;
 const stop = /stop|중지/i;
 for (const b of document.querySelectorAll('button')) {
     const l = (b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('data-testid') || '')
@@ -1122,7 +1122,10 @@ return out.slice(0, 12).join(' / ');
 """
 
 _TURN_COUNT_JS = r"""
-return document.querySelectorAll('[data-testid^="conversation-turn"], article').length;
+return Math.max(
+    document.querySelectorAll('[data-testid^="conversation-turn"], article').length,
+    document.querySelectorAll('[data-message-author-role]').length,
+    document.querySelectorAll('[data-turn]').length);
 """
 
 # send_message() 가 전송 직전에 기록하는 '이전 응답' — 완료 판정 때 새 응답과 구별용
@@ -1199,7 +1202,7 @@ def wait_for_response(driver, timeout=300, should_stop=None, on_tick=None,
         if _stopped():
             return "STOPPED"
         busy = bool(_js(driver, _BUSY_JS, False))
-        text = _js(driver, _EXTRACT_JS)
+        text = _current_response(driver, expect_ids)
         now = time.time()
         if text != last_text:
             last_text, last_change = text, now
@@ -1350,9 +1353,17 @@ if (lastA && !(lastU && (lastU.compareDocumentPosition(lastA) & Node.DOCUMENT_PO
 const after = el => !lastU || (!lastU.contains(el) &&
     (lastU.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING));
 const ok = el => after(el) && !inComposer(el) && !el.closest(USER_SEL);
+// '가장 큰' 코드블록이 아니라 '가장 마지막' 코드블록 — 대화 턴 표식을 못 찾는
+// 화면에선 lastU 가 없어 페이지 전체가 후보가 되는데, 가장 큰 것을 고르면 지난
+// 배치 응답이 더 길 때 그것을 읽어 버렸다.
+const blocks = Array.from(document.querySelectorAll('pre, .cm-content')).filter(ok);
+for (let i = blocks.length - 1; i >= 0; i--) {
+    const b = blocks[i];
+    const inner = b.matches('pre') ? b.querySelector('code, .cm-content') : null;
+    const t = txt(inner) || txt(b);
+    if (t) return t;
+}
 let r = pickBiggest([document], CODE_SEL, ok);
-if (r) return r;
-r = pickBiggest([document], 'pre', ok);
 if (r) return r;
 
 // 3) 사용자 메시지 다음 대화 턴의 전체 텍스트 (코드블록 없이 답한 경우)
@@ -1363,6 +1374,46 @@ if (lastU) {
 }
 return null;
 """
+
+# 화면의 코드블록 본문들(문서 순서, 마지막 12개) — 행 ID 로 '이번 응답'을 고르는 데 쓴다
+_CODE_BLOCKS_JS = r"""
+const txt = el => {
+    if (!el) return '';
+    const a = (el.innerText || '').trim();
+    return a || (el.textContent || '').trim();
+};
+const skip = el => !!el.closest('form, #prompt-textarea, [contenteditable="true"], '
+    + '[data-message-author-role="user"], [data-turn="user"], [data-testid="user-message"]');
+const out = [];
+for (const b of document.querySelectorAll('pre, .cm-content')) {
+    if (skip(b)) continue;
+    if (b.matches('pre') && b.querySelector('.cm-content')) continue;  // 안쪽 것을 쓴다
+    const inner = b.matches('pre') ? b.querySelector('code') : null;
+    const t = txt(inner) || txt(b);
+    if (t) out.push(t);
+}
+return out.slice(-12);
+"""
+
+
+def _pick_by_ids(driver, expect_ids):
+    """기대 행 ID 가 가장 많이 들어 있는 코드블록(동점이면 뒤쪽)을 돌려준다. 없으면 None."""
+    if not expect_ids:
+        return None
+    blocks = _js(driver, _CODE_BLOCKS_JS) or []
+    want = set(expect_ids)
+    best, best_hits = None, 0
+    for b in blocks:
+        hits = sum(1 for line in b.split("\n")
+                   if (m := _ID_PREFIX_RE.match(line)) and f"R{m.group(1)}" in want)
+        if hits and hits >= best_hits:
+            best, best_hits = b, hits
+    return best
+
+
+def _current_response(driver, expect_ids=None):
+    return _pick_by_ids(driver, expect_ids) or _js(driver, _EXTRACT_JS)
+
 
 # 추출 실패 시 원인 분석용으로 대화 영역 구조를 남긴다 (exe 옆 extract_debug.html)
 _DEBUG_JS = r"""
@@ -1398,7 +1449,7 @@ def _dump_extract_debug(driver):
         print(f"  ⚠️ 디버그 저장 실패: {e}")
 
 
-def extract_last_response(driver):
+def extract_last_response(driver, expect_ids=None):
     """마지막 assistant 응답에서 코드블록 내용 추출.
 
     Selenium 의 .text 는 '화면에 보이는' 텍스트만 돌려줘서 새 코드블록 UI
@@ -1408,7 +1459,8 @@ def extract_last_response(driver):
     코드블록'으로 찾는다. 그래도 못 찾으면 extract_debug.html 을 남긴다.
     """
     try:
-        result = driver.execute_script(_EXTRACT_JS)
+        # 이번 배치의 행 ID 가 든 코드블록이 있으면 그것이 정답 — 화면 구조와 무관
+        result = _pick_by_ids(driver, expect_ids) or driver.execute_script(_EXTRACT_JS)
         if result and result.strip():
             return result.strip()
         print("  ⚠️ assistant 응답/코드블록을 찾지 못했습니다 (ChatGPT DOM 변경 가능성)")

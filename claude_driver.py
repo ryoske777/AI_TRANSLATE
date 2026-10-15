@@ -398,7 +398,7 @@ def _assistant_text_len(driver):
         return 0
 
 
-def extract_last_response(driver):
+def extract_last_response(driver, expect_ids=None):
     """마지막 assistant 메시지에서 코드블록 내용 추출.
 
     assistant 메시지를 못 찾으면 None 을 반환한다. 애매할 때 사용자 메시지를
