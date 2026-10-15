@@ -1124,10 +1124,17 @@ return out.slice(0, 12).join(' / ');
 """
 
 _TURN_COUNT_JS = r"""
+// 대화 영역 — 새 ChatGPT 화면은 지나온 페이지(홈 등)의 <main> 을 DOM 에 남겨 두므로
+// 첫 <main> 이 아니라 '실제 입력창이 들어 있는' <main> 을 쓴다
+const __ed = document.querySelector('#prompt-textarea') ||
+    document.querySelector('.ProseMirror[contenteditable="true"]');
+const ROOT = (__ed && __ed.closest('main')) ||
+    Array.from(document.querySelectorAll('main')).find(m => m.getClientRects().length) ||
+    document.body;
 return Math.max(
-    document.querySelectorAll('[data-testid^="conversation-turn"], article').length,
-    document.querySelectorAll('[data-message-author-role]').length,
-    document.querySelectorAll('[data-turn]').length);
+    ROOT.querySelectorAll('[data-testid^="conversation-turn"], article').length,
+    ROOT.querySelectorAll('[data-message-author-role]').length,
+    ROOT.querySelectorAll('[data-turn]').length);
 """
 
 # send_message() 가 전송 직전에 기록하는 '이전 응답' — 완료 판정 때 새 응답과 구별용
@@ -1324,13 +1331,20 @@ def check_logged_in(driver, timeout=10):
 
 
 _EXTRACT_JS = r"""
+// 대화 영역 — 새 ChatGPT 화면은 지나온 페이지(홈 등)의 <main> 을 DOM 에 남겨 두므로
+// 첫 <main> 이 아니라 '실제 입력창이 들어 있는' <main> 을 쓴다
+const __ed = document.querySelector('#prompt-textarea') ||
+    document.querySelector('.ProseMirror[contenteditable="true"]');
+const ROOT = (__ed && __ed.closest('main')) ||
+    Array.from(document.querySelectorAll('main')).find(m => m.getClientRects().length) ||
+    document.body;
 // 텍스트: innerText 가 비면(화면 밖·가상화 렌더링 등) textContent 로 폴백
 const txt = el => {
     if (!el) return '';
     const a = (el.innerText || '').trim();
     return a || (el.textContent || '').trim();
 };
-const lastOf = sel => { const l = document.querySelectorAll(sel); return l.length ? l[l.length - 1] : null; };
+const lastOf = sel => { const l = ROOT.querySelectorAll(sel); return l.length ? l[l.length - 1] : null; };
 const USER_SEL = '[data-message-author-role="user"], [data-turn="user"], [data-testid="user-message"]';
 const ASSIST_SEL = '[data-message-author-role="assistant"], [data-turn="assistant"]';
 // CodeMirror 코드블록은 화면에 보이는 줄만 DOM 에 그린다 — 가능하면 에디터 문서 전체를 읽는다
@@ -1390,19 +1404,21 @@ const ok = el => after(el) && !inComposer(el) && !el.closest(USER_SEL);
 // '가장 큰' 코드블록이 아니라 '가장 마지막' 코드블록 — 대화 턴 표식을 못 찾는
 // 화면에선 lastU 가 없어 페이지 전체가 후보가 되는데, 가장 큰 것을 고르면 지난
 // 배치 응답이 더 길 때 그것을 읽어 버렸다.
-const blocks = Array.from(document.querySelectorAll('pre, .cm-content')).filter(ok);
+// <pre> 없이 <code> 만으로 그리는 화면도 있다 (pre 안의 code 는 pre 로 한 번만 센다)
+const blocks = Array.from(ROOT.querySelectorAll('pre, .cm-content, code'))
+    .filter(el => ok(el) && !(el.matches('code') && el.closest('pre, .cm-content')));
 for (let i = blocks.length - 1; i >= 0; i--) {
     const b = blocks[i];
     const inner = b.matches('pre') ? b.querySelector('code, .cm-content') : null;
     const t = cmText(b) || txt(inner) || txt(b);
     if (t) return t;
 }
-let r = pickBiggest([document], CODE_SEL, ok);
+let r = pickBiggest([ROOT], CODE_SEL, ok);
 if (r) return r;
 
 // 3) 사용자 메시지 다음 대화 턴의 전체 텍스트 (코드블록 없이 답한 경우)
 if (lastU) {
-    const turns = Array.from(document.querySelectorAll('[data-testid^="conversation-turn"], article'))
+    const turns = Array.from(ROOT.querySelectorAll('[data-testid^="conversation-turn"], article'))
         .filter(t => !t.contains(lastU) && (lastU.compareDocumentPosition(t) & Node.DOCUMENT_POSITION_FOLLOWING));
     if (turns.length) { const t = txt(turns[turns.length - 1]); if (t) return t; }
 }
@@ -1429,10 +1445,19 @@ const cmText = el => {
 };
 const skip = el => !!el.closest('form, #prompt-textarea, .ProseMirror, '
     + '[data-message-author-role="user"], [data-turn="user"], [data-testid="user-message"]');
+
+// 대화 영역 — 새 ChatGPT 화면은 지나온 페이지(홈 등)의 <main> 을 DOM 에 남겨 두므로
+// 첫 <main> 이 아니라 '실제 입력창이 들어 있는' <main> 을 쓴다
+const __ed = document.querySelector('#prompt-textarea') ||
+    document.querySelector('.ProseMirror[contenteditable="true"]');
+const ROOT = (__ed && __ed.closest('main')) ||
+    Array.from(document.querySelectorAll('main')).find(m => m.getClientRects().length) ||
+    document.body;
 const out = [];
-for (const b of document.querySelectorAll('pre, .cm-content')) {
+for (const b of ROOT.querySelectorAll('pre, .cm-content, code')) {
     if (skip(b)) continue;
     if (b.matches('pre') && b.querySelector('.cm-content')) continue;  // 안쪽 것을 쓴다
+    if (b.matches('code') && b.closest('pre, .cm-content')) continue; // pre 쪽에서 읽는다
     const inner = b.matches('pre') ? b.querySelector('code') : null;
     const t = cmText(b) || txt(inner) || txt(b);
     if (t) out.push(t);
@@ -1443,8 +1468,14 @@ return out.slice(-12);
 
 # 화면에 보이는 대화 전체 텍스트 (입력창 제외) — 코드블록 구조와 무관한 최후 수단
 _PAGE_TEXT_JS = r"""
-const root = document.querySelector('main') || document.body;
-return root.innerText || '';
+// 대화 영역 — 새 ChatGPT 화면은 지나온 페이지(홈 등)의 <main> 을 DOM 에 남겨 두므로
+// 첫 <main> 이 아니라 '실제 입력창이 들어 있는' <main> 을 쓴다
+const __ed = document.querySelector('#prompt-textarea') ||
+    document.querySelector('.ProseMirror[contenteditable="true"]');
+const ROOT = (__ed && __ed.closest('main')) ||
+    Array.from(document.querySelectorAll('main')).find(m => m.getClientRects().length) ||
+    document.body;
+return ROOT.innerText || '';
 """
 
 
@@ -1516,6 +1547,13 @@ def _pick_code_block(driver, expect_ids):
 # (예전엔 '마지막 코드블록'으로 스크롤했는데, 새 응답이 인식 못 하는 구조면 오히려
 #  옛 코드블록으로 올라가 새 응답이 화면 밖으로 밀려나 읽을 수 없게 됐다)
 _REVEAL_JS = r"""
+// 대화 영역 — 새 ChatGPT 화면은 지나온 페이지(홈 등)의 <main> 을 DOM 에 남겨 두므로
+// 첫 <main> 이 아니라 '실제 입력창이 들어 있는' <main> 을 쓴다
+const __ed = document.querySelector('#prompt-textarea') ||
+    document.querySelector('.ProseMirror[contenteditable="true"]');
+const ROOT = (__ed && __ed.closest('main')) ||
+    Array.from(document.querySelectorAll('main')).find(m => m.getClientRects().length) ||
+    document.body;
 const isScroll = el => el && el.scrollHeight > el.clientHeight + 2 &&
     /(auto|scroll)/.test(getComputedStyle(el).overflowY);
 // ChatGPT 의 '맨 아래로' 버튼이 보이면 누른다 — 위로 밀려난 상태라는 뜻이고,
@@ -1531,8 +1569,7 @@ for (const b of document.querySelectorAll('button')) {
 let sc = window.__roScroller;
 if (!(sc && sc.isConnected && isScroll(sc))) {
     sc = null;
-    const root = document.querySelector('main') || document.body;
-    const anchors = root.querySelectorAll('pre, .cm-editor, p');
+    const anchors = ROOT.querySelectorAll('pre, .cm-editor, code, p');
     let el = anchors.length ? anchors[anchors.length - 1] : null;
     while (el && !isScroll(el)) el = el.parentElement;
     sc = el;
@@ -1549,7 +1586,15 @@ return !!sc;
 _COLLECT_CM_JS = r"""
 const done = arguments[arguments.length - 1];
 (async () => {
-    const eds = Array.from(document.querySelectorAll('.cm-editor'))
+// 대화 영역 — 새 ChatGPT 화면은 지나온 페이지(홈 등)의 <main> 을 DOM 에 남겨 두므로
+// 첫 <main> 이 아니라 '실제 입력창이 들어 있는' <main> 을 쓴다
+const __ed = document.querySelector('#prompt-textarea') ||
+    document.querySelector('.ProseMirror[contenteditable="true"]');
+const ROOT = (__ed && __ed.closest('main')) ||
+    Array.from(document.querySelectorAll('main')).find(m => m.getClientRects().length) ||
+    document.body;
+
+    const eds = Array.from(ROOT.querySelectorAll('.cm-editor'))
         .filter(e => !e.closest('form, #prompt-textarea, .ProseMirror'));
     const ed = eds[eds.length - 1];
     if (!ed) { done(null); return; }
@@ -1612,9 +1657,18 @@ def _current_response(driver, expect_ids=None):
 
 # 추출 실패 시 원인 분석용으로 대화 영역 구조를 남긴다 (exe 옆 extract_debug.html)
 _DEBUG_JS = r"""
-const turns = document.querySelectorAll('[data-testid^="conversation-turn"], article');
+
+// 대화 영역 — 새 ChatGPT 화면은 지나온 페이지(홈 등)의 <main> 을 DOM 에 남겨 두므로
+// 첫 <main> 이 아니라 '실제 입력창이 들어 있는' <main> 을 쓴다
+const __ed = document.querySelector('#prompt-textarea') ||
+    document.querySelector('.ProseMirror[contenteditable="true"]');
+const ROOT = (__ed && __ed.closest('main')) ||
+    Array.from(document.querySelectorAll('main')).find(m => m.getClientRects().length) ||
+    document.body;
+const turns = ROOT.querySelectorAll('[data-testid^="conversation-turn"], article');
 const parts = [];
 parts.push('<!-- url: ' + location.href + ' -->');
+parts.push('<!-- main 요소: ' + document.querySelectorAll('main').length + '개, 대화 영역=' + (ROOT.tagName) + ' -->');
 parts.push('<!-- turns: ' + turns.length +
     ', assistant-role: ' + document.querySelectorAll('[data-message-author-role="assistant"]').length +
     ', user-role: ' + document.querySelectorAll('[data-message-author-role="user"]').length +
@@ -1624,15 +1678,17 @@ parts.push('<!-- turns: ' + turns.length +
     ', cm-content: ' + document.querySelectorAll('.cm-content').length +
     ', contenteditable: ' + document.querySelectorAll('[contenteditable="true"]').length + ' -->');
 // 마지막 코드블록 후보 3개를 따로 남긴다 (어떤 구조로 그려졌는지 확인용)
-const cands = Array.from(document.querySelectorAll('pre, .cm-editor, [class*="code-block"], [class*="codeblock"]')).slice(-3);
-for (const c of cands) parts.push('<!-- code candidate -->\n' + c.outerHTML.slice(0, 30000));
+const cands = Array.from(ROOT.querySelectorAll('pre, .cm-editor, code, [class*="code-block"], [class*="codeblock"]')).slice(-3);
+for (const c of cands) {
+    const box = c.matches('code') ? (c.parentElement && c.parentElement.parentElement || c) : c;
+    parts.push('<!-- code candidate -->\n' + box.outerHTML.slice(0, 30000));
+}
 const esc = t => t.replace(/--/g, '- -');
-const vis = ((document.querySelector('main') || document.body).innerText || '');
+const vis = (ROOT.innerText || '');
 parts.push('<!-- visible text tail (' + vis.length + ' chars):\n' + esc(vis.slice(-6000)) + '\n-->');
 const list = Array.from(turns).slice(-2);
 if (list.length === 0) {
-    const main = document.querySelector('main') || document.body;
-    parts.push(main.outerHTML.slice(-200000));
+    parts.push(ROOT.outerHTML.slice(-200000));
 } else {
     for (const t of list) parts.push(t.outerHTML.slice(0, 200000));
 }
