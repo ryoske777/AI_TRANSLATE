@@ -244,7 +244,7 @@ def send_message(driver, text):
 
 
 def wait_for_response(driver, timeout=300, should_stop=None, on_tick=None,
-                      expect_ids=None):
+                      expect_ids=None, on_slow=None):
     """Claude.ai 응답 완료까지 대기."""
     init_wait     = getattr(config, 'RESPONSE_INIT_WAIT',     2.0)
     poll_interval = getattr(config, 'RESPONSE_POLL_INTERVAL', 0.5)
