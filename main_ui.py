@@ -1065,6 +1065,11 @@ class TranslationWorker(threading.Thread):
         is_review = work_mode in REVIEW_MODES
         work_word = "검수" if is_review else "번역"
         fmt_batch = format_review_batch if is_review else format_batch
+        # 화면 텍스트에서 응답 줄을 찾는 최후 수단 — 결과에 한글이 없어야 하는
+        # 번역 모드(대상 언어가 한국어가 아님)에서만 켠다 (ChatGPT 드라이버 전용)
+        if ai_mode != "claude":
+            from main import set_page_scan
+            set_page_scan((not is_review) and (not is_korean_target()))
         # 용어집 조회에 쓸 대상 언어 (번역 모드는 프롬프트 언어)
         tgt_lang = getattr(config, "PROMPT_LANG", "")
         if is_review:
