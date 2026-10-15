@@ -1456,7 +1456,74 @@ def _pick_by_ids(driver, expect_ids):
     return best
 
 
+# 마지막 코드블록을 화면으로 가져온다 — 화면 밖 블록은 내용이 덜 그려져 있을 수 있다
+_REVEAL_JS = r"""
+const c = Array.from(document.querySelectorAll('pre, .cm-editor'))
+    .filter(e => !e.closest('form, #prompt-textarea, .ProseMirror'));
+const last = c[c.length - 1];
+if (last) last.scrollIntoView({block: 'end'});
+return !!last;
+"""
+
+# CodeMirror 블록을 스크롤하며 그려지는 줄을 모두 모은다 (에디터 내부 객체를 못 읽는
+# 버전 대비). 블록 안쪽 스크롤이든 대화창 스크롤이든 블록 처음부터 끝까지 훑는다.
+_COLLECT_CM_JS = r"""
+const done = arguments[arguments.length - 1];
+(async () => {
+    const eds = Array.from(document.querySelectorAll('.cm-editor'))
+        .filter(e => !e.closest('form, #prompt-textarea, .ProseMirror'));
+    const ed = eds[eds.length - 1];
+    if (!ed) { done(null); return; }
+    const frame = () => new Promise(r => requestAnimationFrame(() => setTimeout(r, 40)));
+    const seen = new Map();
+    const grab = () => ed.querySelectorAll('.cm-line').forEach(l => {
+        const t = l.textContent; if (t && !seen.has(t)) seen.set(t, 1); });
+    const scrollable = el => el && el.scrollHeight > el.clientHeight + 2 &&
+        /(auto|scroll)/.test(getComputedStyle(el).overflowY);
+    let sc = ed.querySelector('.cm-scroller');
+    if (scrollable(sc)) {
+        // 블록이 창 밖이면 CodeMirror 가 줄을 그리지 않는다 — 먼저 화면에 띄운다
+        ed.scrollIntoView({block: 'center'});
+        sc.scrollTop = 0; await frame(); await frame();
+        for (let i = 0; i < 300; i++) {
+            grab();
+            if (sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 2) break;
+            sc.scrollTop += Math.max(40, sc.clientHeight * 0.7); await frame(); await frame();
+        }
+    } else {
+        sc = ed.parentElement;
+        while (sc && !scrollable(sc)) sc = sc.parentElement;
+        sc = sc || document.scrollingElement;
+        ed.scrollIntoView({block: 'start'}); await frame(); await frame();
+        for (let i = 0; i < 300; i++) {
+            grab();
+            const r = ed.getBoundingClientRect();
+            const view = sc === document.scrollingElement ? window.innerHeight
+                : sc.getBoundingClientRect().bottom;
+            if (r.bottom <= view + 2) break;
+            const before = sc.scrollTop;
+            sc.scrollTop += Math.max(40, sc.clientHeight * 0.7); await frame(); await frame();
+            if (sc.scrollTop === before) break;
+        }
+        ed.scrollIntoView({block: 'end'});
+    }
+    grab();
+    done(Array.from(seen.keys()).join('\n'));
+})();
+"""
+
+
+def _collect_codemirror(driver):
+    try:
+        driver.set_script_timeout(30)
+        return driver.execute_async_script(_COLLECT_CM_JS)
+    except Exception:
+        return None
+
+
 def _current_response(driver, expect_ids=None):
+    if expect_ids:
+        _js(driver, _REVEAL_JS)   # 화면 밖 블록은 덜 그려진다
     return _pick_by_ids(driver, expect_ids) or _js(driver, _EXTRACT_JS)
 
 
@@ -1511,8 +1578,16 @@ def extract_last_response(driver, expect_ids=None):
     코드블록'으로 찾는다. 그래도 못 찾으면 extract_debug.html 을 남긴다.
     """
     try:
+        _js(driver, _REVEAL_JS)
+        time.sleep(0.3)
         # 이번 배치의 행 ID 가 든 코드블록이 있으면 그것이 정답 — 화면 구조와 무관
-        result = _pick_by_ids(driver, expect_ids) or driver.execute_script(_EXTRACT_JS)
+        result = _pick_by_ids(driver, expect_ids)
+        if not result and expect_ids:
+            # 덜 그려진 CodeMirror 블록 — 스크롤하며 줄을 모아 다시 본다
+            cm = _collect_codemirror(driver)
+            if cm and any(_has_row_id(cm, r) for r in expect_ids):
+                result = cm
+        result = result or driver.execute_script(_EXTRACT_JS)
         if result and result.strip():
             return result.strip()
         print("  ⚠️ assistant 응답/코드블록을 찾지 못했습니다 (ChatGPT DOM 변경 가능성)")
