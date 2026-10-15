@@ -1512,13 +1512,36 @@ def _pick_code_block(driver, expect_ids):
     return best
 
 
-# 마지막 코드블록을 화면으로 가져온다 — 화면 밖 블록은 내용이 덜 그려져 있을 수 있다
+# 대화창을 맨 아래(최신 응답)로 스크롤한다 — 화면 밖 내용은 덜 그려진다.
+# (예전엔 '마지막 코드블록'으로 스크롤했는데, 새 응답이 인식 못 하는 구조면 오히려
+#  옛 코드블록으로 올라가 새 응답이 화면 밖으로 밀려나 읽을 수 없게 됐다)
 _REVEAL_JS = r"""
-const c = Array.from(document.querySelectorAll('pre, .cm-editor'))
-    .filter(e => !e.closest('form, #prompt-textarea, .ProseMirror'));
-const last = c[c.length - 1];
-if (last) last.scrollIntoView({block: 'end'});
-return !!last;
+const isScroll = el => el && el.scrollHeight > el.clientHeight + 2 &&
+    /(auto|scroll)/.test(getComputedStyle(el).overflowY);
+// ChatGPT 의 '맨 아래로' 버튼이 보이면 누른다 — 위로 밀려난 상태라는 뜻이고,
+// 이 상태에선 새 응답을 따라 내려가지 않는다
+for (const b of document.querySelectorAll('button')) {
+    const l = (b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('data-testid') || '');
+    if (/scroll[- ]?to[- ]?bottom|맨\s*아래|아래로\s*스크롤/i.test(l) && b.getClientRects().length
+            && b.type !== 'submit') {      // 폼 제출(=메시지 전송) 버튼은 절대 누르지 않는다
+        b.click(); break;
+    }
+}
+// 대화 스크롤 영역 — 지난번 찾은 것이 아직 살아 있으면 재사용
+let sc = window.__roScroller;
+if (!(sc && sc.isConnected && isScroll(sc))) {
+    sc = null;
+    const root = document.querySelector('main') || document.body;
+    const anchors = root.querySelectorAll('pre, .cm-editor, p');
+    let el = anchors.length ? anchors[anchors.length - 1] : null;
+    while (el && !isScroll(el)) el = el.parentElement;
+    sc = el;
+    window.__roScroller = sc;
+}
+if (sc) sc.scrollTop = sc.scrollHeight;
+const se = document.scrollingElement;
+if (se) se.scrollTop = se.scrollHeight;
+return !!sc;
 """
 
 # CodeMirror 블록을 스크롤하며 그려지는 줄을 모두 모은다 (에디터 내부 객체를 못 읽는
@@ -1546,6 +1569,10 @@ const done = arguments[arguments.length - 1];
             if (sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 2) break;
             sc.scrollTop += Math.max(40, sc.clientHeight * 0.7); await frame(); await frame();
         }
+        // 블록을 화면에 띄우느라 대화창이 위로 올라갔을 수 있다 — 맨 아래로 되돌린다
+        let outer = ed.parentElement;
+        while (outer && !scrollable(outer)) outer = outer.parentElement;
+        if (outer) outer.scrollTop = outer.scrollHeight;
     } else {
         sc = ed.parentElement;
         while (sc && !scrollable(sc)) sc = sc.parentElement;
@@ -1561,7 +1588,7 @@ const done = arguments[arguments.length - 1];
             sc.scrollTop += Math.max(40, sc.clientHeight * 0.7); await frame(); await frame();
             if (sc.scrollTop === before) break;
         }
-        ed.scrollIntoView({block: 'end'});
+        sc.scrollTop = sc.scrollHeight;   // 끝나면 맨 아래로 — ChatGPT 가 새 응답을 계속 따라오게
     }
     grab();
     done(Array.from(seen.keys()).join('\n'));
@@ -1599,6 +1626,9 @@ parts.push('<!-- turns: ' + turns.length +
 // 마지막 코드블록 후보 3개를 따로 남긴다 (어떤 구조로 그려졌는지 확인용)
 const cands = Array.from(document.querySelectorAll('pre, .cm-editor, [class*="code-block"], [class*="codeblock"]')).slice(-3);
 for (const c of cands) parts.push('<!-- code candidate -->\n' + c.outerHTML.slice(0, 30000));
+const esc = t => t.replace(/--/g, '- -');
+const vis = ((document.querySelector('main') || document.body).innerText || '');
+parts.push('<!-- visible text tail (' + vis.length + ' chars):\n' + esc(vis.slice(-6000)) + '\n-->');
 const list = Array.from(turns).slice(-2);
 if (list.length === 0) {
     const main = document.querySelector('main') || document.body;
