@@ -1080,65 +1080,63 @@ def check_logged_in(driver, timeout=10):
     return False
 
 
+_EXTRACT_JS = r"""
+// 텍스트: innerText 가 비면(화면 밖·가상화 렌더링 등) textContent 로 폴백
+const txt = el => {
+    if (!el) return '';
+    const a = (el.innerText || '').trim();
+    return a || (el.textContent || '').trim();
+};
+const all = Array.from(document.querySelectorAll('[data-message-author-role="assistant"]'));
+if (all.length === 0) return null;
+
+// 마지막 대화 턴의 assistant 요소들만 본다.
+// (추론 모델은 한 턴에 assistant 요소가 여러 개 생기고, 마지막 요소가
+//  빈 자리표시자일 수 있다. 이전 턴으로 거슬러 올라가면 지난 배치 응답을
+//  잘못 기입하게 되므로 같은 턴 안에서만 찾는다.)
+const last = all[all.length - 1];
+const turn = last.closest('[data-testid^="conversation-turn"], article');
+const msgs = turn
+    ? Array.from(turn.querySelectorAll('[data-message-author-role="assistant"]'))
+    : [last];
+
+const biggest = (sel) => {
+    let best = '';
+    for (const m of msgs)
+        m.querySelectorAll(sel).forEach(el => {
+            const t = txt(el);
+            if (t.length > best.length) best = t;
+        });
+    return best;
+};
+
+// 1) 코드블록 본문 — 구형 <pre><code>, 신형 코드 뷰어(CodeMirror .cm-content)
+let r = biggest('pre code, .cm-content, code');
+if (r) return r;
+// 2) <pre> 전체 (헤더 '일반 텍스트' 등이 섞여도 행 ID 파싱이 걸러낸다)
+r = biggest('pre');
+if (r) return r;
+// 3) 코드블록이 없으면 메시지 전체 텍스트
+let best = '';
+for (const m of msgs) { const t = txt(m); if (t.length > best.length) best = t; }
+return best || null;
+"""
+
+
 def extract_last_response(driver):
-    """마지막 assistant 메시지에서 코드블록 내용 추출 — 다중 폴백"""
+    """마지막 assistant 메시지에서 코드블록 내용 추출.
+
+    Selenium 의 .text 는 '화면에 보이는' 텍스트만 돌려줘서, ChatGPT 의 새 코드
+    블록 UI(헤더 '일반 텍스트' + 복사 버튼)나 추론 모델 응답에서 빈 문자열이
+    나와 '응답 추출 실패'가 났다. 그래서 DOM 에서 직접 innerText/textContent 를
+    읽는다.
+    """
     try:
-        # 시도 1: data-message-author-role 셀렉터
-        messages = driver.find_elements(
-            By.CSS_SELECTOR, "[data-message-author-role='assistant']"
-        )
-
-        # 시도 2: 대화 메시지 컨테이너
-        if not messages:
-            messages = driver.find_elements(
-                By.CSS_SELECTOR, "[data-message-author-role='assistant'] .markdown"
-            )
-
-        # 시도 3: prose 클래스
-        if not messages:
-            messages = driver.find_elements(
-                By.CSS_SELECTOR, ".markdown.prose, div.prose"
-            )
-
-        # 시도 4: JavaScript로 직접 추출
-        if not messages:
-            result = driver.execute_script("""
-                const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
-                if (msgs.length === 0) return null;
-                const last = msgs[msgs.length - 1];
-                const code = last.querySelector('code');
-                if (code) return code.innerText;
-                return last.innerText;
-            """)
-            if result:
-                return result.strip()
-            return None
-
-        last = messages[-1]
-
-        # 코드블록 우선
-        code_blocks = last.find_elements(By.TAG_NAME, "code")
-        if code_blocks:
-            biggest = max(code_blocks, key=lambda x: len(x.text))
-            if biggest.text.strip():
-                return biggest.text.strip()
-
-        # 코드블록 없으면 전체 텍스트
-        text = last.text.strip()
-        if text:
-            return text
-
-        # 최후: JS fallback
-        result = driver.execute_script("""
-            const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
-            if (msgs.length === 0) return null;
-            const last = msgs[msgs.length - 1];
-            const code = last.querySelector('code');
-            if (code) return code.innerText;
-            return last.innerText;
-        """)
-        return result.strip() if result else None
-
+        result = driver.execute_script(_EXTRACT_JS)
+        if result and result.strip():
+            return result.strip()
+        print("  ⚠️ assistant 메시지/코드블록을 찾지 못했습니다 (ChatGPT DOM 변경 가능성)")
+        return None
     except Exception as e:
         print(f"  ⚠️ 응답 추출 오류: {e}")
         return None
