@@ -1088,6 +1088,21 @@ if (sub && vis(sub) && /stop|중지/i.test(sub.getAttribute('aria-label') || '')
 return false;
 """
 
+# 응답이 끝났다는 '직접' 신호 — 입력창 오른쪽 버튼 자리는 생성 중엔 중지 버튼,
+# 끝나면 음성 모드(빈 입력창) 또는 보내기 버튼으로 돌아온다. 짧은 답은 중지 버튼이
+# 폴링 사이에 떴다 사라져 못 보는 일이 잦아, 이쪽을 보고 바로 완료로 판단한다.
+_IDLE_JS = r"""
+const vis = el => !!el && el.getClientRects().length > 0;
+const re = /composer-speech-button|send-button|composer-submit|voice[ -]?mode|음성\s*모드|프롬프트\s*보내기|send prompt/i;
+const stop = /stop|중지/i;
+for (const b of document.querySelectorAll('button')) {
+    const l = (b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('data-testid') || '')
+              + ' ' + (b.id || '');
+    if (re.test(l) && !stop.test(l) && vis(b)) return true;
+}
+return false;
+"""
+
 _TURN_COUNT_JS = r"""
 return document.querySelectorAll('[data-testid^="conversation-turn"], article').length;
 """
@@ -1176,8 +1191,12 @@ def wait_for_response(driver, timeout=300, should_stop=None, on_tick=None,
             # 늘고 마지막 행 ID 가 보이면 새 응답으로 인정한다
             fresh = bool(text) and (text != _pre_send["text"]
                                     or (ids_ok and turns >= _pre_send["turns"] + 2))
+            idle = bool(_js(driver, _IDLE_JS, False))
             if fresh:
-                if ids_ok or seen_busy:
+                if idle:
+                    # 입력창이 '대기' 상태로 돌아왔다 — 짧게만 확인
+                    hold = 1.5 if (ids_ok or not expect_ids) else 3.0
+                elif ids_ok or seen_busy:
                     hold = 2.0
                 elif expect_ids and not any(_has_row_id(text, r) for r in expect_ids):
                     # 기대한 행 ID 가 하나도 없다 — '생각 중' 표시 등을 응답으로
@@ -1187,7 +1206,8 @@ def wait_for_response(driver, timeout=300, should_stop=None, on_tick=None,
                     hold = fallback_hold
                 if now - last_change >= hold:
                     time.sleep(done_delay)
-                    how = "행 ID" if ids_ok else ("중지 버튼" if seen_busy else "본문 정지")
+                    how = ("입력창 대기" if idle else "행 ID" if ids_ok
+                           else "중지 버튼" if seen_busy else "본문 정지")
                     print(f"  → 응답 완료 ({how} 기준, {now - start:.0f}초)")
                     return
         _tick(now - start)
