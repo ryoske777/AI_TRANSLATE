@@ -1107,7 +1107,7 @@ return false;
 # 완료 신호를 못 잡았을 때 로그에 남겨, 실제 화면의 버튼 이름을 확인한다.
 _COMPOSER_BUTTONS_JS = r"""
 const vis = el => !!el && el.getClientRects().length > 0;
-const ed = document.querySelector('#prompt-textarea, div.ProseMirror[contenteditable="true"], [contenteditable="true"]');
+const ed = document.querySelector('#prompt-textarea') || document.querySelector('div.ProseMirror[contenteditable="true"]');
 let box = ed ? (ed.closest('form') || ed) : document.body;
 for (let i = 0; i < 6 && box.parentElement && box.querySelectorAll('button').length < 3; i++)
     box = box.parentElement;
@@ -1198,6 +1198,7 @@ def wait_for_response(driver, timeout=300, should_stop=None, on_tick=None,
     last_text, last_change = None, time.time()
     first_fresh = None
     next_slow = 90 if expect_ids else 20   # 배치는 원래 수십 초 걸리므로 늦게
+    dumped_once = False
     while time.time() - start < timeout:
         if _stopped():
             return "STOPPED"
@@ -1261,12 +1262,19 @@ def wait_for_response(driver, timeout=300, should_stop=None, on_tick=None,
         # 오래 걸리면 현재 상태를 한 번씩 알린다 (원인 진단용)
         if on_slow and next_slow is not None and elapsed >= next_slow:
             next_slow = next_slow * 3 if next_slow < 180 else None   # 20→60→180초
+            dumped = ""
+            if first_fresh is None and not dumped_once:
+                dumped_once = True
+                path = _dump_extract_debug(driver)
+                if path:
+                    dumped = f" · 화면 구조 저장: {path}"
             try:
                 on_slow(f"응답 대기 {init_wait + elapsed:.0f}초째 — 생성 중 표시 "
                         f"{'있음' if busy else '없음'} · 대기 상태 {'예' if idle else '아니오'}"
                         f" · 새 응답 {'보임' if first_fresh is not None else '못 찾음'}"
                         f" (본문 {len(text or '')}자) · 대화 턴 {_pre_send['turns']}→{turns}"
-                        f" · 입력창 버튼: {_js(driver, _COMPOSER_BUTTONS_JS, '') or '없음'}")
+                        f" · 입력창 버튼: {_js(driver, _COMPOSER_BUTTONS_JS, '') or '없음'}"
+                        + dumped)
             except Exception:
                 pass
         _tick(now - start)
@@ -1311,8 +1319,20 @@ const txt = el => {
 const lastOf = sel => { const l = document.querySelectorAll(sel); return l.length ? l[l.length - 1] : null; };
 const USER_SEL = '[data-message-author-role="user"], [data-turn="user"], [data-testid="user-message"]';
 const ASSIST_SEL = '[data-message-author-role="assistant"], [data-turn="assistant"]';
-// 입력창(작성 중인 텍스트)은 절대 응답으로 읽지 않는다
-const inComposer = el => !!el.closest('form, #prompt-textarea, [contenteditable="true"]');
+// CodeMirror 코드블록은 화면에 보이는 줄만 DOM 에 그린다 — 가능하면 에디터 문서 전체를 읽는다
+const cmText = el => {
+    try {
+        const ed = el.closest('.cm-editor');
+        const c = ed ? ed.querySelector('.cm-content') : el;
+        const cv = c && (c.cmTile || c.cmView);   // 6.4x: cmTile, 예전: cmView
+        const v = cv && (cv.view || (cv.rootView && cv.rootView.view));
+        if (v && v.state) return v.state.doc.toString().trim();
+    } catch (e) {}
+    return '';
+};
+// 입력창(작성 중인 텍스트)은 절대 응답으로 읽지 않는다.
+// (contenteditable 전체를 빼면 편집 가능한 CodeMirror 코드블록 = 응답까지 빠진다)
+const inComposer = el => !!el.closest('form, #prompt-textarea, .ProseMirror');
 const CODE_SEL = 'pre code, .cm-content, code';
 
 const pickBiggest = (roots, sel, accept) => {
@@ -1360,7 +1380,7 @@ const blocks = Array.from(document.querySelectorAll('pre, .cm-content')).filter(
 for (let i = blocks.length - 1; i >= 0; i--) {
     const b = blocks[i];
     const inner = b.matches('pre') ? b.querySelector('code, .cm-content') : null;
-    const t = txt(inner) || txt(b);
+    const t = cmText(b) || txt(inner) || txt(b);
     if (t) return t;
 }
 let r = pickBiggest([document], CODE_SEL, ok);
@@ -1382,14 +1402,25 @@ const txt = el => {
     const a = (el.innerText || '').trim();
     return a || (el.textContent || '').trim();
 };
-const skip = el => !!el.closest('form, #prompt-textarea, [contenteditable="true"], '
+// CodeMirror 코드블록은 화면에 보이는 줄만 DOM 에 그린다 — 가능하면 에디터 문서 전체를 읽는다
+const cmText = el => {
+    try {
+        const ed = el.closest('.cm-editor');
+        const c = ed ? ed.querySelector('.cm-content') : el;
+        const cv = c && (c.cmTile || c.cmView);   // 6.4x: cmTile, 예전: cmView
+        const v = cv && (cv.view || (cv.rootView && cv.rootView.view));
+        if (v && v.state) return v.state.doc.toString().trim();
+    } catch (e) {}
+    return '';
+};
+const skip = el => !!el.closest('form, #prompt-textarea, .ProseMirror, '
     + '[data-message-author-role="user"], [data-turn="user"], [data-testid="user-message"]');
 const out = [];
 for (const b of document.querySelectorAll('pre, .cm-content')) {
     if (skip(b)) continue;
     if (b.matches('pre') && b.querySelector('.cm-content')) continue;  // 안쪽 것을 쓴다
     const inner = b.matches('pre') ? b.querySelector('code') : null;
-    const t = txt(inner) || txt(b);
+    const t = cmText(b) || txt(inner) || txt(b);
     if (t) out.push(t);
 }
 return out.slice(-12);
@@ -1425,7 +1456,12 @@ parts.push('<!-- turns: ' + turns.length +
     ', user-role: ' + document.querySelectorAll('[data-message-author-role="user"]').length +
     ', data-turn: ' + document.querySelectorAll('[data-turn]').length +
     ', pre: ' + document.querySelectorAll('pre').length +
-    ', code: ' + document.querySelectorAll('code').length + ' -->');
+    ', code: ' + document.querySelectorAll('code').length +
+    ', cm-content: ' + document.querySelectorAll('.cm-content').length +
+    ', contenteditable: ' + document.querySelectorAll('[contenteditable="true"]').length + ' -->');
+// 마지막 코드블록 후보 3개를 따로 남긴다 (어떤 구조로 그려졌는지 확인용)
+const cands = Array.from(document.querySelectorAll('pre, .cm-editor, [class*="code-block"], [class*="codeblock"]')).slice(-3);
+for (const c of cands) parts.push('<!-- code candidate -->\n' + c.outerHTML.slice(0, 30000));
 const list = Array.from(turns).slice(-2);
 if (list.length === 0) {
     const main = document.querySelector('main') || document.body;
@@ -1445,8 +1481,10 @@ def _dump_extract_debug(driver):
         with open(out, "w", encoding="utf-8") as f:
             f.write(html)
         print(f"  → 응답 영역 구조를 저장했습니다: {out}")
+        return out
     except Exception as e:
         print(f"  ⚠️ 디버그 저장 실패: {e}")
+        return None
 
 
 def extract_last_response(driver, expect_ids=None):
