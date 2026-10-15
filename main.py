@@ -1146,7 +1146,7 @@ def _has_row_id(text, rid):
 
 
 def wait_for_response(driver, timeout=300, should_stop=None, on_tick=None,
-                      expect_ids=None):
+                      expect_ids=None, on_slow=None):
     """ChatGPT 응답 완료까지 대기.
 
     예전에는 '중지 버튼이 나타났다 사라지면 완료'만 봤는데, 화면 개편으로 버튼
@@ -1166,6 +1166,7 @@ def wait_for_response(driver, timeout=300, should_stop=None, on_tick=None,
     should_stop: 호출 시 True면 즉시 중단하고 "STOPPED" 반환 (STOP 즉시 반응용)
     on_tick:     매 폴링마다 on_tick(경과초)를 호출 (진행 상태 표시용)
     expect_ids:  이 응답에 나와야 할 행 ID 목록 (예: ["R602", ..., "R651"])
+    on_slow:     20초·60초·180초째에 현재 감지 상태를 문자열로 넘겨 받는 함수 (진단 로그용)
     """
     init_wait     = getattr(config, 'RESPONSE_INIT_WAIT',     2.0)
     poll_interval = getattr(config, 'RESPONSE_POLL_INTERVAL', 0.5)
@@ -1193,6 +1194,7 @@ def wait_for_response(driver, timeout=300, should_stop=None, on_tick=None,
     seen_busy = False
     last_text, last_change = None, time.time()
     first_fresh = None
+    next_slow = 90 if expect_ids else 20   # 배치는 원래 수십 초 걸리므로 늦게
     while time.time() - start < timeout:
         if _stopped():
             return "STOPPED"
@@ -1201,18 +1203,22 @@ def wait_for_response(driver, timeout=300, should_stop=None, on_tick=None,
         now = time.time()
         if text != last_text:
             last_text, last_change = text, now
+        elapsed = now - start
+        turns = _js(driver, _TURN_COUNT_JS, 0) or 0
+        idle = (not busy) and bool(_js(driver, _IDLE_JS, False))
         if busy:
             seen_busy = True
         else:
-            turns = _js(driver, _TURN_COUNT_JS, 0) or 0
             ids_ok = bool(last_id) and _has_row_id(text, last_id)
+            # 내 메시지 + 답 턴이 새로 생겼는지 (본문이 비어 있어도 판단 가능)
+            new_turn = turns >= _pre_send["turns"] + 2
             # 같은 내용의 응답이 연달아 올 수도 있어, 본문이 그대로여도 대화 턴이
             # 늘고 마지막 행 ID 가 보이면 새 응답으로 인정한다
             fresh = bool(text) and (text != _pre_send["text"]
-                                    or (ids_ok and turns >= _pre_send["turns"] + 2))
-            idle = bool(_js(driver, _IDLE_JS, False))
+                                    or (ids_ok and new_turn))
             if fresh and first_fresh is None:
-                first_fresh = now - start
+                first_fresh = elapsed
+            hold, how = None, ""
             if fresh:
                 if idle:
                     # 입력창이 '대기' 상태로 돌아왔다 — 짧게만 확인
@@ -1228,16 +1234,38 @@ def wait_for_response(driver, timeout=300, should_stop=None, on_tick=None,
                     hold = min(fallback_hold, 4.0)
                 else:
                     hold = fallback_hold
-                if now - last_change >= hold:
-                    time.sleep(done_delay)
-                    how = ("입력창 대기" if idle else "행 ID" if ids_ok
-                           else "중지 버튼" if seen_busy else "본문 정지")
-                    info = (f"{how} 기준 · 대기 {init_wait + now - start:.0f}초"
-                            f" (새 응답 보임 {init_wait + first_fresh:.0f}초)")
-                    if how in ("본문 정지", "중지 버튼"):
-                        info += " · 입력창 버튼: " + (_js(driver, _COMPOSER_BUTTONS_JS, "") or "없음")
-                    print(f"  → 응답 완료 ({info})")
-                    return info
+                how = ("입력창 대기" if idle else "행 ID" if ids_ok
+                       else "중지 버튼" if seen_busy else "본문 정지")
+            elif not expect_ids:
+                # 빈 응답(빈 코드블록 등) — 읽을 글이 없어 '새 응답' 판정이 안 된다.
+                # 고정 프롬프트 답은 내용이 중요하지 않으므로 대기 상태로 돌아왔으면 완료.
+                if idle and (new_turn or elapsed >= 6):
+                    hold, how = 1.5, "입력창 대기(빈 응답)"
+                elif elapsed >= 20:
+                    hold, how = 4.0, "시간 경과(빈 응답)"
+            elif idle and new_turn and elapsed >= 15:
+                # 배치인데 새 응답 본문을 못 읽는다 — 추출 단계(재시도·실패 기록)에 맡긴다
+                hold, how = 3.0, "입력창 대기(본문 못 읽음)"
+            if hold is not None and now - last_change >= hold:
+                time.sleep(done_delay)
+                info = f"{how} 기준 · 대기 {init_wait + elapsed:.0f}초"
+                if first_fresh is not None:
+                    info += f" (새 응답 보임 {init_wait + first_fresh:.0f}초)"
+                if not idle:
+                    info += " · 입력창 버튼: " + (_js(driver, _COMPOSER_BUTTONS_JS, "") or "없음")
+                print(f"  → 응답 완료 ({info})")
+                return info
+        # 오래 걸리면 현재 상태를 한 번씩 알린다 (원인 진단용)
+        if on_slow and next_slow is not None and elapsed >= next_slow:
+            next_slow = next_slow * 3 if next_slow < 180 else None   # 20→60→180초
+            try:
+                on_slow(f"응답 대기 {init_wait + elapsed:.0f}초째 — 생성 중 표시 "
+                        f"{'있음' if busy else '없음'} · 대기 상태 {'예' if idle else '아니오'}"
+                        f" · 새 응답 {'보임' if first_fresh is not None else '못 찾음'}"
+                        f" (본문 {len(text or '')}자) · 대화 턴 {_pre_send['turns']}→{turns}"
+                        f" · 입력창 버튼: {_js(driver, _COMPOSER_BUTTONS_JS, '') or '없음'}")
+            except Exception:
+                pass
         _tick(now - start)
         time.sleep(poll_interval)
 

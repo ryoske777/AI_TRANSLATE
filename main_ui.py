@@ -1236,7 +1236,10 @@ class TranslationWorker(threading.Thread):
                     self.waiting("고정 프롬프트 전송 중")
                     timing = send_message(driver, config.FIXED_PROMPT)
                     self.log_send_timing(0.0, timing)
-                    info = wait_for_response(driver, should_stop=lambda: self.stop_flag)
+                    info = wait_for_response(
+                        driver, should_stop=lambda: self.stop_flag,
+                        on_tick=lambda e: self.wait_text(f"고정 프롬프트 응답 대기 중 · {int(e)}초"),
+                        on_slow=lambda m: self.log(f"🔎 {m}", "warn"))
                     self.done_waiting()
                     if isinstance(info, str) and info != "STOPPED":
                         self.log(f"⏱ 고정 프롬프트 응답 감지: {info}", "info")
@@ -1337,7 +1340,8 @@ class TranslationWorker(threading.Thread):
                     driver,
                     should_stop=lambda: self.stop_flag,
                     on_tick=lambda e: self.wait_text(f"{_base} · {int(e)}초"),
-                    expect_ids=[row_id(r[0]) for r in batch])
+                    expect_ids=[row_id(r[0]) for r in batch],
+                    on_slow=lambda m: self.log(f"🔎 {m}", "warn"))
                 self.done_waiting()
                 if isinstance(info, str) and info != "STOPPED":
                     self.log(f"⏱ 응답 감지: {info}", "info")
