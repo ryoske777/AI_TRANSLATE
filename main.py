@@ -1028,6 +1028,7 @@ def send_message(driver, text):
 
     # 입력창 찾기
     textarea = _find_composer(driver, timeout=30)
+    _remember_pre_send(driver)   # 완료 판정 때 '새 응답'인지 구별하려고
     t1 = time.time()
     timing["find"] = t1 - t0
 
@@ -1073,15 +1074,73 @@ def send_message(driver, text):
     return timing
 
 
-def wait_for_response(driver, timeout=300, should_stop=None, on_tick=None):
-    """ChatGPT 응답 완료까지 대기 — 출현 후 소멸 방식.
+# 응답 생성 중 표시(중지 버튼). 화면 개편마다 이름이 바뀌어 왔으므로 이름 하나에
+# 기대지 않고, 보이는 버튼의 aria-label / data-testid 를 넓게 훑는다.
+_BUSY_JS = r"""
+const vis = el => !!el && el.getClientRects().length > 0;
+const re = /stop-button|stop[ -]?(streaming|generating|response)|(스트리밍|응답|생성)\s*중지/i;
+for (const b of document.querySelectorAll('button')) {
+    const l = (b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('data-testid') || '');
+    if (re.test(l) && vis(b)) return true;
+}
+const sub = document.querySelector('#composer-submit-button');
+if (sub && vis(sub) && /stop|중지/i.test(sub.getAttribute('aria-label') || '')) return true;
+return false;
+"""
+
+_TURN_COUNT_JS = r"""
+return document.querySelectorAll('[data-testid^="conversation-turn"], article').length;
+"""
+
+# send_message() 가 전송 직전에 기록하는 '이전 응답' — 완료 판정 때 새 응답과 구별용
+_pre_send = {"text": None, "turns": 0}
+
+
+def _js(driver, script, default=None):
+    try:
+        return driver.execute_script(script)
+    except Exception:
+        return default
+
+
+def _remember_pre_send(driver):
+    _pre_send["text"] = _js(driver, _EXTRACT_JS)
+    _pre_send["turns"] = _js(driver, _TURN_COUNT_JS, 0) or 0
+
+
+def _has_row_id(text, rid):
+    return bool(re.search(r"(?m)^\s*" + re.escape(rid) + r"(?!\d)", text or ""))
+
+
+def wait_for_response(driver, timeout=300, should_stop=None, on_tick=None,
+                      expect_ids=None):
+    """ChatGPT 응답 완료까지 대기.
+
+    예전에는 '중지 버튼이 나타났다 사라지면 완료'만 봤는데, 화면 개편으로 버튼
+    이름이 바뀌자 버튼을 못 찾아 약 40초 뒤 무조건 '완료'로 넘어갔다. 그 사이
+    응답이 끝나지 않았으면(추론 중) 지난 배치 응답을 읽어 '행 ID 전부 누락' →
+    '플레이스홀더 불일치' 가 대량으로 났다. 이제 응답 본문을 직접 본다.
+
+    완료 조건 — 아래를 모두 만족:
+      · 중지 버튼이 보이지 않는다
+      · 응답이 전송 전의 마지막 응답과 다르다(새 응답이다)
+      · 본문이 일정 시간 변하지 않는다:
+          expect_ids 의 마지막 행 ID 가 나왔으면 2초,
+          중지 버튼이 한 번이라도 보였으면 2초,
+          둘 다 아니면(신호 없음) RESPONSE_STABLE_FALLBACK 초(기본 10초),
+          기대한 행 ID 가 하나도 안 보이면 RESPONSE_STABLE_NOID 초(기본 60초)
 
     should_stop: 호출 시 True면 즉시 중단하고 "STOPPED" 반환 (STOP 즉시 반응용)
     on_tick:     매 폴링마다 on_tick(경과초)를 호출 (진행 상태 표시용)
+    expect_ids:  이 응답에 나와야 할 행 ID 목록 (예: ["R602", ..., "R651"])
     """
     init_wait     = getattr(config, 'RESPONSE_INIT_WAIT',     2.0)
     poll_interval = getattr(config, 'RESPONSE_POLL_INTERVAL', 0.5)
     done_delay    = getattr(config, 'RESPONSE_DONE_DELAY',    1.0)
+    fallback_hold = getattr(config, 'RESPONSE_STABLE_FALLBACK', 10.0)
+    noid_hold     = getattr(config, 'RESPONSE_STABLE_NOID',     60.0)
+    poll_interval = min(max(poll_interval, 0.3), 1.0)
+    last_id = expect_ids[-1] if expect_ids else None
 
     def _stopped():
         return should_stop is not None and should_stop()
@@ -1097,53 +1156,41 @@ def wait_for_response(driver, timeout=300, should_stop=None, on_tick=None):
     if _stopped():
         return "STOPPED"
 
-    stop_selectors = [
-        "button[data-testid='stop-button']",
-        "button[aria-label='Stop streaming']",
-        "button[aria-label='Stop generating']",
-        # 화면 개편으로 이름이 바뀌어도 잡히게 (영문/한국어 UI)
-        "#composer-submit-button[aria-label*='Stop' i]",
-        "button[aria-label*='스트리밍 중지']",
-    ]
-
-    # 1단계: Stop 버튼이 나타날 때까지 대기 (최대 30초)
-    appeared = False
     start = time.time()
-    while time.time() - start < 30:
-        if _stopped():
-            return "STOPPED"
-        for sel in stop_selectors:
-            elems = driver.find_elements(By.CSS_SELECTOR, sel)
-            if elems and elems[0].is_displayed():
-                appeared = True
-                break
-        if appeared:
-            break
-        _tick(time.time() - start)
-        time.sleep(poll_interval)
-
-    if not appeared:
-        time.sleep(5)
-
-    # 2단계: Stop 버튼이 사라질 때까지 대기
-    start = time.time()
+    seen_busy = False
+    last_text, last_change = None, time.time()
     while time.time() - start < timeout:
         if _stopped():
             return "STOPPED"
-        try:
-            found = False
-            for sel in stop_selectors:
-                elems = driver.find_elements(By.CSS_SELECTOR, sel)
-                if elems and elems[0].is_displayed():
-                    found = True
-                    break
-            if not found:
-                time.sleep(done_delay)
-                print("  → 응답 완료")
-                return
-        except Exception:
-            pass
-        _tick(time.time() - start)
+        busy = bool(_js(driver, _BUSY_JS, False))
+        text = _js(driver, _EXTRACT_JS)
+        now = time.time()
+        if text != last_text:
+            last_text, last_change = text, now
+        if busy:
+            seen_busy = True
+        else:
+            turns = _js(driver, _TURN_COUNT_JS, 0) or 0
+            ids_ok = bool(last_id) and _has_row_id(text, last_id)
+            # 같은 내용의 응답이 연달아 올 수도 있어, 본문이 그대로여도 대화 턴이
+            # 늘고 마지막 행 ID 가 보이면 새 응답으로 인정한다
+            fresh = bool(text) and (text != _pre_send["text"]
+                                    or (ids_ok and turns >= _pre_send["turns"] + 2))
+            if fresh:
+                if ids_ok or seen_busy:
+                    hold = 2.0
+                elif expect_ids and not any(_has_row_id(text, r) for r in expect_ids):
+                    # 기대한 행 ID 가 하나도 없다 — '생각 중' 표시 등을 응답으로
+                    # 착각하지 않도록 오래 지켜본다(정말 ID 없이 답했을 때만 해당)
+                    hold = noid_hold
+                else:
+                    hold = fallback_hold
+                if now - last_change >= hold:
+                    time.sleep(done_delay)
+                    how = "행 ID" if ids_ok else ("중지 버튼" if seen_busy else "본문 정지")
+                    print(f"  → 응답 완료 ({how} 기준, {now - start:.0f}초)")
+                    return
+        _tick(now - start)
         time.sleep(poll_interval)
 
     print("  ⚠️ 응답 완료 감지 타임아웃 — 계속 진행")
