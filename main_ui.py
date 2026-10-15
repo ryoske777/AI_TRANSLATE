@@ -982,6 +982,24 @@ class TranslationWorker(threading.Thread):
         except Exception as e:
             self.log(f"  ⚠️ 입력 열 마커 기입 실패(번역은 계속): {e}", "warn")
 
+    def log_send_timing(self, prep, timing):
+        """'배치 전송' 로그 뒤 입력창에 글이 들어가기까지 오래 걸렸으면 단계별로 알린다.
+
+        prep  : 전송 준비(용어집 마커 부착·시트 기입·마스킹) 소요 초
+        timing: send_message() 가 돌려준 {"find", "input", "click", "method"}
+                (Claude 드라이버는 None — 그때는 준비 시간만 본다)
+        """
+        t = timing if isinstance(timing, dict) else {}
+        find, inp, click = t.get("find", 0.0), t.get("input", 0.0), t.get("click", 0.0)
+        if prep + find + inp + click < 2.0:
+            return
+        method = {"fast": "일괄", "cdp": "CDP", "fallback": "폴백"}.get(t.get("method"), "")
+        parts = [f"준비 {prep:.1f}초"]
+        if t:
+            parts += [f"입력창 찾기 {find:.1f}초", f"입력 {inp:.1f}초({method})",
+                      f"전송 버튼 {click:.1f}초"]
+        self.log("⏳ 프롬프트 입력 지연: " + " · ".join(parts), "warn")
+
     def glossary_for_batch(self, batch, lang):
         """이 배치에 쓸 (플레이스홀더 치환표, 프롬프트 지시문) 을 만든다.
 
@@ -1235,6 +1253,8 @@ class TranslationWorker(threading.Thread):
                 else:
                     label = " (구멍 그룹)" if len(group) < config.BATCH_SIZE else ""
                 self.log(f"배치 전송: {s_row}~{e_row}행 ({len(batch)}행{label})")
+                import time as _t
+                _prep_t0 = _t.time()   # 전송 준비(용어집 마커·시트 기입 등) 소요 측정
 
                 # ── 용어집 용어에 마커 자동 부착 (번역 모드 전용) ─────────
                 # 문장 속 용어집 용어를 «T:용어» 로 감싼다. 예전에 손으로 하던
@@ -1302,8 +1322,10 @@ class TranslationWorker(threading.Thread):
                     batch_msg = gl_block + "\n\n" + batch_msg
 
                 self.waiting(f"{s_row}~{e_row}행 {work_word} 요청 중 · 배치 {batch_no}/{total_batches}")
-                send_message(driver, batch_msg)
+                _prep = _t.time() - _prep_t0
+                timing = send_message(driver, batch_msg)
                 self.done_waiting()
+                self.log_send_timing(_prep, timing)
                 if self.stop_flag:
                     break
                 self.waiting(f"ChatGPT 응답 대기 중 · 배치 {batch_no}/{total_batches}")
