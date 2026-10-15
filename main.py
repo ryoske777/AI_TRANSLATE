@@ -906,6 +906,46 @@ def _insert_text_cdp(driver, textarea, text):
         return False
 
 
+def _insert_text_fast(driver, textarea, text):
+    """입력창 내용을 한 번의 편집 명령으로 통째로 교체한다. 성공 시 True.
+
+    CDP Input.insertText 는 줄바꿈마다 문단 나누기를 따로 실행해, 줄이 많은
+    메시지(용어집 지시문·토큰 참고표 포함)를 긴 대화 페이지에 넣을 때 수 초~
+    십수 초가 걸렸다. 여기서는 줄마다 <p> 를 만든 HTML 을 execCommand
+    ('insertHTML') 한 번으로 넣어 편집기(ProseMirror)가 한 번에 읽게 한다.
+    결과가 원문과 다르면(탭·글자 누락 등) False — 호출자가 기존 방식으로 다시 넣는다.
+    """
+    try:
+        ok = driver.execute_script(
+            """
+            const el = arguments[0], text = arguments[1];
+            const esc = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                              .replace(/>/g, '&gt;');
+            const html = text.split('\\n')
+                .map(l => l ? '<p>' + esc(l) + '</p>' : '<p><br></p>').join('');
+            el.focus();
+            const r = document.createRange();
+            r.selectNodeContents(el);
+            const s = window.getSelection();
+            s.removeAllRanges();
+            s.addRange(r);
+            return document.execCommand('insertHTML', false, html);
+            """,
+            textarea, text,
+        )
+        if not ok:
+            return False
+        time.sleep(0.2)   # 편집기가 DOM 변경을 읽어 상태에 반영할 시간
+        current = driver.execute_script("return arguments[0].innerText;", textarea) or ""
+        # 문단 사이 빈 줄 수는 렌더링마다 달라 공백은 빼고 비교하되, 행 ID 와
+        # 셀을 가르는 탭은 그대로 살아 있어야 한다.
+        squash = lambda v: re.sub(r"\s+", "", v)
+        return (squash(current) == squash(text)
+                and current.count("\t") >= text.count("\t"))
+    except Exception:
+        return False
+
+
 def _click_send_button(driver, textarea):
     """전송 버튼 클릭. JS 클릭(백그라운드 안전) → Selenium 클릭 → Enter 순서로 시도."""
     sel = "button[data-testid='send-button']"
@@ -935,8 +975,12 @@ def _click_send_button(driver, textarea):
 def send_message(driver, text):
     """ChatGPT 입력창에 텍스트 입력 후 전송.
 
-    1순위: CDP 입력(최소화/백그라운드에서도 동작). 실패 시 기존 방식(포커스 필요)으로 폴백.
+    1순위: 한 번에 통째로 넣기(빠름). 2순위: CDP 입력(최소화/백그라운드에서도 동작).
+    둘 다 실패 시 기존 방식(포커스 필요)으로 폴백.
+    반환: 단계별 소요 시간 {"find", "input", "click", "method"} — 느린 단계 진단용.
     """
+    timing = {}
+    t0 = time.time()
     wait = WebDriverWait(driver, 30)
 
     # 입력창 찾기
@@ -951,11 +995,18 @@ def send_message(driver, text):
                 (By.CSS_SELECTOR, "div[contenteditable='true']")
             )
         )
+    t1 = time.time()
+    timing["find"] = t1 - t0
 
-    # ── 1순위: CDP 입력 ─────────────────────────────────────────────
-    if _insert_text_cdp(driver, textarea, text):
+    # ── 1순위: 통째로 넣기 ───────────────────────────────────────────
+    if getattr(config, "FAST_INPUT", True) and _insert_text_fast(driver, textarea, text):
+        timing["method"] = "fast"
+    # ── 2순위: CDP 입력 ─────────────────────────────────────────────
+    elif _insert_text_cdp(driver, textarea, text):
+        timing["method"] = "cdp"
         time.sleep(0.3)
     else:
+        timing["method"] = "fallback"
         # ── 폴백: 기존 방식 (창이 활성화돼 있어야 함) ─────────────────
         textarea.click()
         time.sleep(0.5)
@@ -974,13 +1025,19 @@ def send_message(driver, text):
             pyperclip.copy(text)
             textarea.send_keys(Keys.CONTROL + "v")
             time.sleep(0.5)
+    t2 = time.time()
+    timing["input"] = t2 - t1
 
     # 전송
     _click_send_button(driver, textarea)
+    timing["click"] = time.time() - t2
 
     # 전송 후 랜덤 딜레이 (봇 감지 방지)
     time.sleep(random.uniform(1.5, 3.5))
-    print("  → 메시지 전송 완료, 응답 대기 중...")
+    print(f"  → 메시지 전송 완료 (입력창 {timing['find']:.1f}초 · "
+          f"입력 {timing['input']:.1f}초[{timing['method']}] · "
+          f"전송 {timing['click']:.1f}초), 응답 대기 중...")
+    return timing
 
 
 def wait_for_response(driver, timeout=300, should_stop=None, on_tick=None):
