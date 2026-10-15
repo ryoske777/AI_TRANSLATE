@@ -1079,9 +1079,11 @@ def send_message(driver, text):
 _BUSY_JS = r"""
 const vis = el => !!el && el.getClientRects().length > 0;
 const re = /stop-button|stop[ -]?(streaming|generating|response)|(스트리밍|응답|생성)\s*중지/i;
+const bare = /^\s*(중지|정지|stop)\s*$/i;     // 실제 화면: aria-label="중지"
 for (const b of document.querySelectorAll('button')) {
-    const l = (b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('data-testid') || '');
-    if (re.test(l) && vis(b)) return true;
+    const al = b.getAttribute('aria-label') || '';
+    const l = al + ' ' + (b.getAttribute('data-testid') || '');
+    if ((re.test(l) || bare.test(al)) && vis(b)) return true;
 }
 const sub = document.querySelector('#composer-submit-button');
 if (sub && vis(sub) && /stop|중지/i.test(sub.getAttribute('aria-label') || '')) return true;
@@ -1197,6 +1199,7 @@ def wait_for_response(driver, timeout=300, should_stop=None, on_tick=None,
     seen_busy = False
     last_text, last_change = None, time.time()
     first_fresh = None
+    idle_since = None
     next_slow = 90 if expect_ids else 20   # 배치는 원래 수십 초 걸리므로 늦게
     dumped_once = False
     while time.time() - start < timeout:
@@ -1210,6 +1213,11 @@ def wait_for_response(driver, timeout=300, should_stop=None, on_tick=None,
         elapsed = now - start
         turns = _js(driver, _TURN_COUNT_JS, 0) or 0
         idle = (not busy) and bool(_js(driver, _IDLE_JS, False))
+        if not idle:
+            idle_since = None
+        elif idle_since is None:
+            idle_since = now
+        idle_for = (now - idle_since) if idle_since is not None else 0.0
         if busy:
             seen_busy = True
         else:
@@ -1223,7 +1231,13 @@ def wait_for_response(driver, timeout=300, should_stop=None, on_tick=None,
             if fresh and first_fresh is None:
                 first_fresh = elapsed
             hold, how = None, ""
-            if fresh:
+            if idle and idle_for >= (2.0 if fresh else 5.0) and elapsed >= 3.0:
+                # 입력창이 대기 상태(음성 대화/보내기 버튼)로 돌아와 유지되고 있다 —
+                # 생성이 끝났다는 가장 확실한 신호. 본문 판정과 무관하게 넘어간다.
+                # (잘못 읽은 응답은 다음 단계에서 행 ID 로 걸러진다)
+                hold = 0.0
+                how = "입력창 대기" if fresh else "입력창 대기(새 본문 확인 못 함)"
+            elif fresh:
                 if idle:
                     # 입력창이 '대기' 상태로 돌아왔다 — 짧게만 확인
                     hold = 1.5 if (ids_ok or not expect_ids) else 3.0
