@@ -1103,6 +1103,24 @@ for (const b of document.querySelectorAll('button')) {
 return false;
 """
 
+# 진단용 — 입력창 주변에 보이는 버튼들의 이름(aria-label/data-testid/id).
+# 완료 신호를 못 잡았을 때 로그에 남겨, 실제 화면의 버튼 이름을 확인한다.
+_COMPOSER_BUTTONS_JS = r"""
+const vis = el => !!el && el.getClientRects().length > 0;
+const ed = document.querySelector('#prompt-textarea, div.ProseMirror[contenteditable="true"], [contenteditable="true"]');
+let box = ed ? (ed.closest('form') || ed) : document.body;
+for (let i = 0; i < 6 && box.parentElement && box.querySelectorAll('button').length < 3; i++)
+    box = box.parentElement;
+const out = [];
+for (const b of box.querySelectorAll('button, [role="button"]')) {
+    if (!vis(b)) continue;
+    const l = [b.getAttribute('aria-label'), b.getAttribute('data-testid'), b.id]
+        .filter(Boolean).join('|');
+    if (l) out.push(l);
+}
+return out.slice(0, 12).join(' / ');
+"""
+
 _TURN_COUNT_JS = r"""
 return document.querySelectorAll('[data-testid^="conversation-turn"], article').length;
 """
@@ -1174,6 +1192,7 @@ def wait_for_response(driver, timeout=300, should_stop=None, on_tick=None,
     start = time.time()
     seen_busy = False
     last_text, last_change = None, time.time()
+    first_fresh = None
     while time.time() - start < timeout:
         if _stopped():
             return "STOPPED"
@@ -1192,6 +1211,8 @@ def wait_for_response(driver, timeout=300, should_stop=None, on_tick=None,
             fresh = bool(text) and (text != _pre_send["text"]
                                     or (ids_ok and turns >= _pre_send["turns"] + 2))
             idle = bool(_js(driver, _IDLE_JS, False))
+            if fresh and first_fresh is None:
+                first_fresh = now - start
             if fresh:
                 if idle:
                     # 입력창이 '대기' 상태로 돌아왔다 — 짧게만 확인
@@ -1202,19 +1223,28 @@ def wait_for_response(driver, timeout=300, should_stop=None, on_tick=None,
                     # 기대한 행 ID 가 하나도 없다 — '생각 중' 표시 등을 응답으로
                     # 착각하지 않도록 오래 지켜본다(정말 ID 없이 답했을 때만 해당)
                     hold = noid_hold
+                elif not expect_ids:
+                    # 고정 프롬프트처럼 행 ID 가 없는 짧은 대화 — 오래 지켜볼 이유가 적다
+                    hold = min(fallback_hold, 4.0)
                 else:
                     hold = fallback_hold
                 if now - last_change >= hold:
                     time.sleep(done_delay)
                     how = ("입력창 대기" if idle else "행 ID" if ids_ok
                            else "중지 버튼" if seen_busy else "본문 정지")
-                    print(f"  → 응답 완료 ({how} 기준, {now - start:.0f}초)")
-                    return
+                    info = (f"{how} 기준 · 대기 {init_wait + now - start:.0f}초"
+                            f" (새 응답 보임 {init_wait + first_fresh:.0f}초)")
+                    if how in ("본문 정지", "중지 버튼"):
+                        info += " · 입력창 버튼: " + (_js(driver, _COMPOSER_BUTTONS_JS, "") or "없음")
+                    print(f"  → 응답 완료 ({info})")
+                    return info
         _tick(now - start)
         time.sleep(poll_interval)
 
     print("  ⚠️ 응답 완료 감지 타임아웃 — 계속 진행")
     time.sleep(done_delay)
+    return ("타임아웃 · 새 응답 " + ("보임" if first_fresh is not None else "못 찾음")
+            + " · 입력창 버튼: " + (_js(driver, _COMPOSER_BUTTONS_JS, "") or "없음"))
 
 
 def check_logged_in(driver, timeout=10):

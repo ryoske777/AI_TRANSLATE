@@ -1234,9 +1234,12 @@ class TranslationWorker(threading.Thread):
                     self.done_waiting()
                     self.log("페이지 로드 완료", "info")
                     self.waiting("고정 프롬프트 전송 중")
-                    send_message(driver, config.FIXED_PROMPT)
-                    wait_for_response(driver, should_stop=lambda: self.stop_flag)
+                    timing = send_message(driver, config.FIXED_PROMPT)
+                    self.log_send_timing(0.0, timing)
+                    info = wait_for_response(driver, should_stop=lambda: self.stop_flag)
                     self.done_waiting()
+                    if isinstance(info, str) and info != "STOPPED":
+                        self.log(f"⏱ 고정 프롬프트 응답 감지: {info}", "info")
                     self.send_count = 0
                     self.force_new_conv = False
                     self.log("고정 프롬프트 전송 완료", "success")
@@ -1330,12 +1333,14 @@ class TranslationWorker(threading.Thread):
                     break
                 self.waiting(f"ChatGPT 응답 대기 중 · 배치 {batch_no}/{total_batches}")
                 _base = f"ChatGPT 응답 대기 중 · 배치 {batch_no}/{total_batches}"
-                wait_for_response(
+                info = wait_for_response(
                     driver,
                     should_stop=lambda: self.stop_flag,
                     on_tick=lambda e: self.wait_text(f"{_base} · {int(e)}초"),
                     expect_ids=[row_id(r[0]) for r in batch])
                 self.done_waiting()
+                if isinstance(info, str) and info != "STOPPED":
+                    self.log(f"⏱ 응답 감지: {info}", "info")
                 if self.stop_flag:
                     break
 
