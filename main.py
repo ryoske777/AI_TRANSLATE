@@ -1128,9 +1128,12 @@ _TURN_COUNT_JS = r"""
 // 첫 <main> 이 아니라 '실제 입력창이 들어 있는' <main> 을 쓴다
 const __ed = document.querySelector('#prompt-textarea') ||
     document.querySelector('.ProseMirror[contenteditable="true"]');
-const ROOT = (__ed && __ed.closest('main')) ||
-    Array.from(document.querySelectorAll('main')).find(m => m.getClientRects().length) ||
-    document.body;
+// 입력창이 <main> 밖으로 빠졌거나 그 <main> 에 대화가 없으면(지나온 홈 화면 등)
+// 엉뚱한 <main> 을 보지 않도록 문서 전체를 쓴다 — 배치 응답은 행 ID 로 고르므로 안전
+const __edMain = __ed && __ed.closest('main');
+const ROOT = (__edMain && __edMain.querySelector(
+        '[data-message-author-role], [data-turn], [data-testid^="conversation-turn"], article')
+    && __edMain) || document.body;
 return Math.max(
     ROOT.querySelectorAll('[data-testid^="conversation-turn"], article').length,
     ROOT.querySelectorAll('[data-message-author-role]').length,
@@ -1335,9 +1338,12 @@ _EXTRACT_JS = r"""
 // 첫 <main> 이 아니라 '실제 입력창이 들어 있는' <main> 을 쓴다
 const __ed = document.querySelector('#prompt-textarea') ||
     document.querySelector('.ProseMirror[contenteditable="true"]');
-const ROOT = (__ed && __ed.closest('main')) ||
-    Array.from(document.querySelectorAll('main')).find(m => m.getClientRects().length) ||
-    document.body;
+// 입력창이 <main> 밖으로 빠졌거나 그 <main> 에 대화가 없으면(지나온 홈 화면 등)
+// 엉뚱한 <main> 을 보지 않도록 문서 전체를 쓴다 — 배치 응답은 행 ID 로 고르므로 안전
+const __edMain = __ed && __ed.closest('main');
+const ROOT = (__edMain && __edMain.querySelector(
+        '[data-message-author-role], [data-turn], [data-testid^="conversation-turn"], article')
+    && __edMain) || document.body;
 // 텍스트: innerText 가 비면(화면 밖·가상화 렌더링 등) textContent 로 폴백
 const txt = el => {
     if (!el) return '';
@@ -1450,9 +1456,12 @@ const skip = el => !!el.closest('form, #prompt-textarea, .ProseMirror, '
 // 첫 <main> 이 아니라 '실제 입력창이 들어 있는' <main> 을 쓴다
 const __ed = document.querySelector('#prompt-textarea') ||
     document.querySelector('.ProseMirror[contenteditable="true"]');
-const ROOT = (__ed && __ed.closest('main')) ||
-    Array.from(document.querySelectorAll('main')).find(m => m.getClientRects().length) ||
-    document.body;
+// 입력창이 <main> 밖으로 빠졌거나 그 <main> 에 대화가 없으면(지나온 홈 화면 등)
+// 엉뚱한 <main> 을 보지 않도록 문서 전체를 쓴다 — 배치 응답은 행 ID 로 고르므로 안전
+const __edMain = __ed && __ed.closest('main');
+const ROOT = (__edMain && __edMain.querySelector(
+        '[data-message-author-role], [data-turn], [data-testid^="conversation-turn"], article')
+    && __edMain) || document.body;
 const out = [];
 for (const b of ROOT.querySelectorAll('pre, .cm-content, code')) {
     if (skip(b)) continue;
@@ -1472,9 +1481,12 @@ _PAGE_TEXT_JS = r"""
 // 첫 <main> 이 아니라 '실제 입력창이 들어 있는' <main> 을 쓴다
 const __ed = document.querySelector('#prompt-textarea') ||
     document.querySelector('.ProseMirror[contenteditable="true"]');
-const ROOT = (__ed && __ed.closest('main')) ||
-    Array.from(document.querySelectorAll('main')).find(m => m.getClientRects().length) ||
-    document.body;
+// 입력창이 <main> 밖으로 빠졌거나 그 <main> 에 대화가 없으면(지나온 홈 화면 등)
+// 엉뚱한 <main> 을 보지 않도록 문서 전체를 쓴다 — 배치 응답은 행 ID 로 고르므로 안전
+const __edMain = __ed && __ed.closest('main');
+const ROOT = (__edMain && __edMain.querySelector(
+        '[data-message-author-role], [data-turn], [data-testid^="conversation-turn"], article')
+    && __edMain) || document.body;
 return ROOT.innerText || '';
 """
 
@@ -1551,9 +1563,12 @@ _REVEAL_JS = r"""
 // 첫 <main> 이 아니라 '실제 입력창이 들어 있는' <main> 을 쓴다
 const __ed = document.querySelector('#prompt-textarea') ||
     document.querySelector('.ProseMirror[contenteditable="true"]');
-const ROOT = (__ed && __ed.closest('main')) ||
-    Array.from(document.querySelectorAll('main')).find(m => m.getClientRects().length) ||
-    document.body;
+// 입력창이 <main> 밖으로 빠졌거나 그 <main> 에 대화가 없으면(지나온 홈 화면 등)
+// 엉뚱한 <main> 을 보지 않도록 문서 전체를 쓴다 — 배치 응답은 행 ID 로 고르므로 안전
+const __edMain = __ed && __ed.closest('main');
+const ROOT = (__edMain && __edMain.querySelector(
+        '[data-message-author-role], [data-turn], [data-testid^="conversation-turn"], article')
+    && __edMain) || document.body;
 const isScroll = el => el && el.scrollHeight > el.clientHeight + 2 &&
     /(auto|scroll)/.test(getComputedStyle(el).overflowY);
 // ChatGPT 의 '맨 아래로' 버튼이 보이면 누른다 — 위로 밀려난 상태라는 뜻이고,
@@ -1590,9 +1605,12 @@ const done = arguments[arguments.length - 1];
 // 첫 <main> 이 아니라 '실제 입력창이 들어 있는' <main> 을 쓴다
 const __ed = document.querySelector('#prompt-textarea') ||
     document.querySelector('.ProseMirror[contenteditable="true"]');
-const ROOT = (__ed && __ed.closest('main')) ||
-    Array.from(document.querySelectorAll('main')).find(m => m.getClientRects().length) ||
-    document.body;
+// 입력창이 <main> 밖으로 빠졌거나 그 <main> 에 대화가 없으면(지나온 홈 화면 등)
+// 엉뚱한 <main> 을 보지 않도록 문서 전체를 쓴다 — 배치 응답은 행 ID 로 고르므로 안전
+const __edMain = __ed && __ed.closest('main');
+const ROOT = (__edMain && __edMain.querySelector(
+        '[data-message-author-role], [data-turn], [data-testid^="conversation-turn"], article')
+    && __edMain) || document.body;
 
     const eds = Array.from(ROOT.querySelectorAll('.cm-editor'))
         .filter(e => !e.closest('form, #prompt-textarea, .ProseMirror'));
@@ -1662,13 +1680,19 @@ _DEBUG_JS = r"""
 // 첫 <main> 이 아니라 '실제 입력창이 들어 있는' <main> 을 쓴다
 const __ed = document.querySelector('#prompt-textarea') ||
     document.querySelector('.ProseMirror[contenteditable="true"]');
-const ROOT = (__ed && __ed.closest('main')) ||
-    Array.from(document.querySelectorAll('main')).find(m => m.getClientRects().length) ||
-    document.body;
+// 입력창이 <main> 밖으로 빠졌거나 그 <main> 에 대화가 없으면(지나온 홈 화면 등)
+// 엉뚱한 <main> 을 보지 않도록 문서 전체를 쓴다 — 배치 응답은 행 ID 로 고르므로 안전
+const __edMain = __ed && __ed.closest('main');
+const ROOT = (__edMain && __edMain.querySelector(
+        '[data-message-author-role], [data-turn], [data-testid^="conversation-turn"], article')
+    && __edMain) || document.body;
 const turns = ROOT.querySelectorAll('[data-testid^="conversation-turn"], article');
 const parts = [];
 parts.push('<!-- url: ' + location.href + ' -->');
-parts.push('<!-- main 요소: ' + document.querySelectorAll('main').length + '개, 대화 영역=' + (ROOT.tagName) + ' -->');
+parts.push('<!-- main 요소: ' + document.querySelectorAll('main').length + '개, 대화 영역=' + (ROOT.tagName) +
+    ', 입력창 ' + (__ed ? (__edMain ? 'main 안' : 'main 밖') : '없음') +
+    ', 입력창 버튼: ' + Array.from(document.querySelectorAll('button')).filter(b => b.getClientRects().length)
+        .map(b => b.getAttribute('aria-label') || b.getAttribute('data-testid') || '').filter(Boolean).slice(-15).join(' / ') + ' -->');
 parts.push('<!-- turns: ' + turns.length +
     ', assistant-role: ' + document.querySelectorAll('[data-message-author-role="assistant"]').length +
     ', user-role: ' + document.querySelectorAll('[data-message-author-role="user"]').length +

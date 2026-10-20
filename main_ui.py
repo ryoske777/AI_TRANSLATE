@@ -1354,14 +1354,20 @@ class TranslationWorker(threading.Thread):
                     break
 
                 response = None
-                for attempt in range(1, 4):
+                # 새 응답 본문을 못 본 채 '완료'로 넘어온 경우 — 아직 그려지는 중일 수
+                # 있으므로 몇 초 만에 포기하지 말고 더 오래 다시 읽어 본다
+                unseen = isinstance(info, str) and "새 본문 확인 못 함" in info
+                tries = 10 if unseen else 3
+                for attempt in range(1, tries + 1):
+                    if self.stop_flag:
+                        break
                     response = extract_last_response(
                         driver, expect_ids=[row_id(r[0]) for r in batch])
                     if response:
                         break
-                    if attempt < 3:
+                    if attempt < tries:
                         self.log(f"응답 추출 실패 ({attempt}회) — 재시도...", "warn")
-                        import time as _t; _t.sleep(2)
+                        import time as _t; _t.sleep(3 if unseen else 2)
 
                 # 행 ID 가 하나도 안 맞으면 '이번 응답'을 못 읽은 것 (지난 응답·덜 그려진
                 # 블록) — 잠시 뒤 다시 읽고, 그래도 안 되면 추출 실패로 처리한다.
