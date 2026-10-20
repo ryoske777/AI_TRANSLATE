@@ -1126,8 +1126,10 @@ return out.slice(0, 12).join(' / ');
 _TURN_COUNT_JS = r"""
 // 대화 영역 — 새 ChatGPT 화면은 지나온 페이지(홈 등)의 <main> 을 DOM 에 남겨 두므로
 // 첫 <main> 이 아니라 '실제 입력창이 들어 있는' <main> 을 쓴다
-const __ed = document.querySelector('#prompt-textarea') ||
-    document.querySelector('.ProseMirror[contenteditable="true"]');
+// 입력창이 여럿이면(지나온 홈 화면의 입력창이 남아 있음) 홈 화면 것이 아닌 쪽을 쓴다
+const __eds = Array.from(document.querySelectorAll(
+    '#prompt-textarea, .ProseMirror[contenteditable="true"]')).filter(e => e.getClientRects().length);
+const __ed = __eds.find(e => !e.closest('[data-composer-placement="home"]')) || __eds[0] || null;
 // 입력창이 <main> 밖으로 빠졌거나 그 <main> 에 대화가 없으면(지나온 홈 화면 등)
 // 엉뚱한 <main> 을 보지 않도록 문서 전체를 쓴다 — 배치 응답은 행 ID 로 고르므로 안전
 const __edMain = __ed && __ed.closest('main');
@@ -1149,6 +1151,11 @@ def _js(driver, script, default=None):
         return driver.execute_script(script)
     except Exception:
         return default
+
+
+def is_busy(driver):
+    """응답 생성 중 표시(중지 버튼)가 보이는지."""
+    return bool(_js(driver, _BUSY_JS, False))
 
 
 def _remember_pre_send(driver):
@@ -1336,8 +1343,10 @@ def check_logged_in(driver, timeout=10):
 _EXTRACT_JS = r"""
 // 대화 영역 — 새 ChatGPT 화면은 지나온 페이지(홈 등)의 <main> 을 DOM 에 남겨 두므로
 // 첫 <main> 이 아니라 '실제 입력창이 들어 있는' <main> 을 쓴다
-const __ed = document.querySelector('#prompt-textarea') ||
-    document.querySelector('.ProseMirror[contenteditable="true"]');
+// 입력창이 여럿이면(지나온 홈 화면의 입력창이 남아 있음) 홈 화면 것이 아닌 쪽을 쓴다
+const __eds = Array.from(document.querySelectorAll(
+    '#prompt-textarea, .ProseMirror[contenteditable="true"]')).filter(e => e.getClientRects().length);
+const __ed = __eds.find(e => !e.closest('[data-composer-placement="home"]')) || __eds[0] || null;
 // 입력창이 <main> 밖으로 빠졌거나 그 <main> 에 대화가 없으면(지나온 홈 화면 등)
 // 엉뚱한 <main> 을 보지 않도록 문서 전체를 쓴다 — 배치 응답은 행 ID 로 고르므로 안전
 const __edMain = __ed && __ed.closest('main');
@@ -1454,8 +1463,10 @@ const skip = el => !!el.closest('form, #prompt-textarea, .ProseMirror, '
 
 // 대화 영역 — 새 ChatGPT 화면은 지나온 페이지(홈 등)의 <main> 을 DOM 에 남겨 두므로
 // 첫 <main> 이 아니라 '실제 입력창이 들어 있는' <main> 을 쓴다
-const __ed = document.querySelector('#prompt-textarea') ||
-    document.querySelector('.ProseMirror[contenteditable="true"]');
+// 입력창이 여럿이면(지나온 홈 화면의 입력창이 남아 있음) 홈 화면 것이 아닌 쪽을 쓴다
+const __eds = Array.from(document.querySelectorAll(
+    '#prompt-textarea, .ProseMirror[contenteditable="true"]')).filter(e => e.getClientRects().length);
+const __ed = __eds.find(e => !e.closest('[data-composer-placement="home"]')) || __eds[0] || null;
 // 입력창이 <main> 밖으로 빠졌거나 그 <main> 에 대화가 없으면(지나온 홈 화면 등)
 // 엉뚱한 <main> 을 보지 않도록 문서 전체를 쓴다 — 배치 응답은 행 ID 로 고르므로 안전
 const __edMain = __ed && __ed.closest('main');
@@ -1479,8 +1490,10 @@ return out.slice(-12);
 _PAGE_TEXT_JS = r"""
 // 대화 영역 — 새 ChatGPT 화면은 지나온 페이지(홈 등)의 <main> 을 DOM 에 남겨 두므로
 // 첫 <main> 이 아니라 '실제 입력창이 들어 있는' <main> 을 쓴다
-const __ed = document.querySelector('#prompt-textarea') ||
-    document.querySelector('.ProseMirror[contenteditable="true"]');
+// 입력창이 여럿이면(지나온 홈 화면의 입력창이 남아 있음) 홈 화면 것이 아닌 쪽을 쓴다
+const __eds = Array.from(document.querySelectorAll(
+    '#prompt-textarea, .ProseMirror[contenteditable="true"]')).filter(e => e.getClientRects().length);
+const __ed = __eds.find(e => !e.closest('[data-composer-placement="home"]')) || __eds[0] || null;
 // 입력창이 <main> 밖으로 빠졌거나 그 <main> 에 대화가 없으면(지나온 홈 화면 등)
 // 엉뚱한 <main> 을 보지 않도록 문서 전체를 쓴다 — 배치 응답은 행 ID 로 고르므로 안전
 const __edMain = __ed && __ed.closest('main');
@@ -1561,8 +1574,10 @@ def _pick_code_block(driver, expect_ids):
 _REVEAL_JS = r"""
 // 대화 영역 — 새 ChatGPT 화면은 지나온 페이지(홈 등)의 <main> 을 DOM 에 남겨 두므로
 // 첫 <main> 이 아니라 '실제 입력창이 들어 있는' <main> 을 쓴다
-const __ed = document.querySelector('#prompt-textarea') ||
-    document.querySelector('.ProseMirror[contenteditable="true"]');
+// 입력창이 여럿이면(지나온 홈 화면의 입력창이 남아 있음) 홈 화면 것이 아닌 쪽을 쓴다
+const __eds = Array.from(document.querySelectorAll(
+    '#prompt-textarea, .ProseMirror[contenteditable="true"]')).filter(e => e.getClientRects().length);
+const __ed = __eds.find(e => !e.closest('[data-composer-placement="home"]')) || __eds[0] || null;
 // 입력창이 <main> 밖으로 빠졌거나 그 <main> 에 대화가 없으면(지나온 홈 화면 등)
 // 엉뚱한 <main> 을 보지 않도록 문서 전체를 쓴다 — 배치 응답은 행 ID 로 고르므로 안전
 const __edMain = __ed && __ed.closest('main');
@@ -1603,8 +1618,10 @@ const done = arguments[arguments.length - 1];
 (async () => {
 // 대화 영역 — 새 ChatGPT 화면은 지나온 페이지(홈 등)의 <main> 을 DOM 에 남겨 두므로
 // 첫 <main> 이 아니라 '실제 입력창이 들어 있는' <main> 을 쓴다
-const __ed = document.querySelector('#prompt-textarea') ||
-    document.querySelector('.ProseMirror[contenteditable="true"]');
+// 입력창이 여럿이면(지나온 홈 화면의 입력창이 남아 있음) 홈 화면 것이 아닌 쪽을 쓴다
+const __eds = Array.from(document.querySelectorAll(
+    '#prompt-textarea, .ProseMirror[contenteditable="true"]')).filter(e => e.getClientRects().length);
+const __ed = __eds.find(e => !e.closest('[data-composer-placement="home"]')) || __eds[0] || null;
 // 입력창이 <main> 밖으로 빠졌거나 그 <main> 에 대화가 없으면(지나온 홈 화면 등)
 // 엉뚱한 <main> 을 보지 않도록 문서 전체를 쓴다 — 배치 응답은 행 ID 로 고르므로 안전
 const __edMain = __ed && __ed.closest('main');
@@ -1678,8 +1695,10 @@ _DEBUG_JS = r"""
 
 // 대화 영역 — 새 ChatGPT 화면은 지나온 페이지(홈 등)의 <main> 을 DOM 에 남겨 두므로
 // 첫 <main> 이 아니라 '실제 입력창이 들어 있는' <main> 을 쓴다
-const __ed = document.querySelector('#prompt-textarea') ||
-    document.querySelector('.ProseMirror[contenteditable="true"]');
+// 입력창이 여럿이면(지나온 홈 화면의 입력창이 남아 있음) 홈 화면 것이 아닌 쪽을 쓴다
+const __eds = Array.from(document.querySelectorAll(
+    '#prompt-textarea, .ProseMirror[contenteditable="true"]')).filter(e => e.getClientRects().length);
+const __ed = __eds.find(e => !e.closest('[data-composer-placement="home"]')) || __eds[0] || null;
 // 입력창이 <main> 밖으로 빠졌거나 그 <main> 에 대화가 없으면(지나온 홈 화면 등)
 // 엉뚱한 <main> 을 보지 않도록 문서 전체를 쓴다 — 배치 응답은 행 ID 로 고르므로 안전
 const __edMain = __ed && __ed.closest('main');
@@ -1708,11 +1727,37 @@ for (const c of cands) {
     parts.push('<!-- code candidate -->\n' + box.outerHTML.slice(0, 30000));
 }
 const esc = t => t.replace(/--/g, '- -');
+// 모든 <main> 요약 — 어느 쪽이 실제 대화 화면인지 확인용
+document.querySelectorAll('main').forEach((m, i) => {
+    const r = m.getBoundingClientRect();
+    parts.push('<!-- main[' + i + '] ' + (m === ROOT ? '(대화 영역) ' : '') +
+        'rect=' + Math.round(r.left) + ',' + Math.round(r.top) + ' ' + Math.round(r.width) + 'x' + Math.round(r.height) +
+        ' code=' + m.querySelectorAll('code').length + ' 입력창=' +
+        m.querySelectorAll('[contenteditable="true"]').length +
+        ' placement=' + Array.from(m.querySelectorAll('[data-composer-placement]'))
+            .map(f => f.getAttribute('data-composer-placement')).join(',') +
+        ' attrs=' + Array.from(m.attributes).map(a => a.name + '=' + a.value.slice(0, 40)).join(' ') +
+        '\n' + esc((m.innerText || '').slice(-1500)) + ' -->');
+});
+// 보이는 버튼 중 '중지'/'대기' 신호로 쓰는 것들과 그 위치
+for (const b of document.querySelectorAll('button')) {
+    const l = (b.getAttribute('aria-label') || '') + '|' + (b.getAttribute('data-testid') || '') + '|' + (b.id || '');
+    if (!/stop|중지|send|보내기|submit|speech|voice|음성/i.test(l)) continue;
+    const f = b.closest('[data-composer-placement]');
+    parts.push('<!-- button ' + l + ' visible=' + (b.getClientRects().length > 0) +
+        ' placement=' + (f ? f.getAttribute('data-composer-placement') : '-') + ' -->');
+}
+// 문서 전체의 code 블록 (마지막 4개)
+for (const c of Array.from(document.querySelectorAll('pre, code')).slice(-4))
+    parts.push('<!-- doc code (in main: ' + !!c.closest('main') + ', in ROOT: ' + ROOT.contains(c) + ') -->\n' +
+        (c.parentElement && c.parentElement.parentElement || c).outerHTML.slice(0, 20000));
 const vis = (ROOT.innerText || '');
 parts.push('<!-- visible text tail (' + vis.length + ' chars):\n' + esc(vis.slice(-6000)) + '\n-->');
 const list = Array.from(turns).slice(-2);
 if (list.length === 0) {
-    parts.push(ROOT.outerHTML.slice(-200000));
+    parts.push(ROOT.outerHTML.slice(-100000));
+    const bt = document.body.innerText || '';
+    parts.push('<!-- body visible text tail (' + bt.length + ' chars):\n' + esc(bt.slice(-6000)) + '\n-->');
 } else {
     for (const t of list) parts.push(t.outerHTML.slice(0, 200000));
 }
